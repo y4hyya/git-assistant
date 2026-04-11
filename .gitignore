@@ -4,4 +4,4 @@ git-assist
 CLAUDE.md
 skills-lock.json
 gitignore
-internal/git/git.go
+
