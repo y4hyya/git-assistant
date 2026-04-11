@@ -1,1 +1,7 @@
 git-assist
+.agents/
+.claude/
+CLAUDE.md
+skills-lock.json
+gitignore
+internal/git/git.go
