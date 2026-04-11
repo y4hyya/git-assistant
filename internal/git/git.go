@@ -73,6 +73,13 @@ func GetStatus() ([]types.FileEntry, error) {
 			status = types.StatusModified
 		}
 
+		// Skip phantom entries: not on disk and not a deletion
+		if status != types.StatusDeleted {
+			if _, err := os.Stat(path); err != nil {
+				continue
+			}
+		}
+
 		files = append(files, types.FileEntry{
 			Path:   path,
 			Status: status,
