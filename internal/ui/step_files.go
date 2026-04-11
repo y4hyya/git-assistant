@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -118,6 +120,121 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// ── Edit mode ──────────────────────────────────────
+	if m.editMode {
+		if m.saving {
+			return m, nil
+		}
+
+		// Unsaved changes prompt
+		if m.confirmExit {
+			switch keyMsg.String() {
+			case "y":
+				m.confirmExit = false
+				m.editMode = false
+				m.editDirty = false
+				return m, nil
+			default:
+				m.confirmExit = false
+				return m, nil
+			}
+		}
+
+		switch keyMsg.String() {
+		case "ctrl+s":
+			m.saving = true
+			var fileStatus types.FileStatus
+			for _, f := range m.files {
+				if f.Path == m.diffFile {
+					fileStatus = f.Status
+					break
+				}
+			}
+			return m, doSave(m.diffFile, m.editArea.Value(), fileStatus)
+		case "esc":
+			if m.editDirty {
+				m.confirmExit = true
+				return m, nil
+			}
+			m.editMode = false
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			prevValue := m.editArea.Value()
+			m.editArea, cmd = m.editArea.Update(msg)
+			if m.editArea.Value() != prevValue {
+				m.editDirty = true
+			}
+			return m, cmd
+		}
+	}
+
+	// ── Diff preview mode ──────────────────────────────
+	if m.showDiff {
+		diffLines := strings.Split(m.diffContent, "\n")
+		maxScroll := len(diffLines) - 1
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+
+		// Visible lines based on terminal height (box padding + header + footer)
+		visible := m.height - 12
+		if visible < 5 {
+			visible = 5
+		}
+
+		switch keyMsg.String() {
+		case "up", "k":
+			if m.diffScroll > 0 {
+				m.diffScroll--
+			}
+		case "down", "j":
+			if m.diffScroll < maxScroll-visible {
+				m.diffScroll++
+			}
+		case "e":
+			// Block edit for deleted files and files not on disk
+			currentFile := m.files[m.cursor]
+			if currentFile.Status == types.StatusDeleted {
+				return m, nil
+			}
+			if _, err := os.Stat(m.diffFile); err != nil {
+				return m, nil
+			}
+			content, err := git.ReadFileContent(m.diffFile)
+			if err != nil {
+				m.err = err
+				return m, nil
+			}
+			m.editArea.SetValue(content)
+			// Size the textarea to fill available space
+			w := m.width - 10
+			if w < 40 {
+				w = 40
+			}
+			h := m.height - 10
+			if h < 5 {
+				h = 5
+			}
+			m.editArea.SetWidth(w)
+			m.editArea.SetHeight(h)
+			m.editArea.Focus()
+			m.editMode = true
+			m.editDirty = false
+			return m, nil
+		case "esc":
+			m.showDiff = false
+			m.diffContent = ""
+			m.diffFile = ""
+			m.diffScroll = 0
+			return m, nil
+		case "q":
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	// ── Commit mode (default) ──────────────────────────
 	switch keyMsg.String() {
 	case "up", "k":
@@ -130,6 +247,23 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case " ":
 		m.files[m.cursor].Selected = !m.files[m.cursor].Selected
+	case "d":
+		f := m.files[m.cursor]
+		diff, err := git.GetFileDiff(f.Path, f.Status)
+		if err != nil {
+			if errors.Is(err, git.ErrBinaryFile) {
+				m.diffContent = ""
+				m.diffFile = f.Path
+				m.showDiff = true
+				return m, nil
+			}
+			m.err = err
+			return m, nil
+		}
+		m.diffContent = diff
+		m.diffFile = f.Path
+		m.diffScroll = 0
+		m.showDiff = true
 	case "g":
 		m.existingIgnored = git.GetGitignoreEntries()
 		m.removeIgnored = make(map[string]bool)
@@ -196,9 +330,33 @@ func doGitignore(addPaths, cachedPaths, removePaths []string) tea.Cmd {
 	}
 }
 
+func doSave(path, content string, status types.FileStatus) tea.Cmd {
+	return func() tea.Msg {
+		if err := git.WriteFileContent(path, content); err != nil {
+			return saveResultMsg{err: err}
+		}
+		files, err := git.GetStatus()
+		if err != nil {
+			return saveResultMsg{err: err}
+		}
+		diff, _ := git.GetFileDiff(path, status)
+		return saveResultMsg{files: files, diff: diff}
+	}
+}
+
 // ── View ────────────────────────────────────────────────
 
 func (m Model) viewFiles() string {
+	// ── Edit mode view ─────────────────────────────────
+	if m.editMode {
+		return m.viewEdit()
+	}
+
+	// ── Diff preview view ──────────────────────────────
+	if m.showDiff {
+		return m.viewDiff()
+	}
+
 	var b strings.Builder
 
 	// Header
@@ -320,7 +478,6 @@ func (m Model) viewFiles() string {
 		b.WriteString(renderHelp([]helpEntry{
 			{"↑↓", "navigate"},
 			{"space", "toggle"},
-			{"a", "all"},
 			{"enter", "confirm"},
 			{"g", "cancel"},
 		}))
@@ -328,13 +485,161 @@ func (m Model) viewFiles() string {
 		b.WriteString(renderHelp([]helpEntry{
 			{"↑↓", "navigate"},
 			{"space", "select"},
+			{"d", "diff"},
 			{"g", "gitignore"},
-			{"a", "all"},
 			{"u", "undo"},
 			{"enter", "next"},
 			{"q", "quit"},
 		}))
 	}
+
+	return boxBorder.Render(b.String())
+}
+
+// ── Diff view ──────────────────────────────────────────
+
+func (m Model) viewDiff() string {
+	var b strings.Builder
+
+	// Header
+	b.WriteString(titleStyle.Render(" git-assist "))
+	b.WriteString("  ")
+	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Step 1/5 · Diff: " + m.diffFile))
+	b.WriteString("\n\n")
+
+	// Binary file
+	if m.diffContent == "" {
+		b.WriteString("\n\n")
+		b.WriteString("          ")
+		b.WriteString(dimStyle.Render("Binary file — cannot preview or edit"))
+		b.WriteString("\n\n\n")
+		b.WriteString(renderHelp([]helpEntry{
+			{"esc", "back"},
+		}))
+		return boxBorder.Render(b.String())
+	}
+
+	// Diff content with colors
+	lines := strings.Split(m.diffContent, "\n")
+	visible := m.height - 12
+	if visible < 5 {
+		visible = 5
+	}
+
+	end := m.diffScroll + visible
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	visibleLines := lines[m.diffScroll:end]
+	for _, line := range visibleLines {
+		styled := styleDiffLine(line)
+		b.WriteString("  " + styled + "\n")
+	}
+
+	// Line counter
+	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(
+		fmt.Sprintf("Lines %d-%d of %d", m.diffScroll+1, end, len(lines)),
+	)))
+
+	// Error
+	if m.err != nil {
+		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+	}
+
+	// Help bar
+	b.WriteString("\n")
+	currentFile := m.files[m.cursor]
+	_, fileExists := os.Stat(m.diffFile)
+	if currentFile.Status == types.StatusDeleted || fileExists != nil {
+		b.WriteString(renderHelp([]helpEntry{
+			{"↑↓", "scroll"},
+			{"esc", "back"},
+		}))
+	} else {
+		b.WriteString(renderHelp([]helpEntry{
+			{"↑↓", "scroll"},
+			{"e", "edit"},
+			{"esc", "back"},
+		}))
+	}
+
+	return boxBorder.Render(b.String())
+}
+
+func styleDiffLine(line string) string {
+	switch {
+	case strings.HasPrefix(line, "(new file)"), strings.HasPrefix(line, "(deleted file)"):
+		return diffHunkStyle.Render(line)
+	case strings.HasPrefix(line, "@@"):
+		return diffHunkStyle.Render(line)
+	case strings.HasPrefix(line, "diff "), strings.HasPrefix(line, "---"), strings.HasPrefix(line, "+++"),
+		strings.HasPrefix(line, "index "):
+		return diffHeaderStyle.Render(line)
+	case strings.HasPrefix(line, "+"):
+		return diffAddStyle.Render(line)
+	case strings.HasPrefix(line, "-"):
+		return diffRemoveStyle.Render(line)
+	default:
+		return line
+	}
+}
+
+// ── Edit view ──────────────────────────────────────────
+
+func (m Model) viewEdit() string {
+	var b strings.Builder
+
+	// Header
+	b.WriteString(titleStyle.Render(" git-assist "))
+	b.WriteString("  ")
+	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString("\n")
+
+	title := "  Step 1/5 · Editing: " + m.diffFile
+	if m.editDirty {
+		title += "  " + modifiedStyle.Render("●")
+	}
+	b.WriteString(stepStyle.Render(title))
+	b.WriteString("\n\n")
+
+	// Unsaved changes prompt
+	if m.confirmExit {
+		b.WriteString(m.editArea.View())
+		b.WriteString("\n\n")
+		b.WriteString("  " + modifiedStyle.Render("You have unsaved changes. Discard?") + "\n")
+		b.WriteString("\n")
+		b.WriteString(renderHelp([]helpEntry{
+			{"y", "discard"},
+			{"any", "cancel"},
+		}))
+		return boxBorder.Render(b.String())
+	}
+
+	// Saving indicator
+	if m.saving {
+		b.WriteString(m.editArea.View())
+		b.WriteString("\n\n")
+		b.WriteString("  " + dimStyle.Render("Saving...") + "\n")
+		return boxBorder.Render(b.String())
+	}
+
+	// Textarea
+	b.WriteString(m.editArea.View())
+
+	// Error
+	if m.err != nil {
+		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+	}
+
+	// Help bar
+	b.WriteString("\n\n")
+	b.WriteString(renderHelp([]helpEntry{
+		{"ctrl+s", "save"},
+		{"esc", "back"},
+	}))
 
 	return boxBorder.Render(b.String())
 }

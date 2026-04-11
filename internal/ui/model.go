@@ -28,6 +28,11 @@ type undoResultMsg struct {
 	err   error
 	files []types.FileEntry
 }
+type saveResultMsg struct {
+	err   error
+	files []types.FileEntry
+	diff  string
+}
 
 // Model is the main Bubble Tea model.
 type Model struct {
@@ -59,6 +64,19 @@ type Model struct {
 	bodyInput   textarea.Model
 	showBody    bool
 	bodyFocused bool
+
+	// Diff preview
+	showDiff    bool
+	diffContent string
+	diffFile    string
+	diffScroll  int
+
+	// Edit mode
+	editMode    bool
+	editArea    textarea.Model
+	editDirty   bool
+	saving      bool
+	confirmExit bool
 
 	// Undo confirmation
 	confirmUndo bool
@@ -109,6 +127,12 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	bi.SetHeight(4)
 	bi.CharLimit = 500
 
+	ei := textarea.New()
+	ei.Placeholder = ""
+	ei.SetWidth(60)
+	ei.SetHeight(20)
+	ei.CharLimit = 0
+
 	return Model{
 		step:        stepFiles,
 		files:       files,
@@ -117,6 +141,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		customInput: ci,
 		scopeInput:  si,
 		bodyInput:   bi,
+		editArea:    ei,
 		hasRemote:   git.HasRemote(),
 	}
 }
@@ -152,6 +177,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.files = msg.files
 		m.cursor = 0
+		return m, nil
+
+	case saveResultMsg:
+		m.saving = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		// Carry over selections
+		prevSelected := make(map[string]bool)
+		for _, f := range m.files {
+			if f.Selected {
+				prevSelected[f.Path] = true
+			}
+		}
+		for i, f := range msg.files {
+			if prevSelected[f.Path] {
+				msg.files[i].Selected = true
+			}
+		}
+		m.files = msg.files
+		m.diffContent = msg.diff
+		m.editDirty = false
+		m.editMode = false
 		return m, nil
 
 	case gitignoreResultMsg:

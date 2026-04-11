@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,9 @@ import (
 
 	"git-assist/internal/types"
 )
+
+// ErrBinaryFile is returned when a file is detected as binary.
+var ErrBinaryFile = errors.New("binary file")
 
 // IsGitRepo checks if the current directory is inside a git repository.
 func IsGitRepo() bool {
@@ -122,12 +126,18 @@ func Commit(filePaths []string, cachedPaths []string, message string) error {
 		return err
 	}
 
-	// Stage selected files
-	if len(filePaths) > 0 {
-		args := append([]string{"add", "--"}, filePaths...)
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("staging failed: %s", strings.TrimSpace(string(out)))
+	// Stage selected files individually — skip any that fail
+	staged := 0
+	var lastErr string
+	for _, p := range filePaths {
+		if out, err := exec.Command("git", "add", "--", p).CombinedOutput(); err != nil {
+			lastErr = strings.TrimSpace(string(out))
+			continue
 		}
+		staged++
+	}
+	if staged == 0 && len(filePaths) > 0 {
+		return fmt.Errorf("staging failed: %s", lastErr)
 	}
 
 	// Commit
@@ -293,4 +303,117 @@ func GetCommitStats() string {
 		return strings.TrimSpace(lines[len(lines)-1])
 	}
 	return ""
+}
+
+// GetFileDiff returns the diff output for a single file.
+// Routes by FileStatus to avoid guessing from empty diff output.
+func GetFileDiff(path string, status types.FileStatus) (string, error) {
+	switch status {
+	case types.StatusUntracked:
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read file: %w", err)
+		}
+		if isBinary(content) {
+			return "", ErrBinaryFile
+		}
+		var b strings.Builder
+		b.WriteString("(new file)\n")
+		for _, line := range strings.Split(strings.TrimRight(string(content), "\n"), "\n") {
+			b.WriteString("+ " + line + "\n")
+		}
+		return b.String(), nil
+
+	case types.StatusDeleted:
+		out, err := exec.Command("git", "show", "HEAD:"+path).CombinedOutput()
+		if err != nil {
+			// File may not be in HEAD — try index
+			out, err = exec.Command("git", "diff", "--cached", "--", path).CombinedOutput()
+			if err != nil {
+				return "(deleted file)\n", nil
+			}
+			result := strings.TrimSpace(string(out))
+			if result != "" {
+				return result, nil
+			}
+			return "(deleted file)\n", nil
+		}
+		if isBinary(out) {
+			return "", ErrBinaryFile
+		}
+		var b strings.Builder
+		b.WriteString("(deleted file)\n")
+		for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+			b.WriteString("- " + line + "\n")
+		}
+		return b.String(), nil
+
+	default:
+		// Modified, Added, Renamed — try diff against HEAD, then cached
+		out, err := exec.Command("git", "diff", "HEAD", "--", path).CombinedOutput()
+		if err == nil {
+			result := strings.TrimSpace(string(out))
+			if result != "" {
+				if strings.Contains(result, "Binary files") {
+					return "", ErrBinaryFile
+				}
+				return result, nil
+			}
+		}
+		// Fallback: staged changes not yet committed
+		out, err = exec.Command("git", "diff", "--cached", "--", path).CombinedOutput()
+		if err == nil {
+			result := strings.TrimSpace(string(out))
+			if result != "" {
+				if strings.Contains(result, "Binary files") {
+					return "", ErrBinaryFile
+				}
+				return result, nil
+			}
+		}
+		// Fallback: unstaged changes only
+		out, err = exec.Command("git", "diff", "--", path).CombinedOutput()
+		if err == nil {
+			result := strings.TrimSpace(string(out))
+			if result != "" {
+				if strings.Contains(result, "Binary files") {
+					return "", ErrBinaryFile
+				}
+				return result, nil
+			}
+		}
+		return "(no changes to display)\n", nil
+	}
+}
+
+// ReadFileContent reads the raw content of a file in the working tree.
+func ReadFileContent(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	return string(content), nil
+}
+
+// WriteFileContent writes content to a file in the working tree.
+func WriteFileContent(path string, content string) error {
+	info, err := os.Stat(path)
+	perm := os.FileMode(0644)
+	if err == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(path, []byte(content), perm); err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+	return nil
+}
+
+// isBinary checks if content contains null bytes (indicating binary data).
+func isBinary(data []byte) bool {
+	for _, b := range data {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
 }

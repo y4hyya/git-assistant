@@ -62,6 +62,12 @@ var (
 	previewStyle = lipgloss.NewStyle().Foreground(gray).Italic(true)
 	dimStyle     = lipgloss.NewStyle().Foreground(dimColor)
 
+	// Diff
+	diffAddStyle    = lipgloss.NewStyle().Foreground(green)
+	diffRemoveStyle = lipgloss.NewStyle().Foreground(red)
+	diffHunkStyle   = lipgloss.NewStyle().Foreground(cyan)
+	diffHeaderStyle = lipgloss.NewStyle().Foreground(dimColor)
+
 	// Box
 	boxBorder = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
