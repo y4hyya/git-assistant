@@ -35,10 +35,12 @@ type Model struct {
 	step step
 
 	// Step 1 — file selection
-	files        []types.FileEntry
-	cursor       int
-	branch       string
-	gitignoreMode bool
+	files           []types.FileEntry
+	cursor          int
+	branch          string
+	gitignoreMode   bool
+	existingIgnored []string
+	removeIgnored   map[string]bool
 
 	// Step 2 — type picker
 	typeIdx    int

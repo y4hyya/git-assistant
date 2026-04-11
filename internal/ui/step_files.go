@@ -50,18 +50,28 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Gitignore mode ─────────────────────────────────
 	if m.gitignoreMode {
+		totalItems := len(m.files) + len(m.existingIgnored)
+
 		switch keyMsg.String() {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
 		case "down", "j":
-			if m.cursor < len(m.files)-1 {
+			if m.cursor < totalItems-1 {
 				m.cursor++
 			}
 		case " ":
-			m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
+			if m.cursor < len(m.files) {
+				// Toggle new file for gitignore
+				m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
+			} else {
+				// Toggle existing gitignore entry for removal
+				entry := m.existingIgnored[m.cursor-len(m.files)]
+				m.removeIgnored[entry] = !m.removeIgnored[entry]
+			}
 		case "a":
+			// Only toggle new files
 			allIgnored := true
 			for _, f := range m.files {
 				if !f.Gitignored {
@@ -73,26 +83,33 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.files[i].Gitignored = !allIgnored
 			}
 		case "enter":
-			var ignorePaths []string
+			var addPaths []string
 			var cachedPaths []string
 			for _, f := range m.files {
 				if f.Gitignored {
-					ignorePaths = append(ignorePaths, f.Path)
+					addPaths = append(addPaths, f.Path)
 					if f.Status != types.StatusUntracked {
 						cachedPaths = append(cachedPaths, f.Path)
 					}
 				}
 			}
-			if len(ignorePaths) == 0 {
+			var removePaths []string
+			for entry, remove := range m.removeIgnored {
+				if remove {
+					removePaths = append(removePaths, entry)
+				}
+			}
+			if len(addPaths) == 0 && len(removePaths) == 0 {
 				return m, nil
 			}
 			m.gitignoreCached = cachedPaths
-			return m, doGitignore(ignorePaths, cachedPaths)
-		case "esc":
-			// Cancel — clear gitignore selections and return to commit mode
+			return m, doGitignore(addPaths, cachedPaths, removePaths)
+		case "g", "esc":
 			for i := range m.files {
 				m.files[i].Gitignored = false
 			}
+			m.removeIgnored = nil
+			m.existingIgnored = nil
 			m.gitignoreMode = false
 		case "q":
 			m.quitting = true
@@ -114,6 +131,8 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case " ":
 		m.files[m.cursor].Selected = !m.files[m.cursor].Selected
 	case "g":
+		m.existingIgnored = git.GetGitignoreEntries()
+		m.removeIgnored = make(map[string]bool)
 		m.gitignoreMode = true
 	case "a":
 		allSelected := true
@@ -162,9 +181,12 @@ func doUndo() tea.Cmd {
 	}
 }
 
-func doGitignore(ignorePaths, cachedPaths []string) tea.Cmd {
+func doGitignore(addPaths, cachedPaths, removePaths []string) tea.Cmd {
 	return func() tea.Msg {
-		if err := git.AddToGitignore(ignorePaths); err != nil {
+		if err := git.AddToGitignore(addPaths); err != nil {
+			return gitignoreResultMsg{err: err}
+		}
+		if err := git.RemoveFromGitignore(removePaths); err != nil {
 			return gitignoreResultMsg{err: err}
 		}
 		if err := git.RemoveCached(cachedPaths); err != nil {
@@ -230,9 +252,44 @@ func (m Model) viewFiles() string {
 		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", cursor, check, status, path))
 	}
 
+	// Existing gitignore entries (only in gitignore mode)
+	if m.gitignoreMode && len(m.existingIgnored) > 0 {
+		b.WriteString("\n  " + dimStyle.Render("Already in .gitignore:") + "\n\n")
+		for j, entry := range m.existingIgnored {
+			idx := len(m.files) + j
+
+			cursor := "  "
+			if idx == m.cursor {
+				cursor = cursorStyle.Render("▸ ")
+			}
+
+			check := gitignoreCheck.Render("●")
+			if m.removeIgnored[entry] {
+				check = unselectedCheck.Render("○")
+			}
+
+			path := dimStyle.Render(entry)
+			if idx == m.cursor {
+				path = highlightStyle.Render(entry)
+			}
+
+			b.WriteString(fmt.Sprintf("%s%s      %s\n", cursor, check, path))
+		}
+	}
+
 	// Counter
 	if m.gitignoreMode {
-		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d to gitignore", ignored, len(m.files)))))
+		removing := 0
+		for _, r := range m.removeIgnored {
+			if r {
+				removing++
+			}
+		}
+		counter := fmt.Sprintf("%d to add", ignored)
+		if removing > 0 {
+			counter += fmt.Sprintf(" · %d to remove", removing)
+		}
+		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(counter)))
 	} else {
 		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
 	}
@@ -262,10 +319,10 @@ func (m Model) viewFiles() string {
 	if m.gitignoreMode {
 		b.WriteString(renderHelp([]helpEntry{
 			{"↑↓", "navigate"},
-			{"space", "select"},
+			{"space", "toggle"},
 			{"a", "all"},
 			{"enter", "confirm"},
-			{"esc", "cancel"},
+			{"g", "cancel"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{

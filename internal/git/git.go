@@ -219,6 +219,56 @@ func AddToGitignore(paths []string) error {
 	return nil
 }
 
+// GetGitignoreEntries reads .gitignore and returns non-empty, non-comment lines.
+func GetGitignoreEntries() []string {
+	content, err := os.ReadFile(".gitignore")
+	if err != nil {
+		return nil
+	}
+	var entries []string
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			entries = append(entries, line)
+		}
+	}
+	return entries
+}
+
+// RemoveFromGitignore removes the given entries from .gitignore by rewriting the file.
+func RemoveFromGitignore(entries []string) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	remove := make(map[string]bool)
+	for _, e := range entries {
+		remove[e] = true
+	}
+
+	content, err := os.ReadFile(".gitignore")
+	if err != nil {
+		return nil // no .gitignore, nothing to remove
+	}
+
+	var kept []string
+	for _, line := range strings.Split(string(content), "\n") {
+		if !remove[strings.TrimSpace(line)] {
+			kept = append(kept, line)
+		}
+	}
+
+	// Trim trailing empty lines
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+
+	result := strings.Join(kept, "\n")
+	if result != "" {
+		result += "\n"
+	}
+	return os.WriteFile(".gitignore", []byte(result), 0644)
+}
+
 // RemoveCached removes files from git tracking without deleting them from disk.
 func RemoveCached(paths []string) error {
 	if len(paths) == 0 {
