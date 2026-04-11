@@ -28,6 +28,8 @@ func (m Model) updateType(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.typeIdx < totalItems-1 {
 			m.typeIdx++
 		}
+	case "!":
+		m.breaking = !m.breaking
 	case "enter":
 		if m.typeIdx == len(types.CommitTypes) {
 			// Custom type
@@ -36,8 +38,8 @@ func (m Model) updateType(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.commitType = types.CommitTypes[m.typeIdx].Name
-		m.step = stepMessage
-		m.msgInput.Focus()
+		m.step = stepScope
+		m.scopeInput.Focus()
 		return m, nil
 	case "esc":
 		m.step = stepFiles
@@ -60,7 +62,10 @@ func (m Model) viewType() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 2/4 · Choose commit type"))
+	b.WriteString(stepStyle.Render("  Step 2/5 · Choose commit type"))
+	if m.breaking {
+		b.WriteString("   " + errorStyle.Render("! BREAKING CHANGE"))
+	}
 	b.WriteString("\n\n")
 
 	// Commit type list
@@ -103,6 +108,7 @@ func (m Model) viewType() string {
 	b.WriteString(renderHelp([]helpEntry{
 		{"↑↓", "navigate"},
 		{"enter", "select"},
+		{"!", "breaking"},
 		{"esc", "back"},
 		{"q", "quit"},
 	}))
@@ -119,8 +125,8 @@ func (m Model) updateCustom(msg tea.Msg) (tea.Model, tea.Cmd) {
 			val := strings.TrimSpace(m.customInput.Value())
 			if val != "" {
 				m.commitType = val
-				m.step = stepMessage
-				m.msgInput.Focus()
+				m.step = stepScope
+				m.scopeInput.Focus()
 				return m, nil
 			}
 			return m, nil
@@ -143,7 +149,7 @@ func (m Model) viewCustom() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 2/4 · Enter custom commit type"))
+	b.WriteString(stepStyle.Render("  Step 2/5 · Enter custom commit type"))
 	b.WriteString("\n\n")
 
 	b.WriteString("  " + m.customInput.View() + "\n")

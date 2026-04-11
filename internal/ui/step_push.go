@@ -62,11 +62,11 @@ func (m Model) viewPush() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 4/4 · Push to remote"))
+	b.WriteString(stepStyle.Render("  Step 5/5 · Push to remote"))
 	b.WriteString("\n\n")
 
 	// Commit success
-	msg := m.commitType + ": " + strings.TrimSpace(m.msgInput.Value())
+	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
 	b.WriteString("  " + successStyle.Render("✓") + " Committed: " + msg + "\n")
 
 	stats := git.GetCommitStats()

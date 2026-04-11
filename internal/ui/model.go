@@ -14,6 +14,7 @@ const (
 	stepFiles   step = iota // file selection
 	stepType                // commit type picker
 	stepCustom              // custom type input
+	stepScope               // optional scope input
 	stepMessage             // commit message input
 	stepPush                // branch picker + push
 	stepDone                // success screen
@@ -36,9 +37,14 @@ type Model struct {
 	// Step 2 — type picker
 	typeIdx    int
 	commitType string
+	breaking   bool
 
 	// Step 2b — custom type input
 	customInput textinput.Model
+
+	// Step 2c — scope input
+	scopeInput textinput.Model
+	scope      string
 
 	// Step 3 — commit message
 	msgInput textinput.Model
@@ -78,14 +84,32 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	ci.CharLimit = 20
 	ci.Width = 30
 
+	si := textinput.New()
+	si.Placeholder = "e.g. auth, api, ui (empty to skip)"
+	si.CharLimit = 30
+	si.Width = 40
+
 	return Model{
 		step:        stepFiles,
 		files:       files,
 		branch:      branch,
 		msgInput:    mi,
 		customInput: ci,
+		scopeInput:  si,
 		hasRemote:   git.HasRemote(),
 	}
+}
+
+// commitPrefix builds the conventional commit prefix: type(scope)!
+func (m Model) commitPrefix() string {
+	prefix := m.commitType
+	if m.scope != "" {
+		prefix += "(" + m.scope + ")"
+	}
+	if m.breaking {
+		prefix += "!"
+	}
+	return prefix
 }
 
 func (m Model) Init() tea.Cmd {
@@ -173,6 +197,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateType(msg)
 	case stepCustom:
 		return m.updateCustom(msg)
+	case stepScope:
+		return m.updateScope(msg)
 	case stepMessage:
 		return m.updateMessage(msg)
 	case stepPush:
@@ -196,6 +222,8 @@ func (m Model) View() string {
 		return m.viewType()
 	case stepCustom:
 		return m.viewCustom()
+	case stepScope:
+		return m.viewScope()
 	case stepMessage:
 		return m.viewMessage()
 	case stepPush:

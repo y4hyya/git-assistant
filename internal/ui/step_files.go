@@ -124,7 +124,7 @@ func (m Model) viewFiles() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 1/4 · Select files to commit"))
+	b.WriteString(stepStyle.Render("  Step 1/5 · Select files to commit"))
 	b.WriteString("\n\n")
 
 	// File list

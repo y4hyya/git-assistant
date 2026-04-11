@@ -30,7 +30,7 @@ func (m Model) viewDone() string {
 	b.WriteString("\n\n")
 
 	// Commit summary
-	msg := m.commitType + ": " + strings.TrimSpace(m.msgInput.Value())
+	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
 	b.WriteString("  " + successStyle.Render("✓") + " Committed: " + msg + "\n")
 
 	// Push summary

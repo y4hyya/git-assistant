@@ -22,7 +22,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			val := strings.TrimSpace(m.msgInput.Value())
 			if val != "" {
 				m.committing = true
-				fullMsg := m.commitType + ": " + val
+				fullMsg := m.commitPrefix() + ": " + val
 				var paths []string
 				for _, f := range m.files {
 					if f.Selected {
@@ -33,7 +33,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "esc":
-			m.step = stepType
+			m.step = stepScope
 			return m, nil
 		}
 	}
@@ -60,7 +60,7 @@ func (m Model) viewMessage() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 3/4 · Write commit message"))
+	b.WriteString(stepStyle.Render("  Step 4/5 · Write commit message"))
 	b.WriteString("\n\n")
 
 	// Summary
@@ -70,7 +70,8 @@ func (m Model) viewMessage() string {
 			count++
 		}
 	}
-	b.WriteString(fmt.Sprintf("  Type:  %s\n", activeStyle.Render(m.commitType)))
+	prefix := m.commitPrefix()
+	b.WriteString(fmt.Sprintf("  Type:  %s\n", activeStyle.Render(prefix)))
 	b.WriteString(fmt.Sprintf("  Files: %s\n\n", dimStyle.Render(fmt.Sprintf("%d selected", count))))
 
 	// Input
@@ -79,7 +80,7 @@ func (m Model) viewMessage() string {
 	// Live preview
 	val := m.msgInput.Value()
 	if val != "" {
-		preview := m.commitType + ": " + val
+		preview := prefix + ": " + val
 		b.WriteString("\n  " + previewStyle.Render("→ "+preview) + "\n")
 	}
 
