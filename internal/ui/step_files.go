@@ -6,8 +6,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"git-assist/internal/git"
 	"git-assist/internal/types"
 )
+
+type gitignoreResultMsg struct{ err error }
 
 func fileStatusStyle(s types.FileStatus) lipgloss.Style {
 	switch s {
@@ -44,7 +47,11 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case " ":
+		m.files[m.cursor].Gitignored = false
 		m.files[m.cursor].Selected = !m.files[m.cursor].Selected
+	case "g":
+		m.files[m.cursor].Selected = false
+		m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
 	case "a":
 		allSelected := true
 		for _, f := range m.files {
@@ -58,22 +65,53 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		hasSelected := false
+		hasGitignored := false
 		for _, f := range m.files {
 			if f.Selected {
 				hasSelected = true
-				break
+			}
+			if f.Gitignored {
+				hasGitignored = true
 			}
 		}
-		if hasSelected {
-			m.step = stepType
-			m.cursor = 0
+		if !hasSelected && !hasGitignored {
+			return m, nil
 		}
+		// Process gitignored files if any
+		var ignorePaths []string
+		var cachedPaths []string
+		for _, f := range m.files {
+			if f.Gitignored {
+				ignorePaths = append(ignorePaths, f.Path)
+				if f.Status != types.StatusUntracked {
+					cachedPaths = append(cachedPaths, f.Path)
+				}
+			}
+		}
+		m.gitignoreCached = cachedPaths
+		if len(ignorePaths) > 0 {
+			return m, doGitignore(ignorePaths, cachedPaths)
+		}
+		m.step = stepType
+		m.cursor = 0
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
 	}
 
 	return m, nil
+}
+
+func doGitignore(ignorePaths, cachedPaths []string) tea.Cmd {
+	return func() tea.Msg {
+		if err := git.AddToGitignore(ignorePaths); err != nil {
+			return gitignoreResultMsg{err: err}
+		}
+		if err := git.RemoveCached(cachedPaths); err != nil {
+			return gitignoreResultMsg{err: err}
+		}
+		return gitignoreResultMsg{}
+	}
 }
 
 // ── View ────────────────────────────────────────────────
@@ -91,6 +129,7 @@ func (m Model) viewFiles() string {
 
 	// File list
 	selected := 0
+	ignored := 0
 	for i, f := range m.files {
 		// Cursor arrow
 		cursor := "  "
@@ -100,7 +139,10 @@ func (m Model) viewFiles() string {
 
 		// Checkbox
 		check := unselectedCheck.Render("○")
-		if f.Selected {
+		if f.Gitignored {
+			check = gitignoreCheck.Render("●")
+			ignored++
+		} else if f.Selected {
 			check = selectedCheck.Render("●")
 			selected++
 		}
@@ -118,7 +160,11 @@ func (m Model) viewFiles() string {
 	}
 
 	// Counter
-	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
+	counter := fmt.Sprintf("%d/%d selected", selected, len(m.files))
+	if ignored > 0 {
+		counter += fmt.Sprintf(" · %d gitignored", ignored)
+	}
+	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(counter)))
 
 	// Error
 	if m.err != nil {
@@ -130,6 +176,7 @@ func (m Model) viewFiles() string {
 	b.WriteString(renderHelp([]helpEntry{
 		{"↑↓", "navigate"},
 		{"space", "select"},
+		{"g", "gitignore"},
 		{"a", "all"},
 		{"enter", "next"},
 		{"q", "quit"},

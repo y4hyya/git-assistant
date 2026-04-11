@@ -49,6 +49,9 @@ type Model struct {
 	hasRemote  bool
 	pushBranch string
 
+	// Gitignore — paths that need git rm --cached during commit
+	gitignoreCached []string
+
 	// State flags
 	committing bool
 	pushing    bool
@@ -94,6 +97,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, nil
+
+	case gitignoreResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		// Remove gitignored entries from file list
+		var kept []types.FileEntry
+		for _, f := range m.files {
+			if !f.Gitignored {
+				kept = append(kept, f)
+			}
+		}
+		// Inject .gitignore as auto-selected for commit
+		hasGitignore := false
+		for i, f := range kept {
+			if f.Path == ".gitignore" {
+				kept[i].Selected = true
+				hasGitignore = true
+				break
+			}
+		}
+		if !hasGitignore {
+			kept = append(kept, types.FileEntry{
+				Path:     ".gitignore",
+				Status:   types.StatusModified,
+				Selected: true,
+			})
+		}
+		m.files = kept
+		m.step = stepType
+		m.cursor = 0
 		return m, nil
 
 	case commitResultMsg:

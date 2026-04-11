@@ -29,7 +29,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 						paths = append(paths, f.Path)
 					}
 				}
-				return m, doCommit(paths, fullMsg)
+				return m, doCommit(paths, m.gitignoreCached, fullMsg)
 			}
 			return m, nil
 		case "esc":
@@ -44,9 +44,9 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func doCommit(paths []string, message string) tea.Cmd {
+func doCommit(paths []string, cachedPaths []string, message string) tea.Cmd {
 	return func() tea.Msg {
-		err := git.Commit(paths, message)
+		err := git.Commit(paths, cachedPaths, message)
 		return commitResultMsg{err: err}
 	}
 }

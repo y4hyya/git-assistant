@@ -31,9 +31,10 @@ func (s FileStatus) Symbol() string {
 
 // FileEntry represents a changed file in the repository.
 type FileEntry struct {
-	Path     string
-	Status   FileStatus
-	Selected bool
+	Path       string
+	Status     FileStatus
+	Selected   bool
+	Gitignored bool
 }
 
 // CommitType represents a conventional commit type.

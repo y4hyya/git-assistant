@@ -40,6 +40,7 @@ var (
 	// List items
 	cursorStyle     = lipgloss.NewStyle().Foreground(purple).Bold(true)
 	selectedCheck   = lipgloss.NewStyle().Foreground(green).Bold(true)
+	gitignoreCheck  = lipgloss.NewStyle().Foreground(yellow).Bold(true)
 	unselectedCheck = lipgloss.NewStyle().Foreground(dimColor)
 	filePathStyle   = lipgloss.NewStyle().Foreground(white)
 	highlightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
