@@ -37,6 +37,71 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle undo confirmation
+	if m.confirmUndo {
+		switch keyMsg.String() {
+		case "y":
+			return m, doUndo()
+		default:
+			m.confirmUndo = false
+			return m, nil
+		}
+	}
+
+	// ── Gitignore mode ─────────────────────────────────
+	if m.gitignoreMode {
+		switch keyMsg.String() {
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.files)-1 {
+				m.cursor++
+			}
+		case " ":
+			m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
+		case "a":
+			allIgnored := true
+			for _, f := range m.files {
+				if !f.Gitignored {
+					allIgnored = false
+					break
+				}
+			}
+			for i := range m.files {
+				m.files[i].Gitignored = !allIgnored
+			}
+		case "enter":
+			var ignorePaths []string
+			var cachedPaths []string
+			for _, f := range m.files {
+				if f.Gitignored {
+					ignorePaths = append(ignorePaths, f.Path)
+					if f.Status != types.StatusUntracked {
+						cachedPaths = append(cachedPaths, f.Path)
+					}
+				}
+			}
+			if len(ignorePaths) == 0 {
+				return m, nil
+			}
+			m.gitignoreCached = cachedPaths
+			return m, doGitignore(ignorePaths, cachedPaths)
+		case "esc":
+			// Cancel — clear gitignore selections and return to commit mode
+			for i := range m.files {
+				m.files[i].Gitignored = false
+			}
+			m.gitignoreMode = false
+		case "q":
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
+	// ── Commit mode (default) ──────────────────────────
 	switch keyMsg.String() {
 	case "up", "k":
 		if m.cursor > 0 {
@@ -47,11 +112,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case " ":
-		m.files[m.cursor].Gitignored = false
 		m.files[m.cursor].Selected = !m.files[m.cursor].Selected
 	case "g":
-		m.files[m.cursor].Selected = false
-		m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
+		m.gitignoreMode = true
 	case "a":
 		allSelected := true
 		for _, f := range m.files {
@@ -63,34 +126,18 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i := range m.files {
 			m.files[i].Selected = !allSelected
 		}
+	case "u":
+		m.confirmUndo = true
 	case "enter":
 		hasSelected := false
-		hasGitignored := false
 		for _, f := range m.files {
 			if f.Selected {
 				hasSelected = true
-			}
-			if f.Gitignored {
-				hasGitignored = true
+				break
 			}
 		}
-		if !hasSelected && !hasGitignored {
+		if !hasSelected {
 			return m, nil
-		}
-		// Process gitignored files if any
-		var ignorePaths []string
-		var cachedPaths []string
-		for _, f := range m.files {
-			if f.Gitignored {
-				ignorePaths = append(ignorePaths, f.Path)
-				if f.Status != types.StatusUntracked {
-					cachedPaths = append(cachedPaths, f.Path)
-				}
-			}
-		}
-		m.gitignoreCached = cachedPaths
-		if len(ignorePaths) > 0 {
-			return m, doGitignore(ignorePaths, cachedPaths)
 		}
 		m.step = stepType
 		m.cursor = 0
@@ -100,6 +147,19 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func doUndo() tea.Cmd {
+	return func() tea.Msg {
+		if err := git.UndoLastCommit(); err != nil {
+			return undoResultMsg{err: err}
+		}
+		files, err := git.GetStatus()
+		if err != nil {
+			return undoResultMsg{err: err}
+		}
+		return undoResultMsg{files: files}
+	}
 }
 
 func doGitignore(ignorePaths, cachedPaths []string) tea.Cmd {
@@ -124,7 +184,11 @@ func (m Model) viewFiles() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 1/5 · Select files to commit"))
+	if m.gitignoreMode {
+		b.WriteString(stepStyle.Render("  Step 1/5 · Select files to add .gitignore"))
+	} else {
+		b.WriteString(stepStyle.Render("  Step 1/5 · Select files to commit"))
+	}
 	b.WriteString("\n\n")
 
 	// File list
@@ -137,14 +201,21 @@ func (m Model) viewFiles() string {
 			cursor = cursorStyle.Render("▸ ")
 		}
 
-		// Checkbox
+		// Checkbox — depends on mode
 		check := unselectedCheck.Render("○")
-		if f.Gitignored {
-			check = gitignoreCheck.Render("●")
-			ignored++
-		} else if f.Selected {
-			check = selectedCheck.Render("●")
-			selected++
+		if m.gitignoreMode {
+			if f.Gitignored {
+				check = gitignoreCheck.Render("●")
+				ignored++
+			} else if f.Selected {
+				// Show commit selections as dimmed in gitignore mode
+				check = dimmedCheck.Render("●")
+			}
+		} else {
+			if f.Selected {
+				check = selectedCheck.Render("●")
+				selected++
+			}
 		}
 
 		// Status badge
@@ -160,11 +231,26 @@ func (m Model) viewFiles() string {
 	}
 
 	// Counter
-	counter := fmt.Sprintf("%d/%d selected", selected, len(m.files))
-	if ignored > 0 {
-		counter += fmt.Sprintf(" · %d gitignored", ignored)
+	if m.gitignoreMode {
+		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d to gitignore", ignored, len(m.files)))))
+	} else {
+		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
 	}
-	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(counter)))
+
+	// Undo confirmation
+	if m.confirmUndo {
+		lastMsg := git.GetLastCommitMessage()
+		if lastMsg != "" {
+			b.WriteString("\n  " + dimStyle.Render("Last: "+lastMsg))
+		}
+		b.WriteString("\n  " + modifiedStyle.Render("Undo last commit? Changes will be kept.") + "\n")
+		b.WriteString("\n")
+		b.WriteString(renderHelp([]helpEntry{
+			{"y", "confirm"},
+			{"any", "cancel"},
+		}))
+		return boxBorder.Render(b.String())
+	}
 
 	// Error
 	if m.err != nil {
@@ -173,14 +259,25 @@ func (m Model) viewFiles() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"↑↓", "navigate"},
-		{"space", "select"},
-		{"g", "gitignore"},
-		{"a", "all"},
-		{"enter", "next"},
-		{"q", "quit"},
-	}))
+	if m.gitignoreMode {
+		b.WriteString(renderHelp([]helpEntry{
+			{"↑↓", "navigate"},
+			{"space", "select"},
+			{"a", "all"},
+			{"enter", "confirm"},
+			{"esc", "cancel"},
+		}))
+	} else {
+		b.WriteString(renderHelp([]helpEntry{
+			{"↑↓", "navigate"},
+			{"space", "select"},
+			{"g", "gitignore"},
+			{"a", "all"},
+			{"u", "undo"},
+			{"enter", "next"},
+			{"q", "quit"},
+		}))
+	}
 
 	return boxBorder.Render(b.String())
 }

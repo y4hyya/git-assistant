@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
@@ -23,6 +24,10 @@ const (
 // Async result messages
 type commitResultMsg struct{ err error }
 type pushResultMsg struct{ err error }
+type undoResultMsg struct {
+	err   error
+	files []types.FileEntry
+}
 
 // Model is the main Bubble Tea model.
 type Model struct {
@@ -30,9 +35,10 @@ type Model struct {
 	step step
 
 	// Step 1 — file selection
-	files  []types.FileEntry
-	cursor int
-	branch string
+	files        []types.FileEntry
+	cursor       int
+	branch       string
+	gitignoreMode bool
 
 	// Step 2 — type picker
 	typeIdx    int
@@ -47,7 +53,13 @@ type Model struct {
 	scope      string
 
 	// Step 3 — commit message
-	msgInput textinput.Model
+	msgInput    textinput.Model
+	bodyInput   textarea.Model
+	showBody    bool
+	bodyFocused bool
+
+	// Undo confirmation
+	confirmUndo bool
 
 	// Step 4 — push
 	branches   []string
@@ -89,6 +101,12 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	si.CharLimit = 30
 	si.Width = 40
 
+	bi := textarea.New()
+	bi.Placeholder = "Optional detailed description..."
+	bi.SetWidth(50)
+	bi.SetHeight(4)
+	bi.CharLimit = 500
+
 	return Model{
 		step:        stepFiles,
 		files:       files,
@@ -96,6 +114,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		msgInput:    mi,
 		customInput: ci,
 		scopeInput:  si,
+		bodyInput:   bi,
 		hasRemote:   git.HasRemote(),
 	}
 }
@@ -123,36 +142,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
-	case gitignoreResultMsg:
+	case undoResultMsg:
+		m.confirmUndo = false
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
-		// Remove gitignored entries from file list
-		var kept []types.FileEntry
+		m.files = msg.files
+		m.cursor = 0
+		return m, nil
+
+	case gitignoreResultMsg:
+		m.gitignoreMode = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		// Remember which files were commit-selected
+		prevSelected := make(map[string]bool)
 		for _, f := range m.files {
-			if !f.Gitignored {
-				kept = append(kept, f)
+			if f.Selected {
+				prevSelected[f.Path] = true
 			}
 		}
-		// Inject .gitignore as auto-selected for commit
-		hasGitignore := false
-		for i, f := range kept {
-			if f.Path == ".gitignore" {
-				kept[i].Selected = true
-				hasGitignore = true
-				break
+		// Refresh file list from git status
+		freshFiles, err := git.GetStatus()
+		if err != nil {
+			m.err = err
+			return m, nil
+		}
+		// Carry over commit selections for files that remain
+		for i, f := range freshFiles {
+			if prevSelected[f.Path] {
+				freshFiles[i].Selected = true
 			}
 		}
-		if !hasGitignore {
-			kept = append(kept, types.FileEntry{
-				Path:     ".gitignore",
-				Status:   types.StatusModified,
-				Selected: true,
-			})
-		}
-		m.files = kept
-		m.step = stepType
+		m.files = freshFiles
 		m.cursor = 0
 		return m, nil
 

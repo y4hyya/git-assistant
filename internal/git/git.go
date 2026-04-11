@@ -123,9 +123,11 @@ func Commit(filePaths []string, cachedPaths []string, message string) error {
 	}
 
 	// Stage selected files
-	args := append([]string{"add", "--"}, filePaths...)
-	if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("staging failed: %s", strings.TrimSpace(string(out)))
+	if len(filePaths) > 0 {
+		args := append([]string{"add", "--"}, filePaths...)
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("staging failed: %s", strings.TrimSpace(string(out)))
+		}
 	}
 
 	// Commit
@@ -133,6 +135,24 @@ func Commit(filePaths []string, cachedPaths []string, message string) error {
 		return fmt.Errorf("commit failed: %s", strings.TrimSpace(string(out)))
 	}
 
+	return nil
+}
+
+// GetLastCommitMessage returns the subject line of the last commit.
+func GetLastCommitMessage() string {
+	out, err := exec.Command("git", "log", "-1", "--format=%s").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// UndoLastCommit performs a soft reset, keeping changes staged.
+func UndoLastCommit() error {
+	out, err := exec.Command("git", "reset", "--soft", "HEAD~1").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("undo failed: %s", strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 

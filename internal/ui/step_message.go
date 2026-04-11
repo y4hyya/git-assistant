@@ -18,11 +18,49 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
+		case "tab":
+			if !m.showBody {
+				// Show body and focus it
+				m.showBody = true
+				m.bodyFocused = true
+				m.msgInput.Blur()
+				m.bodyInput.Focus()
+			} else if m.bodyFocused {
+				// Switch focus back to subject
+				m.bodyFocused = false
+				m.bodyInput.Blur()
+				m.msgInput.Focus()
+			} else {
+				// Switch focus to body
+				m.bodyFocused = true
+				m.msgInput.Blur()
+				m.bodyInput.Focus()
+			}
+			return m, nil
 		case "enter":
+			// In body mode, enter is handled by textarea (newline)
+			if m.bodyFocused {
+				break
+			}
 			val := strings.TrimSpace(m.msgInput.Value())
 			if val != "" {
 				m.committing = true
-				fullMsg := m.commitPrefix() + ": " + val
+				fullMsg := m.buildCommitMessage(val)
+				var paths []string
+				for _, f := range m.files {
+					if f.Selected {
+						paths = append(paths, f.Path)
+					}
+				}
+				return m, doCommit(paths, m.gitignoreCached, fullMsg)
+			}
+			return m, nil
+		case "ctrl+d":
+			// Commit from body
+			val := strings.TrimSpace(m.msgInput.Value())
+			if val != "" {
+				m.committing = true
+				fullMsg := m.buildCommitMessage(val)
 				var paths []string
 				for _, f := range m.files {
 					if f.Selected {
@@ -33,15 +71,38 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "esc":
+			if m.bodyFocused {
+				// Exit body, focus subject
+				m.bodyFocused = false
+				m.bodyInput.Blur()
+				m.msgInput.Focus()
+				return m, nil
+			}
 			m.step = stepScope
 			return m, nil
 		}
 	}
 
-	// Pass everything else to the text input (typing, blink, etc.)
+	// Route input to the focused widget
 	var cmd tea.Cmd
-	m.msgInput, cmd = m.msgInput.Update(msg)
+	if m.bodyFocused {
+		m.bodyInput, cmd = m.bodyInput.Update(msg)
+	} else {
+		m.msgInput, cmd = m.msgInput.Update(msg)
+	}
 	return m, cmd
+}
+
+// buildCommitMessage constructs the full commit message with optional body.
+func (m Model) buildCommitMessage(subject string) string {
+	msg := m.commitPrefix() + ": " + subject
+	if m.showBody {
+		body := strings.TrimSpace(m.bodyInput.Value())
+		if body != "" {
+			msg += "\n\n" + body
+		}
+	}
+	return msg
 }
 
 func doCommit(paths []string, cachedPaths []string, message string) tea.Cmd {
@@ -74,8 +135,28 @@ func (m Model) viewMessage() string {
 	b.WriteString(fmt.Sprintf("  Type:  %s\n", activeStyle.Render(prefix)))
 	b.WriteString(fmt.Sprintf("  Files: %s\n\n", dimStyle.Render(fmt.Sprintf("%d selected", count))))
 
-	// Input
+	// Subject input
+	label := "  Subject"
+	if !m.bodyFocused {
+		label = highlightStyle.Render("  Subject")
+	} else {
+		label = dimStyle.Render("  Subject")
+	}
+	b.WriteString(label + "\n")
 	b.WriteString("  " + m.msgInput.View() + "\n")
+
+	// Body input (shown when tab is pressed)
+	if m.showBody {
+		b.WriteString("\n")
+		label = "  Body"
+		if m.bodyFocused {
+			label = highlightStyle.Render("  Body")
+		} else {
+			label = dimStyle.Render("  Body")
+		}
+		b.WriteString(label + "\n")
+		b.WriteString("  " + m.bodyInput.View() + "\n")
+	}
 
 	// Live preview
 	val := m.msgInput.Value()
@@ -96,10 +177,25 @@ func (m Model) viewMessage() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "commit"},
-		{"esc", "back"},
-	}))
+	if m.bodyFocused {
+		b.WriteString(renderHelp([]helpEntry{
+			{"ctrl+d", "commit"},
+			{"tab", "subject"},
+			{"esc", "back"},
+		}))
+	} else if m.showBody {
+		b.WriteString(renderHelp([]helpEntry{
+			{"enter", "commit"},
+			{"tab", "body"},
+			{"esc", "back"},
+		}))
+	} else {
+		b.WriteString(renderHelp([]helpEntry{
+			{"enter", "commit"},
+			{"tab", "add body"},
+			{"esc", "back"},
+		}))
+	}
 
 	return boxBorder.Render(b.String())
 }
