@@ -85,15 +85,36 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case "up":
+			switch f {
+			case focusSubject:
+				m.msgInput.Blur()
+				m.scopeInput.Focus()
+			}
+			return m, nil
+
+		case "down":
+			switch f {
+			case focusScope:
+				m.scope = strings.TrimSpace(m.scopeInput.Value())
+				m.scopeInput.Blur()
+				m.msgInput.Focus()
+			case focusSubject:
+				if m.showBody {
+					m.msgInput.Blur()
+					m.bodyInput.Focus()
+					m.bodyFocused = true
+				}
+			}
+			return m, nil
+
 		case "esc":
 			switch f {
 			case focusBody:
-				// Body → Subject
 				m.bodyInput.Blur()
 				m.bodyFocused = false
 				m.msgInput.Focus()
 			case focusSubject:
-				// Subject → Scope
 				m.msgInput.Blur()
 				m.scopeInput.Focus()
 			case focusScope:
@@ -223,8 +244,8 @@ func (m Model) viewMessage() string {
 	switch f {
 	case focusScope:
 		b.WriteString(renderHelp([]helpEntry{
+			{symArrows, "navigate"},
 			{"enter", "subject"},
-			{"tab", "subject"},
 			{"esc", "back"},
 		}))
 	case focusBody:
@@ -236,12 +257,14 @@ func (m Model) viewMessage() string {
 	default:
 		if m.showBody {
 			b.WriteString(renderHelp([]helpEntry{
+				{symArrows, "navigate"},
 				{"enter", "next"},
 				{"tab", "body"},
 				{"esc", "scope"},
 			}))
 		} else {
 			b.WriteString(renderHelp([]helpEntry{
+				{symArrows, "navigate"},
 				{"enter", "next"},
 				{"tab", "add body"},
 				{"esc", "scope"},
