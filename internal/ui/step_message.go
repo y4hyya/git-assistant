@@ -123,7 +123,9 @@ func (m Model) viewMessage() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 4/5 · Write commit message"))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Write commit message"))
 	b.WriteString("\n\n")
 
 	// Summary

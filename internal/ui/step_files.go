@@ -169,6 +169,46 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// ── Filter mode ───────────────────────────────────
+	if m.filterMode {
+		switch keyMsg.String() {
+		case "up":
+			if m.filterCursor > 0 {
+				m.filterCursor--
+			}
+		case "down":
+			if m.filterCursor < len(m.filterMatches)-1 {
+				m.filterCursor++
+			}
+		case "tab":
+			if len(m.filterMatches) > 0 {
+				idx := m.filterMatches[m.filterCursor]
+				m.files[idx].Selected = !m.files[idx].Selected
+			}
+		case "enter":
+			if len(m.filterMatches) > 0 {
+				m.cursor = m.filterMatches[m.filterCursor]
+			}
+			m.filterMode = false
+			m.filterInput.Reset()
+		case "esc":
+			m.filterMode = false
+			m.filterInput.Reset()
+		default:
+			var cmd tea.Cmd
+			prevValue := m.filterInput.Value()
+			m.filterInput, cmd = m.filterInput.Update(msg)
+			if m.filterInput.Value() != prevValue {
+				m.filterMatches = computeFilterMatches(m.files, m.filterInput.Value())
+				if m.filterCursor >= len(m.filterMatches) {
+					m.filterCursor = max(0, len(m.filterMatches)-1)
+				}
+			}
+			return m, cmd
+		}
+		return m, nil
+	}
+
 	// ── Diff preview mode ──────────────────────────────
 	if m.showDiff {
 		diffLines := strings.Split(m.diffContent, "\n")
@@ -178,7 +218,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Visible lines based on terminal height (box padding + header + footer)
-		visible := m.height - 12
+		visible := m.height - 13
 		if visible < 5 {
 			visible = 5
 		}
@@ -264,6 +304,12 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diffFile = f.Path
 		m.diffScroll = 0
 		m.showDiff = true
+	case "/":
+		m.filterMode = true
+		m.filterInput.Focus()
+		m.filterInput.Reset()
+		m.filterMatches = computeFilterMatches(m.files, "")
+		m.filterCursor = 0
 	case "g":
 		m.existingIgnored = git.GetGitignoreEntries()
 		m.removeIgnored = make(map[string]bool)
@@ -301,7 +347,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Adjust scroll to keep cursor visible
 	if !m.gitignoreMode {
-		visible := m.height - 12
+		visible := m.height - 13
 		if visible < 5 {
 			visible = 5
 		}
@@ -371,6 +417,11 @@ func (m Model) viewFiles() string {
 		return m.viewDiff()
 	}
 
+	// ── Filter mode view ───────────────────────────────
+	if m.filterMode {
+		return m.viewFilter()
+	}
+
 	var b strings.Builder
 
 	// Header
@@ -378,10 +429,12 @@ func (m Model) viewFiles() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
 	if m.gitignoreMode {
-		b.WriteString(stepStyle.Render("  Step 1/5 · Select files to add .gitignore"))
+		b.WriteString(stepStyle.Render("  Select files to add .gitignore"))
 	} else {
-		b.WriteString(stepStyle.Render("  Step 1/5 · Select files to commit"))
+		b.WriteString(stepStyle.Render("  Select files to commit"))
 	}
 	b.WriteString("\n\n")
 
@@ -401,7 +454,7 @@ func (m Model) viewFiles() string {
 	start := 0
 	end := len(m.files)
 	if !m.gitignoreMode {
-		visibleCount := m.height - 12
+		visibleCount := m.height - 13
 		if visibleCount < 5 {
 			visibleCount = 5
 		}
@@ -532,8 +585,9 @@ func (m Model) viewFiles() string {
 		b.WriteString(renderHelp([]helpEntry{
 			{"↑↓", "navigate"},
 			{"space", "select"},
+			{"/", "filter"},
 			{"d", "diff"},
-			{"g", "gitignore"},
+			{"g", "ignore"},
 			{"u", "undo"},
 			{"enter", "next"},
 			{"q", "quit"},
@@ -553,7 +607,9 @@ func (m Model) viewDiff() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 1/5 · Diff: " + m.diffFile))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Diff: " + m.diffFile))
 	b.WriteString("\n\n")
 
 	// Binary file
@@ -570,7 +626,7 @@ func (m Model) viewDiff() string {
 
 	// Diff content with colors
 	lines := strings.Split(m.diffContent, "\n")
-	visible := m.height - 12
+	visible := m.height - 13
 	if visible < 5 {
 		visible = 5
 	}
@@ -645,7 +701,9 @@ func (m Model) viewEdit() string {
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
 
-	title := "  Step 1/5 · Editing: " + m.diffFile
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	title := "  Editing: " + m.diffFile
 	if m.editDirty {
 		title += "  " + modifiedStyle.Render("●")
 	}
@@ -704,4 +762,155 @@ func renderHelp(entries []helpEntry) string {
 		parts = append(parts, helpKeyStyle.Render(e.key)+" "+helpStyle.Render(e.desc))
 	}
 	return "  " + strings.Join(parts, "    ")
+}
+
+// ── Progress breadcrumb ───────────────────────────────
+
+func stepProgressIndex(s step) int {
+	switch s {
+	case stepFiles:
+		return 0
+	case stepType, stepCustom:
+		return 1
+	case stepScope:
+		return 2
+	case stepMessage:
+		return 3
+	case stepPush:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func renderProgress(current step) string {
+	names := []string{"Files", "Type", "Scope", "Message", "Push"}
+	currentIdx := stepProgressIndex(current)
+
+	var parts []string
+	for i, name := range names {
+		if i < currentIdx {
+			parts = append(parts, successStyle.Render("✓ "+name))
+		} else if i == currentIdx {
+			parts = append(parts, activeStyle.Render("▸ "+name))
+		} else {
+			parts = append(parts, dimStyle.Render("○ "+name))
+		}
+	}
+	return "  " + strings.Join(parts, "  ")
+}
+
+// ── Fuzzy filter ──────────────────────────────────────
+
+func fuzzyMatch(query, target string) bool {
+	q := strings.ToLower(query)
+	t := strings.ToLower(target)
+	qi := 0
+	for i := 0; i < len(t) && qi < len(q); i++ {
+		if t[i] == q[qi] {
+			qi++
+		}
+	}
+	return qi == len(q)
+}
+
+func computeFilterMatches(files []types.FileEntry, query string) []int {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		matches := make([]int, len(files))
+		for i := range files {
+			matches[i] = i
+		}
+		return matches
+	}
+	var matches []int
+	for i, f := range files {
+		if fuzzyMatch(query, f.Path) {
+			matches = append(matches, i)
+		}
+	}
+	return matches
+}
+
+func (m Model) viewFilter() string {
+	var b strings.Builder
+
+	// Header
+	b.WriteString(titleStyle.Render(" git-assist "))
+	b.WriteString("  ")
+	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString("\n")
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n\n")
+
+	// Search input
+	b.WriteString("  " + dimStyle.Render("/") + " " + m.filterInput.View() + "\n\n")
+
+	// Calculate visible window
+	visibleCount := m.height - 13
+	if visibleCount < 5 {
+		visibleCount = 5
+	}
+	start := 0
+	end := len(m.filterMatches)
+	if len(m.filterMatches) > visibleCount {
+		start = m.filterCursor - visibleCount + 1
+		if start < 0 {
+			start = 0
+		}
+		end = start + visibleCount
+		if end > len(m.filterMatches) {
+			end = len(m.filterMatches)
+			start = end - visibleCount
+		}
+	}
+
+	if start > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+	}
+
+	// Matched files
+	for j := start; j < end; j++ {
+		idx := m.filterMatches[j]
+		f := m.files[idx]
+
+		cursor := "  "
+		if j == m.filterCursor {
+			cursor = cursorStyle.Render("▸ ")
+		}
+
+		check := unselectedCheck.Render("○")
+		if f.Selected {
+			check = selectedCheck.Render("●")
+		}
+
+		status := fileStatusStyle(f.Status).Render(fmt.Sprintf("%-2s", f.Status.Symbol()))
+
+		path := filePathStyle.Render(f.Path)
+		if j == m.filterCursor {
+			path = highlightStyle.Render(f.Path)
+		}
+
+		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", cursor, check, status, path))
+	}
+
+	if end < len(m.filterMatches) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filterMatches)-end)) + "\n")
+	}
+
+	// Counter
+	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(
+		fmt.Sprintf("%d of %d matched", len(m.filterMatches), len(m.files)),
+	)))
+
+	// Help bar
+	b.WriteString("\n")
+	b.WriteString(renderHelp([]helpEntry{
+		{"↑↓", "navigate"},
+		{"tab", "select"},
+		{"enter", "jump"},
+		{"esc", "cancel"},
+	}))
+
+	return boxBorder.Render(b.String())
 }

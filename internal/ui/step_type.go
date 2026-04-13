@@ -62,7 +62,9 @@ func (m Model) viewType() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 2/5 · Choose commit type"))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Choose commit type"))
 	if m.breaking {
 		b.WriteString("   " + errorStyle.Render("! BREAKING CHANGE"))
 	}
@@ -149,7 +151,9 @@ func (m Model) viewCustom() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 2/5 · Enter custom commit type"))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Enter custom commit type"))
 	b.WriteString("\n\n")
 
 	b.WriteString("  " + m.customInput.View() + "\n")

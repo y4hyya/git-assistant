@@ -38,7 +38,9 @@ func (m Model) viewScope() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 3/5 · Add scope (optional)"))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Add scope (optional)"))
 	b.WriteString("\n\n")
 
 	// Current type

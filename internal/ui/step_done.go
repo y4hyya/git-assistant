@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"git-assist/internal/git"
 )
 
 // ── Update ──────────────────────────────────────────────
@@ -27,11 +28,30 @@ func (m Model) viewDone() string {
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString("\n")
+	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n\n")
 
 	// Commit summary
 	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
 	b.WriteString("  " + successStyle.Render("✓") + " Committed: " + msg + "\n")
+
+	// Commit hash and stats
+	hash := git.GetLastCommitHash()
+	stats := git.GetCommitStats()
+	if hash != "" || stats != "" {
+		detail := "    "
+		if hash != "" {
+			detail += dimStyle.Render(hash)
+		}
+		if hash != "" && stats != "" {
+			detail += dimStyle.Render(" · ")
+		}
+		if stats != "" {
+			detail += dimStyle.Render(stats)
+		}
+		b.WriteString(detail + "\n")
+	}
 
 	// Push summary
 	if m.pushed {

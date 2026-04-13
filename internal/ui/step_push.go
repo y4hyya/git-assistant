@@ -64,7 +64,9 @@ func (m Model) viewPush() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render("⎇ " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Step 5/5 · Push to remote"))
+	b.WriteString(renderProgress(m.step))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Push to remote"))
 	b.WriteString("\n\n")
 
 	// Commit success

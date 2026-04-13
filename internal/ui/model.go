@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"git-assist/internal/git"
 	"git-assist/internal/types"
 )
@@ -42,6 +44,7 @@ type Model struct {
 	// Step 1 — file selection
 	files           []types.FileEntry
 	cursor          int
+	fileScroll      int
 	branch          string
 	gitignoreMode   bool
 	existingIgnored []string
@@ -78,6 +81,12 @@ type Model struct {
 	saving      bool
 	confirmExit bool
 
+	// Filter mode (file search)
+	filterMode    bool
+	filterInput   textinput.Model
+	filterMatches []int
+	filterCursor  int
+
 	// Undo confirmation
 	confirmUndo bool
 
@@ -94,6 +103,9 @@ type Model struct {
 	committing bool
 	pushing    bool
 	pushed     bool
+
+	// Spinner for async operations
+	spinner spinner.Model
 
 	// Error (shown on current step, cleared on next keypress)
 	err error
@@ -133,6 +145,15 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	ei.SetHeight(20)
 	ei.CharLimit = 0
 
+	fi := textinput.New()
+	fi.Placeholder = "Type to filter files..."
+	fi.CharLimit = 100
+	fi.Width = 40
+
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
+
 	return Model{
 		step:        stepFiles,
 		files:       files,
@@ -142,6 +163,8 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		scopeInput:  si,
 		bodyInput:   bi,
 		editArea:    ei,
+		filterInput: fi,
+		spinner:     s,
 		hasRemote:   git.HasRemote(),
 	}
 }
@@ -167,6 +190,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		inputWidth := msg.Width - 16
+		if inputWidth < 30 {
+			inputWidth = 30
+		}
+		if inputWidth > 80 {
+			inputWidth = 80
+		}
+		m.msgInput.Width = inputWidth
+		m.bodyInput.SetWidth(inputWidth)
+		m.customInput.Width = min(inputWidth, 40)
+		m.scopeInput.Width = min(inputWidth, 50)
+		m.filterInput.Width = min(inputWidth, 60)
 		return m, nil
 
 	case undoResultMsg:
