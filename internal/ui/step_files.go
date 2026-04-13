@@ -310,6 +310,12 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filterInput.Reset()
 		m.filterMatches = computeFilterMatches(m.files, "")
 		m.filterCursor = 0
+	case "b":
+		m.branchEntries = git.GetAllBranches()
+		m.branchCursor = 0
+		m.branchScroll = 0
+		m.branchStandalone = false
+		m.step = stepBranch
 	case "g":
 		m.existingIgnored = git.GetGitignoreEntries()
 		m.removeIgnored = make(map[string]bool)
@@ -587,6 +593,7 @@ func (m Model) viewFiles() string {
 			{"space", "select"},
 			{"/", "filter"},
 			{"d", "diff"},
+			{"b", "branch"},
 			{"g", "ignore"},
 			{"u", "undo"},
 			{"enter", "next"},

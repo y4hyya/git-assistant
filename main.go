@@ -21,6 +21,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subcommand: git-assist branch
+	subcommand := ""
+	for _, arg := range os.Args[1:] {
+		if arg != "--no-color" {
+			subcommand = arg
+			break
+		}
+	}
+
+	if subcommand == "branch" {
+		branch, _ := git.GetCurrentBranch()
+		m := ui.NewBranchModel(branch)
+		p := tea.NewProgram(m, tea.WithAltScreen())
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("✗ Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	files, err := git.GetStatus()
 	if err != nil {
 		fmt.Printf("✗ Failed to get status: %v\n", err)

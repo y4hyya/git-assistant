@@ -37,6 +37,13 @@ type FileEntry struct {
 	Gitignored bool
 }
 
+// BranchEntry represents a git branch.
+type BranchEntry struct {
+	Name      string
+	IsCurrent bool
+	IsRemote  bool
+}
+
 // CommitType represents a conventional commit type.
 type CommitType struct {
 	Name        string

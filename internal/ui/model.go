@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -15,6 +17,7 @@ type step int
 
 const (
 	stepFiles   step = iota // file selection
+	stepBranch              // branch manager
 	stepType                // commit type picker
 	stepCustom              // custom type input
 	stepScope               // optional scope input
@@ -35,6 +38,20 @@ type saveResultMsg struct {
 	err   error
 	files []types.FileEntry
 	diff  string
+}
+type branchSwitchResultMsg struct {
+	err           error
+	newBranch     string
+	stashConflict bool
+}
+type branchCreateResultMsg struct {
+	err       error
+	newBranch string
+}
+type branchDeleteResultMsg struct{ err error }
+type branchMergeResultMsg struct {
+	err           error
+	conflictFiles []string
 }
 
 // Model is the main Bubble Tea model.
@@ -87,6 +104,20 @@ type Model struct {
 	filterInput   textinput.Model
 	filterMatches []int
 	filterCursor  int
+
+	// Branch manager
+	branchEntries     []types.BranchEntry
+	branchCursor      int
+	branchScroll      int
+	branchCreateMode  bool
+	branchCreateInput textinput.Model
+	branchDeleteMode  bool
+	branchMergeMode   bool
+	branchConflict    bool
+	branchConflFiles  []string
+	branchStandalone  bool
+	branchSwitching   bool
+	branchMerging     bool
 
 	// Undo confirmation
 	confirmUndo bool
@@ -151,12 +182,18 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	fi.CharLimit = 100
 	fi.Width = 40
 
+	bci := textinput.New()
+	bci.Placeholder = "new-branch-name"
+	bci.CharLimit = 100
+	bci.Width = 40
+
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
 
 	return Model{
-		step:        stepFiles,
+		step:              stepFiles,
+		branchCreateInput: bci,
 		files:       files,
 		branch:      branch,
 		msgInput:    mi,
@@ -168,6 +205,15 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		spinner:     s,
 		hasRemote:   git.HasRemote(),
 	}
+}
+
+// NewBranchModel creates a model that starts in branch manager mode.
+func NewBranchModel(branch string) Model {
+	m := NewModel(nil, branch)
+	m.step = stepBranch
+	m.branchStandalone = true
+	m.branchEntries = git.GetAllBranches()
+	return m
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -203,6 +249,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.customInput.Width = min(inputWidth, 40)
 		m.scopeInput.Width = min(inputWidth, 50)
 		m.filterInput.Width = min(inputWidth, 60)
+		m.branchCreateInput.Width = min(inputWidth, 50)
 		return m, nil
 
 	case undoResultMsg:
@@ -292,6 +339,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.step = stepDone
 		return m, nil
 
+	case branchSwitchResultMsg:
+		m.branchSwitching = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.branch = msg.newBranch
+		m.branchEntries = git.GetAllBranches()
+		m.branchCursor = 0
+		m.branchScroll = 0
+		if msg.stashConflict {
+			m.err = fmt.Errorf("switched to %s — stashed changes had conflicts, run: git stash pop", msg.newBranch)
+		}
+		return m, nil
+
+	case branchCreateResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.branch = msg.newBranch
+		m.branchEntries = git.GetAllBranches()
+		m.branchCursor = 0
+		m.branchScroll = 0
+		m.branchCreateMode = false
+		m.branchCreateInput.Reset()
+		return m, nil
+
+	case branchDeleteResultMsg:
+		m.branchDeleteMode = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.branchEntries = git.GetAllBranches()
+		if m.branchCursor >= len(m.branchEntries) {
+			m.branchCursor = max(0, len(m.branchEntries)-1)
+		}
+		return m, nil
+
+	case branchMergeResultMsg:
+		m.branchMerging = false
+		m.branchMergeMode = false
+		if msg.err != nil {
+			conflicts := msg.conflictFiles
+			if len(conflicts) > 0 {
+				m.branchConflict = true
+				m.branchConflFiles = conflicts
+			} else {
+				m.err = msg.err
+			}
+			return m, nil
+		}
+		m.branchEntries = git.GetAllBranches()
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			m.quitting = true
@@ -305,6 +408,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.step {
 	case stepFiles:
 		return m.updateFiles(msg)
+	case stepBranch:
+		return m.updateBranch(msg)
 	case stepType:
 		return m.updateType(msg)
 	case stepCustom:
@@ -332,6 +437,8 @@ func (m Model) View() string {
 	switch m.step {
 	case stepFiles:
 		return m.viewFiles()
+	case stepBranch:
+		return m.viewBranch()
 	case stepType:
 		return m.viewType()
 	case stepCustom:

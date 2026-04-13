@@ -424,6 +424,155 @@ func WriteFileContent(path string, content string) error {
 	return nil
 }
 
+// ── Branch operations ──────────────────────────────────
+
+// GetAllBranches returns local and remote-only branches.
+// Local branches come first (current branch at top), then remote-only branches.
+// Remote branches that have a local equivalent are deduplicated.
+func GetAllBranches() []types.BranchEntry {
+	var entries []types.BranchEntry
+	localNames := make(map[string]bool)
+
+	// Local branches
+	out, err := exec.Command("git", "branch").Output()
+	if err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			isCurrent := strings.HasPrefix(line, "* ")
+			name := strings.TrimPrefix(line, "* ")
+			name = strings.TrimSpace(name)
+			if strings.HasPrefix(name, "(HEAD detached") {
+				continue
+			}
+			localNames[name] = true
+			entries = append(entries, types.BranchEntry{
+				Name:      name,
+				IsCurrent: isCurrent,
+			})
+		}
+	}
+
+	// Remote branches (only those without a local equivalent)
+	out, err = exec.Command("git", "branch", "-r").Output()
+	if err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.Contains(line, "->") {
+				continue
+			}
+			// Strip origin/ prefix for dedup check
+			short := strings.TrimPrefix(line, "origin/")
+			if localNames[short] {
+				continue
+			}
+			entries = append(entries, types.BranchEntry{
+				Name:     short,
+				IsRemote: true,
+			})
+		}
+	}
+
+	return entries
+}
+
+// SwitchBranch checks out an existing branch.
+// For remote-only branches, it creates a local tracking branch.
+func SwitchBranch(name string, isRemote bool) error {
+	var out []byte
+	var err error
+	if isRemote {
+		out, err = exec.Command("git", "checkout", "-b", name, "origin/"+name).CombinedOutput()
+	} else {
+		out, err = exec.Command("git", "checkout", name).CombinedOutput()
+	}
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// CreateBranch creates a new branch from HEAD and switches to it.
+func CreateBranch(name string) error {
+	out, err := exec.Command("git", "checkout", "-b", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// DeleteBranch deletes a local branch (safe delete, -d).
+func DeleteBranch(name string) error {
+	out, err := exec.Command("git", "branch", "-d", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// MergeBranch merges the given branch into the current branch.
+func MergeBranch(name string) error {
+	out, err := exec.Command("git", "merge", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// MergeAbort aborts an in-progress merge.
+func MergeAbort() error {
+	out, err := exec.Command("git", "merge", "--abort").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// GetConflictFiles returns the list of files with merge conflicts.
+func GetConflictFiles() []string {
+	out, err := exec.Command("git", "diff", "--name-only", "--diff-filter=U").Output()
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files
+}
+
+// HasUncommittedChanges returns true if the working tree has uncommitted changes.
+func HasUncommittedChanges() bool {
+	out, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// StashChanges stashes uncommitted changes.
+func StashChanges() error {
+	out, err := exec.Command("git", "stash").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// StashPop restores the most recent stash.
+func StashPop() error {
+	out, err := exec.Command("git", "stash", "pop").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("stash pop failed (resolve manually with git stash pop): %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // isBinary checks if content contains null bytes (indicating binary data).
 func isBinary(data []byte) bool {
 	for _, b := range data {
