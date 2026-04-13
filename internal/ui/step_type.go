@@ -38,7 +38,7 @@ func (m Model) updateType(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.commitType = types.CommitTypes[m.typeIdx].Name
-		m.step = stepScope
+		m.step = stepMessage
 		m.scopeInput.Focus()
 		return m, nil
 	case "esc":
@@ -127,7 +127,7 @@ func (m Model) updateCustom(msg tea.Msg) (tea.Model, tea.Cmd) {
 			val := strings.TrimSpace(m.customInput.Value())
 			if val != "" {
 				m.commitType = val
-				m.step = stepScope
+				m.step = stepMessage
 				m.scopeInput.Focus()
 				return m, nil
 			}

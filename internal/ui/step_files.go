@@ -810,21 +810,19 @@ func stepProgressIndex(s step) int {
 		return 0
 	case stepType, stepCustom:
 		return 1
-	case stepScope:
-		return 2
 	case stepMessage:
-		return 3
+		return 2
 	case stepConfirm:
-		return 4
+		return 3
 	case stepPush:
-		return 5
+		return 4
 	default:
-		return 6
+		return 5
 	}
 }
 
 func renderProgress(current step) string {
-	names := []string{"Files", "Type", "Scope", "Message", "Confirm", "Push"}
+	names := []string{"Files", "Type", "Message", "Confirm", "Push"}
 	currentIdx := stepProgressIndex(current)
 
 	var parts []string
