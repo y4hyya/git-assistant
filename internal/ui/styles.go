@@ -118,4 +118,9 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(purple).
 			Padding(1, 2)
+
+	// Graph panels
+	graphTitleStyle = lipgloss.NewStyle().
+			Foreground(cyan).
+			Bold(true)
 )

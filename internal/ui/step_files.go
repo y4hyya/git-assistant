@@ -346,6 +346,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.step = stepType
 		m.cursor = 0
+	case "esc":
+		m.step = stepMenu
+		return m, nil
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -601,6 +604,13 @@ func (m Model) viewFiles() string {
 		}))
 	}
 
+	// Graph section
+	graphSection := m.renderGraphSection()
+	if graphSection != "" {
+		b.WriteString("\n\n")
+		b.WriteString(graphSection)
+	}
+
 	return boxBorder.Render(b.String())
 }
 
@@ -793,6 +803,10 @@ func formatError(err error) string {
 		hint = "Some files could not be untracked. Check paths."
 	case strings.Contains(msg, "staging failed"):
 		hint = "Files could not be staged. Check paths and permissions."
+	case strings.Contains(msg, "saved in stash"):
+		hint = "Your changes are safe. Switch back to the original branch and run: git stash pop"
+	case strings.Contains(msg, "invalid branch name"):
+		hint = "Branch names cannot contain spaces or special characters like ~, ^, :, ?, *, ["
 	}
 
 	result := errorStyle.Render("Error: " + msg)

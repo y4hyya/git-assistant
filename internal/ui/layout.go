@@ -1,0 +1,188 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+// renderGraphSection returns a compact side-by-side local/remote graph footer.
+func (m Model) renderGraphSection() string {
+	if m.width < 60 {
+		return ""
+	}
+
+	innerWidth := m.width - 10
+	halfWidth := innerWidth / 2
+
+	localTitle := graphTitleStyle.Render("Local: " + m.branch)
+	localContent := transformGraph(m.localGraph, halfWidth-2, 5)
+	localPanel := localTitle + "\n" + localContent
+
+	remoteTitle := graphTitleStyle.Render("Remote: origin/" + m.branch)
+	remoteContent := transformGraph(m.remoteGraph, halfWidth-2, 5)
+	abLine := ""
+	if m.aheadBehind != "" {
+		abLine = "\n" + dimStyle.Render(m.aheadBehind)
+	}
+	remotePanel := remoteTitle + "\n" + remoteContent + abLine
+
+	leftCol := lipgloss.NewStyle().Width(halfWidth).Render(localPanel)
+	rightCol := lipgloss.NewStyle().Width(halfWidth).Render(remotePanel)
+
+	separator := dimStyle.Render(strings.Repeat("─", innerWidth))
+
+	return separator + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+}
+
+// ── Graph transformation ──────────────────────────────
+
+type graphLine struct {
+	chars     []byte
+	message   string
+	starCol   int
+	connector bool
+}
+
+func transformGraph(raw string, maxWidth, maxLines int) string {
+	if raw == "" {
+		return dimStyle.Render("(no commits)")
+	}
+
+	rawLines := strings.Split(raw, "\n")
+	parsed := make([]graphLine, 0, len(rawLines))
+	for _, line := range rawLines {
+		parsed = append(parsed, parseLine(line))
+	}
+
+	withConnectors := insertConnectors(parsed)
+
+	if len(withConnectors) > maxLines {
+		withConnectors = withConnectors[:maxLines]
+	}
+
+	var result []string
+	for _, gl := range withConnectors {
+		result = append(result, renderGraphLine(gl, maxWidth))
+	}
+
+	return strings.Join(result, "\n")
+}
+
+func parseLine(line string) graphLine {
+	gl := graphLine{starCol: -1}
+
+	graphEnd := 0
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if ch == '*' || ch == '|' || ch == '/' || ch == '\\' || ch == ' ' || ch == '_' {
+			gl.chars = append(gl.chars, ch)
+			if ch == '*' {
+				gl.starCol = i
+			}
+			graphEnd = i + 1
+		} else {
+			break
+		}
+	}
+
+	if graphEnd < len(line) {
+		gl.message = strings.TrimSpace(line[graphEnd:])
+	}
+
+	return gl
+}
+
+func insertConnectors(lines []graphLine) []graphLine {
+	var result []graphLine
+	for i, gl := range lines {
+		result = append(result, gl)
+
+		if gl.starCol < 0 {
+			continue
+		}
+
+		if i < len(lines)-1 && lines[i+1].starCol >= 0 {
+			conn := graphLine{
+				starCol:   gl.starCol,
+				connector: true,
+			}
+			for j := 0; j <= gl.starCol; j++ {
+				if j == gl.starCol {
+					conn.chars = append(conn.chars, '|')
+				} else if j < len(gl.chars) && gl.chars[j] == '|' {
+					conn.chars = append(conn.chars, '|')
+				} else {
+					conn.chars = append(conn.chars, ' ')
+				}
+			}
+			result = append(result, conn)
+		}
+	}
+	return result
+}
+
+func renderGraphLine(gl graphLine, maxWidth int) string {
+	var visual strings.Builder
+
+	for i, ch := range gl.chars {
+		switch ch {
+		case '*':
+			if i == 0 {
+				visual.WriteString(activeStyle.Render(symSelected))
+			} else {
+				visual.WriteString(modifiedStyle.Render(symSelected))
+			}
+		case '|':
+			if gl.connector && i == gl.starCol {
+				if gl.starCol == 0 {
+					visual.WriteString(activeStyle.Render("│"))
+				} else {
+					visual.WriteString(modifiedStyle.Render("│"))
+				}
+			} else {
+				visual.WriteString(dimStyle.Render("│"))
+			}
+		case '/':
+			visual.WriteString(dimStyle.Render("/"))
+		case '\\':
+			visual.WriteString(dimStyle.Render("\\"))
+		case ' ':
+			visual.WriteString(" ")
+		case '_':
+			visual.WriteString(dimStyle.Render("_"))
+		}
+	}
+
+	if gl.connector || gl.message == "" {
+		return visual.String()
+	}
+
+	prefixWidth := len(gl.chars)
+	available := maxWidth - prefixWidth - 1
+	if available < 10 {
+		available = 10
+	}
+
+	msg := gl.message
+	if len(msg) > available {
+		msg = msg[:available-3] + "..."
+	}
+
+	return visual.String() + " " + msg
+}
+
+func formatAheadBehind(ahead, behind int) string {
+	if ahead == 0 && behind == 0 {
+		return "up to date"
+	}
+	parts := []string{}
+	if ahead > 0 {
+		parts = append(parts, fmt.Sprintf("%d ahead", ahead))
+	}
+	if behind > 0 {
+		parts = append(parts, fmt.Sprintf("%d behind", behind))
+	}
+	return strings.Join(parts, " · ")
+}

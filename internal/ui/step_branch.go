@@ -30,6 +30,8 @@ func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 		stashConflict := false
 		if stashed {
 			if err := git.StashPop(); err != nil {
+				// Clean up the conflicted state — stash stays in stack
+				git.CleanupFailedStashPop()
 				stashConflict = true
 			}
 		}
@@ -196,13 +198,11 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		// Return to file selection, refresh files + branch
-		m.step = stepFiles
+		// Return to menu, refresh files + branch
+		m.step = stepMenu
 		m.branch, _ = git.GetCurrentBranch()
-		freshFiles, err := git.GetStatus()
-		if err == nil {
-			m.files = freshFiles
-		}
+		freshFiles, _ := git.GetStatus()
+		m.files = freshFiles
 		m.cursor = 0
 		m.fileScroll = 0
 		return m, nil
@@ -393,6 +393,13 @@ func (m Model) viewBranch() string {
 		entries = append(entries, helpEntry{"esc", "back"})
 	}
 	b.WriteString(renderHelp(entries))
+
+	// Graph section
+	graphSection := m.renderGraphSection()
+	if graphSection != "" {
+		b.WriteString("\n\n")
+		b.WriteString(graphSection)
+	}
 
 	return boxBorder.Render(b.String())
 }

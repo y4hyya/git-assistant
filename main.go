@@ -41,20 +41,11 @@ func main() {
 		return
 	}
 
-	files, err := git.GetStatus()
-	if err != nil {
-		fmt.Printf("✗ Failed to get status: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(files) == 0 {
-		fmt.Println("✓ Working tree clean — nothing to commit")
-		os.Exit(0)
-	}
-
 	branch, _ := git.GetCurrentBranch()
+	files, _ := git.GetStatus() // nil if clean, that's fine
 
 	m := ui.NewModel(files, branch)
+	m.RefreshGraphs()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

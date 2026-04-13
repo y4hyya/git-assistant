@@ -16,7 +16,8 @@ import (
 type step int
 
 const (
-	stepFiles   step = iota // file selection
+	stepMenu    step = iota // main menu hub
+	stepFiles               // file selection
 	stepBranch              // branch manager
 	stepType                // commit type picker
 	stepCustom              // custom type input
@@ -141,6 +142,14 @@ type Model struct {
 	// Error (shown on current step, cleared on next keypress)
 	err error
 
+	// Main menu
+	menuCursor int
+
+	// Graph panels
+	localGraph   string
+	remoteGraph  string
+	aheadBehind  string
+
 	// Terminal dimensions
 	width    int
 	height   int
@@ -191,7 +200,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
 
 	return Model{
-		step:              stepFiles,
+		step:              stepMenu,
 		branchCreateInput: bci,
 		files:       files,
 		branch:      branch,
@@ -212,7 +221,19 @@ func NewBranchModel(branch string) Model {
 	m.step = stepBranch
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
+	m.localGraph = git.GetLocalGraph(branch, 15)
+	m.remoteGraph = git.GetRemoteGraph(branch, 15)
+	a, b := git.GetAheadBehind(branch)
+	m.aheadBehind = formatAheadBehind(a, b)
 	return m
+}
+
+// RefreshGraphs updates the graph data from git.
+func (m *Model) RefreshGraphs() {
+	m.localGraph = git.GetLocalGraph(m.branch, 15)
+	m.remoteGraph = git.GetRemoteGraph(m.branch, 15)
+	a, b := git.GetAheadBehind(m.branch)
+	m.aheadBehind = formatAheadBehind(a, b)
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -320,6 +341,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
+		m.RefreshGraphs()
 		if m.hasRemote {
 			m.branches = git.GetBranches(m.branch)
 			m.step = stepPush
@@ -335,6 +357,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.pushed = true
+		m.RefreshGraphs()
 		m.step = stepDone
 		return m, nil
 
@@ -348,8 +371,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
+		m.RefreshGraphs()
 		if msg.stashConflict {
-			m.err = fmt.Errorf("switched to %s — stashed changes had conflicts, run: git stash pop", msg.newBranch)
+			m.err = fmt.Errorf("switched to %s — changes saved in stash (conflicts). Switch back and run: git stash pop", msg.newBranch)
 		}
 		return m, nil
 
@@ -405,6 +429,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Route to the active step handler
 	switch m.step {
+	case stepMenu:
+		return m.updateMenu(msg)
 	case stepFiles:
 		return m.updateFiles(msg)
 	case stepBranch:
@@ -432,6 +458,8 @@ func (m Model) View() string {
 	}
 
 	switch m.step {
+	case stepMenu:
+		return m.viewMenu()
 	case stepFiles:
 		return m.viewFiles()
 	case stepBranch:
@@ -449,6 +477,5 @@ func (m Model) View() string {
 	case stepDone:
 		return m.viewDone()
 	}
-
 	return ""
 }
