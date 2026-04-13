@@ -251,7 +251,7 @@ func (m Model) viewBranch() string {
 			{"a", "abort merge"},
 			{"q", "close"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// ── Create mode ────────────────────────────────────
@@ -263,7 +263,7 @@ func (m Model) viewBranch() string {
 			{"enter", "create"},
 			{"esc", "cancel"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// ── Delete confirmation ────────────────────────────
@@ -275,7 +275,7 @@ func (m Model) viewBranch() string {
 			{"y", "confirm"},
 			{"any", "cancel"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// ── Merge confirmation ─────────────────────────────
@@ -287,7 +287,7 @@ func (m Model) viewBranch() string {
 			{"y", "confirm"},
 			{"any", "cancel"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// ── Branch list ────────────────────────────────────
@@ -394,14 +394,7 @@ func (m Model) viewBranch() string {
 	}
 	b.WriteString(renderHelp(entries))
 
-	// Graph section
-	graphSection := m.renderGraphSection()
-	if graphSection != "" {
-		b.WriteString("\n\n")
-		b.WriteString(graphSection)
-	}
-
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
 
 // branchSeparatorIndex returns the index where remote branches start.

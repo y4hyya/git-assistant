@@ -119,5 +119,5 @@ func (m Model) viewConfirm() string {
 		{"q", "quit"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }

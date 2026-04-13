@@ -139,5 +139,5 @@ func (m Model) viewMenu() string {
 		b.WriteString(graphSection)
 	}
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }

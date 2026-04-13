@@ -457,25 +457,27 @@ func (m Model) View() string {
 		return ""
 	}
 
+	var content string
 	switch m.step {
 	case stepMenu:
-		return m.viewMenu()
+		content = m.viewMenu()
 	case stepFiles:
-		return m.viewFiles()
+		content = m.viewFiles()
 	case stepBranch:
-		return m.viewBranch()
+		content = m.viewBranch()
 	case stepType:
-		return m.viewType()
+		content = m.viewType()
 	case stepCustom:
-		return m.viewCustom()
+		content = m.viewCustom()
 	case stepMessage:
-		return m.viewMessage()
+		content = m.viewMessage()
 	case stepConfirm:
-		return m.viewConfirm()
+		content = m.viewConfirm()
 	case stepPush:
-		return m.viewPush()
+		content = m.viewPush()
 	case stepDone:
-		return m.viewDone()
+		content = m.viewDone()
 	}
-	return ""
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
 }

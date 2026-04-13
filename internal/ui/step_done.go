@@ -68,5 +68,5 @@ func (m Model) viewDone() string {
 		{"enter", "exit"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }

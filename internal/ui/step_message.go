@@ -272,5 +272,5 @@ func (m Model) viewMessage() string {
 		}
 	}
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }

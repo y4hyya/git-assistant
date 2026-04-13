@@ -7,21 +7,53 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// styledBox wraps content in the standard bordered box constrained to terminal size.
+func (m Model) styledBox(content string) string {
+	w := m.width - 4
+	if w < 30 {
+		w = 30
+	}
+	h := m.height
+	if h < 10 {
+		h = 10
+	}
+	return boxBorder.Width(w).MaxHeight(h).Render(content)
+}
+
 // renderGraphSection returns a compact side-by-side local/remote graph footer.
+// Height-adaptive: reduces commits or hides entirely if terminal is too short.
 func (m Model) renderGraphSection() string {
 	if m.width < 60 {
 		return ""
 	}
 
-	innerWidth := m.width - 10
+	// Menu content uses ~14 lines (header, items, help, box overhead, spacing)
+	available := m.height - 14
+	if available < 6 {
+		return "" // not enough room
+	}
+
+	// Each commit with connector = 2 lines. Titles + separator + spacing = 4 lines.
+	maxCommits := (available - 4) / 2
+	if maxCommits < 1 {
+		return ""
+	}
+	if maxCommits > 5 {
+		maxCommits = 5
+	}
+
+	innerWidth := m.width - 12
+	if innerWidth < 30 {
+		innerWidth = 30
+	}
 	halfWidth := innerWidth / 2
 
 	localTitle := graphTitleStyle.Render("Local: " + m.branch)
-	localContent := transformGraph(m.localGraph, halfWidth-2, 5)
+	localContent := transformGraph(m.localGraph, halfWidth-2, maxCommits*2)
 	localPanel := localTitle + "\n" + localContent
 
 	remoteTitle := graphTitleStyle.Render("Remote: origin/" + m.branch)
-	remoteContent := transformGraph(m.remoteGraph, halfWidth-2, 5)
+	remoteContent := transformGraph(m.remoteGraph, halfWidth-2, maxCommits*2)
 	abLine := ""
 	if m.aheadBehind != "" {
 		abLine = "\n" + dimStyle.Render(m.aheadBehind)

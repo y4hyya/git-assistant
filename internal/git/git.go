@@ -424,6 +424,44 @@ func WriteFileContent(path string, content string) error {
 	return nil
 }
 
+// ── Graph operations ───────────────────────────────────
+
+// GetLocalGraph returns the git log graph for a local branch.
+func GetLocalGraph(branch string, limit int) string {
+	out, err := exec.Command("git", "log", "--graph", "--format=%s",
+		fmt.Sprintf("-%d", limit), branch).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// GetRemoteGraph returns the git log graph for the remote tracking branch.
+func GetRemoteGraph(branch string, limit int) string {
+	remote := "origin/" + branch
+	out, err := exec.Command("git", "log", "--graph", "--format=%s",
+		fmt.Sprintf("-%d", limit), remote).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// GetAheadBehind returns how many commits the local branch is ahead/behind the remote.
+func GetAheadBehind(branch string) (ahead, behind int) {
+	out, err := exec.Command("git", "rev-list", "--left-right", "--count",
+		branch+"...origin/"+branch).Output()
+	if err != nil {
+		return 0, 0
+	}
+	parts := strings.Fields(strings.TrimSpace(string(out)))
+	if len(parts) == 2 {
+		fmt.Sscanf(parts[0], "%d", &ahead)
+		fmt.Sscanf(parts[1], "%d", &behind)
+	}
+	return ahead, behind
+}
+
 // ── Branch operations ──────────────────────────────────
 
 // GetAllBranches returns local and remote-only branches.
@@ -568,9 +606,16 @@ func StashChanges() error {
 func StashPop() error {
 	out, err := exec.Command("git", "stash", "pop").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("stash pop failed (resolve manually with git stash pop): %s", strings.TrimSpace(string(out)))
+		return fmt.Errorf("stash pop failed: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// CleanupFailedStashPop resets the working directory after a failed stash pop.
+// The stash remains in the stack so the user can retry manually.
+func CleanupFailedStashPop() {
+	exec.Command("git", "reset", "HEAD").Run()
+	exec.Command("git", "checkout", "--", ".").Run()
 }
 
 // isBinary checks if content contains null bytes (indicating binary data).

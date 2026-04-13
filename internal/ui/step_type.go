@@ -115,7 +115,7 @@ func (m Model) viewType() string {
 		{"q", "quit"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
 
 // ── Custom type input ───────────────────────────────────
@@ -164,5 +164,5 @@ func (m Model) viewCustom() string {
 		{"esc", "back"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }

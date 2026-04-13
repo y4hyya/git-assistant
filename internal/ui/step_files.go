@@ -573,7 +573,7 @@ func (m Model) viewFiles() string {
 			{"y", "confirm"},
 			{"any", "cancel"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// Error
@@ -604,14 +604,7 @@ func (m Model) viewFiles() string {
 		}))
 	}
 
-	// Graph section
-	graphSection := m.renderGraphSection()
-	if graphSection != "" {
-		b.WriteString("\n\n")
-		b.WriteString(graphSection)
-	}
-
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
 
 // ── Diff view ──────────────────────────────────────────
@@ -638,7 +631,7 @@ func (m Model) viewDiff() string {
 		b.WriteString(renderHelp([]helpEntry{
 			{"esc", "back"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// Diff content with colors
@@ -687,7 +680,7 @@ func (m Model) viewDiff() string {
 		}))
 	}
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
 
 func styleDiffLine(line string) string {
@@ -738,7 +731,7 @@ func (m Model) viewEdit() string {
 			{"y", "discard"},
 			{"any", "cancel"},
 		}))
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// Saving indicator
@@ -746,7 +739,7 @@ func (m Model) viewEdit() string {
 		b.WriteString(m.editArea.View())
 		b.WriteString("\n\n")
 		b.WriteString("  " + dimStyle.Render("Saving...") + "\n")
-		return boxBorder.Render(b.String())
+		return m.styledBox(b.String())
 	}
 
 	// Textarea
@@ -764,7 +757,7 @@ func (m Model) viewEdit() string {
 		{"esc", "back"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
 
 // ── Helpers ─────────────────────────────────────────────
@@ -964,5 +957,5 @@ func (m Model) viewFilter() string {
 		{"esc", "cancel"},
 	}))
 
-	return boxBorder.Render(b.String())
+	return m.styledBox(b.String())
 }
