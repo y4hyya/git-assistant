@@ -11,9 +11,11 @@ import (
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Block input while committing
+	// Forward spinner ticks while committing
 	if m.committing {
-		return m, nil
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
@@ -52,7 +54,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 						paths = append(paths, f.Path)
 					}
 				}
-				return m, doCommit(paths, m.gitignoreCached, fullMsg)
+				return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
 			}
 			return m, nil
 		case "ctrl+d":
@@ -67,7 +69,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 						paths = append(paths, f.Path)
 					}
 				}
-				return m, doCommit(paths, m.gitignoreCached, fullMsg)
+				return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
 			}
 			return m, nil
 		case "esc":
@@ -167,7 +169,7 @@ func (m Model) viewMessage() string {
 
 	// Loading state
 	if m.committing {
-		b.WriteString("\n  " + dimStyle.Render("⟳ Committing...") + "\n")
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Committing...") + "\n")
 	}
 
 	// Error

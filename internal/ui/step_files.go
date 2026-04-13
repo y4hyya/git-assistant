@@ -299,6 +299,20 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 
+	// Adjust scroll to keep cursor visible
+	if !m.gitignoreMode {
+		visible := m.height - 12
+		if visible < 5 {
+			visible = 5
+		}
+		if m.cursor < m.fileScroll {
+			m.fileScroll = m.cursor
+		}
+		if m.cursor >= m.fileScroll+visible {
+			m.fileScroll = m.cursor - visible + 1
+		}
+	}
+
 	return m, nil
 }
 
@@ -371,10 +385,41 @@ func (m Model) viewFiles() string {
 	}
 	b.WriteString("\n\n")
 
-	// File list
+	// Count totals across all files
 	selected := 0
 	ignored := 0
-	for i, f := range m.files {
+	for _, f := range m.files {
+		if f.Selected {
+			selected++
+		}
+		if f.Gitignored {
+			ignored++
+		}
+	}
+
+	// Calculate visible window
+	start := 0
+	end := len(m.files)
+	if !m.gitignoreMode {
+		visibleCount := m.height - 12
+		if visibleCount < 5 {
+			visibleCount = 5
+		}
+		if len(m.files) > visibleCount {
+			start = m.fileScroll
+			end = start + visibleCount
+			if end > len(m.files) {
+				end = len(m.files)
+			}
+		}
+		if start > 0 {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+		}
+	}
+
+	// File list
+	for i := start; i < end; i++ {
+		f := m.files[i]
 		// Cursor arrow
 		cursor := "  "
 		if i == m.cursor {
@@ -386,15 +431,12 @@ func (m Model) viewFiles() string {
 		if m.gitignoreMode {
 			if f.Gitignored {
 				check = gitignoreCheck.Render("●")
-				ignored++
 			} else if f.Selected {
-				// Show commit selections as dimmed in gitignore mode
 				check = dimmedCheck.Render("●")
 			}
 		} else {
 			if f.Selected {
 				check = selectedCheck.Render("●")
-				selected++
 			}
 		}
 
@@ -408,6 +450,11 @@ func (m Model) viewFiles() string {
 		}
 
 		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", cursor, check, status, path))
+	}
+
+	// Scroll-down indicator
+	if !m.gitignoreMode && end < len(m.files) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.files)-end)) + "\n")
 	}
 
 	// Existing gitignore entries (only in gitignore mode)

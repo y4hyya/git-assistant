@@ -11,9 +11,11 @@ import (
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updatePush(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Block input while pushing
+	// Forward spinner ticks while pushing
 	if m.pushing {
-		return m, nil
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 
 	keyMsg, ok := msg.(tea.KeyMsg)
@@ -34,7 +36,7 @@ func (m Model) updatePush(msg tea.Msg) (tea.Model, tea.Cmd) {
 		branch := m.branches[m.branchIdx]
 		m.pushBranch = branch
 		m.pushing = true
-		return m, doPush(m.branch, branch)
+		return m, tea.Batch(doPush(m.branch, branch), m.spinner.Tick)
 	case "n", "esc":
 		m.step = stepDone
 		return m, nil
@@ -100,7 +102,7 @@ func (m Model) viewPush() string {
 
 	// Loading
 	if m.pushing {
-		b.WriteString("\n  " + dimStyle.Render("⟳ Pushing...") + "\n")
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Pushing...") + "\n")
 	}
 
 	// Error
