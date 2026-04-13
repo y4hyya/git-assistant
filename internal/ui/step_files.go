@@ -427,7 +427,7 @@ func (m Model) viewFiles() string {
 	// Header
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
@@ -466,7 +466,7 @@ func (m Model) viewFiles() string {
 			}
 		}
 		if start > 0 {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp,start)) + "\n")
 		}
 	}
 
@@ -476,20 +476,20 @@ func (m Model) viewFiles() string {
 		// Cursor arrow
 		cursor := "  "
 		if i == m.cursor {
-			cursor = cursorStyle.Render("▸ ")
+			cursor = cursorStyle.Render(symCursor + " ")
 		}
 
 		// Checkbox — depends on mode
-		check := unselectedCheck.Render("○")
+		check := unselectedCheck.Render(symUnselected)
 		if m.gitignoreMode {
 			if f.Gitignored {
-				check = gitignoreCheck.Render("●")
+				check = gitignoreCheck.Render(symSelected)
 			} else if f.Selected {
-				check = dimmedCheck.Render("●")
+				check = dimmedCheck.Render(symSelected)
 			}
 		} else {
 			if f.Selected {
-				check = selectedCheck.Render("●")
+				check = selectedCheck.Render(symSelected)
 			}
 		}
 
@@ -507,7 +507,7 @@ func (m Model) viewFiles() string {
 
 	// Scroll-down indicator
 	if !m.gitignoreMode && end < len(m.files) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.files)-end)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown,len(m.files)-end)) + "\n")
 	}
 
 	// Existing gitignore entries (only in gitignore mode)
@@ -518,12 +518,12 @@ func (m Model) viewFiles() string {
 
 			cursor := "  "
 			if idx == m.cursor {
-				cursor = cursorStyle.Render("▸ ")
+				cursor = cursorStyle.Render(symCursor + " ")
 			}
 
-			check := gitignoreCheck.Render("●")
+			check := gitignoreCheck.Render(symSelected)
 			if m.removeIgnored[entry] {
-				check = unselectedCheck.Render("○")
+				check = unselectedCheck.Render(symUnselected)
 			}
 
 			path := dimStyle.Render(entry)
@@ -569,21 +569,21 @@ func (m Model) viewFiles() string {
 
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
 	// Help bar
 	b.WriteString("\n")
 	if m.gitignoreMode {
 		b.WriteString(renderHelp([]helpEntry{
-			{"↑↓", "navigate"},
+			{symArrows, "navigate"},
 			{"space", "toggle"},
 			{"enter", "confirm"},
 			{"g", "cancel"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{
-			{"↑↓", "navigate"},
+			{symArrows, "navigate"},
 			{"space", "select"},
 			{"/", "filter"},
 			{"d", "diff"},
@@ -605,7 +605,7 @@ func (m Model) viewDiff() string {
 	// Header
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
@@ -637,9 +637,10 @@ func (m Model) viewDiff() string {
 	}
 
 	visibleLines := lines[m.diffScroll:end]
-	for _, line := range visibleLines {
+	for i, line := range visibleLines {
+		lineNum := dimStyle.Render(fmt.Sprintf("%4d ", m.diffScroll+i+1))
 		styled := styleDiffLine(line)
-		b.WriteString("  " + styled + "\n")
+		b.WriteString("  " + lineNum + styled + "\n")
 	}
 
 	// Line counter
@@ -649,7 +650,7 @@ func (m Model) viewDiff() string {
 
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
 	// Help bar
@@ -658,12 +659,12 @@ func (m Model) viewDiff() string {
 	_, fileExists := os.Stat(m.diffFile)
 	if currentFile.Status == types.StatusDeleted || fileExists != nil {
 		b.WriteString(renderHelp([]helpEntry{
-			{"↑↓", "scroll"},
+			{symArrows, "scroll"},
 			{"esc", "back"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{
-			{"↑↓", "scroll"},
+			{symArrows, "scroll"},
 			{"e", "edit"},
 			{"esc", "back"},
 		}))
@@ -698,14 +699,14 @@ func (m Model) viewEdit() string {
 	// Header
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
 	title := "  Editing: " + m.diffFile
 	if m.editDirty {
-		title += "  " + modifiedStyle.Render("●")
+		title += "  " + modifiedStyle.Render(symSelected)
 	}
 	b.WriteString(stepStyle.Render(title))
 	b.WriteString("\n\n")
@@ -736,7 +737,7 @@ func (m Model) viewEdit() string {
 
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
 	// Help bar
@@ -764,6 +765,36 @@ func renderHelp(entries []helpEntry) string {
 	return "  " + strings.Join(parts, "    ")
 }
 
+// ── Actionable errors ─────────────────────────────────
+
+func formatError(err error) string {
+	msg := err.Error()
+	hint := ""
+
+	switch {
+	case strings.Contains(msg, "nothing to commit"):
+		hint = "Go back and select at least one file."
+	case strings.Contains(msg, "CONFLICT"):
+		hint = "Resolve merge conflicts before committing."
+	case strings.Contains(msg, "rejected"), strings.Contains(msg, "non-fast-forward"):
+		hint = "Remote has newer changes. Run git pull first."
+	case strings.Contains(msg, "Authentication failed"):
+		hint = "Check your git credentials or SSH key."
+	case strings.Contains(msg, "Permission denied"):
+		hint = "Check file or repository permissions."
+	case strings.Contains(msg, "rm --cached failed"):
+		hint = "Some files could not be untracked. Check paths."
+	case strings.Contains(msg, "staging failed"):
+		hint = "Files could not be staged. Check paths and permissions."
+	}
+
+	result := errorStyle.Render("Error: " + msg)
+	if hint != "" {
+		result += "\n  " + dimStyle.Render("Hint: " + hint)
+	}
+	return result
+}
+
 // ── Progress breadcrumb ───────────────────────────────
 
 func stepProgressIndex(s step) int {
@@ -776,25 +807,27 @@ func stepProgressIndex(s step) int {
 		return 2
 	case stepMessage:
 		return 3
-	case stepPush:
+	case stepConfirm:
 		return 4
-	default:
+	case stepPush:
 		return 5
+	default:
+		return 6
 	}
 }
 
 func renderProgress(current step) string {
-	names := []string{"Files", "Type", "Scope", "Message", "Push"}
+	names := []string{"Files", "Type", "Scope", "Message", "Confirm", "Push"}
 	currentIdx := stepProgressIndex(current)
 
 	var parts []string
 	for i, name := range names {
 		if i < currentIdx {
-			parts = append(parts, successStyle.Render("✓ "+name))
+			parts = append(parts, successStyle.Render(symDone + " "+name))
 		} else if i == currentIdx {
-			parts = append(parts, activeStyle.Render("▸ "+name))
+			parts = append(parts, activeStyle.Render(symCursor + " "+name))
 		} else {
-			parts = append(parts, dimStyle.Render("○ "+name))
+			parts = append(parts, dimStyle.Render(symUnselected + " "+name))
 		}
 	}
 	return "  " + strings.Join(parts, "  ")
@@ -838,7 +871,7 @@ func (m Model) viewFilter() string {
 	// Header
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n\n")
@@ -866,7 +899,7 @@ func (m Model) viewFilter() string {
 	}
 
 	if start > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp,start)) + "\n")
 	}
 
 	// Matched files
@@ -876,12 +909,12 @@ func (m Model) viewFilter() string {
 
 		cursor := "  "
 		if j == m.filterCursor {
-			cursor = cursorStyle.Render("▸ ")
+			cursor = cursorStyle.Render(symCursor + " ")
 		}
 
-		check := unselectedCheck.Render("○")
+		check := unselectedCheck.Render(symUnselected)
 		if f.Selected {
-			check = selectedCheck.Render("●")
+			check = selectedCheck.Render(symSelected)
 		}
 
 		status := fileStatusStyle(f.Status).Render(fmt.Sprintf("%-2s", f.Status.Symbol()))
@@ -895,7 +928,7 @@ func (m Model) viewFilter() string {
 	}
 
 	if end < len(m.filterMatches) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filterMatches)-end)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown,len(m.filterMatches)-end)) + "\n")
 	}
 
 	// Counter
@@ -906,7 +939,7 @@ func (m Model) viewFilter() string {
 	// Help bar
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
-		{"↑↓", "navigate"},
+		{symArrows, "navigate"},
 		{"tab", "select"},
 		{"enter", "jump"},
 		{"esc", "cancel"},

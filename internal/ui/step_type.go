@@ -60,7 +60,7 @@ func (m Model) viewType() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
@@ -74,14 +74,14 @@ func (m Model) viewType() string {
 	for i, ct := range types.CommitTypes {
 		cursor := "  "
 		if i == m.typeIdx {
-			cursor = cursorStyle.Render("▸ ")
+			cursor = cursorStyle.Render(symCursor + " ")
 		}
 
-		radio := inactiveStyle.Render("○")
+		radio := inactiveStyle.Render(symUnselected)
 		name := inactiveStyle.Render(ct.Name)
 		desc := dimStyle.Render(ct.Description)
 		if i == m.typeIdx {
-			radio = activeStyle.Render("●")
+			radio = activeStyle.Render(symSelected)
 			name = activeStyle.Render(ct.Name)
 			desc = lipgloss.NewStyle().Foreground(lightGray).Render(ct.Description)
 		}
@@ -93,13 +93,13 @@ func (m Model) viewType() string {
 	customIdx := len(types.CommitTypes)
 	cursor := "  "
 	if m.typeIdx == customIdx {
-		cursor = cursorStyle.Render("▸ ")
+		cursor = cursorStyle.Render(symCursor + " ")
 	}
-	radio := inactiveStyle.Render("○")
+	radio := inactiveStyle.Render(symUnselected)
 	name := inactiveStyle.Render("custom")
 	desc := dimStyle.Render("Write your own...")
 	if m.typeIdx == customIdx {
-		radio = activeStyle.Render("●")
+		radio = activeStyle.Render(symSelected)
 		name = activeStyle.Render("custom")
 		desc = lipgloss.NewStyle().Foreground(lightGray).Render("Write your own...")
 	}
@@ -108,7 +108,7 @@ func (m Model) viewType() string {
 	// Help bar
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
-		{"↑↓", "navigate"},
+		{symArrows, "navigate"},
 		{"enter", "select"},
 		{"!", "breaking"},
 		{"esc", "back"},
@@ -149,7 +149,7 @@ func (m Model) viewCustom() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")

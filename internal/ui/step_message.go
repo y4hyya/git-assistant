@@ -11,65 +11,37 @@ import (
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Forward spinner ticks while committing
-	if m.committing {
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
-	}
-
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
 		case "tab":
 			if !m.showBody {
-				// Show body and focus it
 				m.showBody = true
 				m.bodyFocused = true
 				m.msgInput.Blur()
 				m.bodyInput.Focus()
 			} else if m.bodyFocused {
-				// Switch focus back to subject
 				m.bodyFocused = false
 				m.bodyInput.Blur()
 				m.msgInput.Focus()
 			} else {
-				// Switch focus to body
 				m.bodyFocused = true
 				m.msgInput.Blur()
 				m.bodyInput.Focus()
 			}
 			return m, nil
 		case "enter":
-			// In body mode, enter is handled by textarea (newline)
 			if m.bodyFocused {
 				break
 			}
 			val := strings.TrimSpace(m.msgInput.Value())
 			if val != "" {
-				m.committing = true
-				fullMsg := m.buildCommitMessage(val)
-				var paths []string
-				for _, f := range m.files {
-					if f.Selected {
-						paths = append(paths, f.Path)
-					}
-				}
-				return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
+				m.step = stepConfirm
 			}
 			return m, nil
 		case "ctrl+d":
-			// Commit from body
 			val := strings.TrimSpace(m.msgInput.Value())
 			if val != "" {
-				m.committing = true
-				fullMsg := m.buildCommitMessage(val)
-				var paths []string
-				for _, f := range m.files {
-					if f.Selected {
-						paths = append(paths, f.Path)
-					}
-				}
-				return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
+				m.step = stepConfirm
 			}
 			return m, nil
 		case "esc":
@@ -121,7 +93,7 @@ func (m Model) viewMessage() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
@@ -169,33 +141,28 @@ func (m Model) viewMessage() string {
 		b.WriteString("\n  " + previewStyle.Render("→ "+preview) + "\n")
 	}
 
-	// Loading state
-	if m.committing {
-		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Committing...") + "\n")
-	}
-
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
 	// Help bar
 	b.WriteString("\n")
 	if m.bodyFocused {
 		b.WriteString(renderHelp([]helpEntry{
-			{"ctrl+d", "commit"},
+			{"ctrl+d", "next"},
 			{"tab", "subject"},
 			{"esc", "back"},
 		}))
 	} else if m.showBody {
 		b.WriteString(renderHelp([]helpEntry{
-			{"enter", "commit"},
+			{"enter", "next"},
 			{"tab", "body"},
 			{"esc", "back"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{
-			{"enter", "commit"},
+			{"enter", "next"},
 			{"tab", "add body"},
 			{"esc", "back"},
 		}))

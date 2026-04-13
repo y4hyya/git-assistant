@@ -62,7 +62,7 @@ func (m Model) viewPush() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
@@ -71,7 +71,7 @@ func (m Model) viewPush() string {
 
 	// Commit success
 	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
-	b.WriteString("  " + successStyle.Render("✓") + " Committed: " + msg + "\n")
+	b.WriteString("  " + successStyle.Render(symDone) + " Committed: " + msg + "\n")
 
 	stats := git.GetCommitStats()
 	if stats != "" {
@@ -84,13 +84,13 @@ func (m Model) viewPush() string {
 	for i, branch := range m.branches {
 		cursor := "  "
 		if i == m.branchIdx {
-			cursor = cursorStyle.Render("▸ ")
+			cursor = cursorStyle.Render(symCursor + " ")
 		}
 
-		radio := inactiveStyle.Render("○")
+		radio := inactiveStyle.Render(symUnselected)
 		name := inactiveStyle.Render(branch)
 		if i == m.branchIdx {
-			radio = activeStyle.Render("●")
+			radio = activeStyle.Render(symSelected)
 			name = activeStyle.Render(branch)
 		}
 
@@ -109,13 +109,13 @@ func (m Model) viewPush() string {
 
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + errorStyle.Render("Error: "+m.err.Error()) + "\n")
+		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
 	// Help bar
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
-		{"↑↓", "navigate"},
+		{symArrows, "navigate"},
 		{"enter", "push"},
 		{"n", "skip"},
 		{"q", "quit"},

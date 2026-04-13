@@ -19,6 +19,7 @@ const (
 	stepCustom              // custom type input
 	stepScope               // optional scope input
 	stepMessage             // commit message input
+	stepConfirm             // commit confirmation
 	stepPush                // branch picker + push
 	stepDone                // success screen
 )
@@ -312,6 +313,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateScope(msg)
 	case stepMessage:
 		return m.updateMessage(msg)
+	case stepConfirm:
+		return m.updateConfirm(msg)
 	case stepPush:
 		return m.updatePush(msg)
 	case stepDone:
@@ -337,6 +340,8 @@ func (m Model) View() string {
 		return m.viewScope()
 	case stepMessage:
 		return m.viewMessage()
+	case stepConfirm:
+		return m.viewConfirm()
 	case stepPush:
 		return m.viewPush()
 	case stepDone:

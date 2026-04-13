@@ -1,6 +1,51 @@
 package ui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"os"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+// Terminal symbol set with Unicode/ASCII fallbacks
+var (
+	symCursor     = "▸"
+	symSelected   = "●"
+	symUnselected = "○"
+	symDone       = "✓"
+	symBranch     = "⎇"
+	symArrowUp    = "↑"
+	symArrowDown  = "↓"
+	symArrows     = "↑↓"
+	symSkip       = "⊘"
+	symDirty      = "●"
+)
+
+func init() {
+	if !isUnicodeSupported() {
+		symCursor = ">"
+		symSelected = "*"
+		symUnselected = "o"
+		symDone = "+"
+		symBranch = "@"
+		symArrowUp = "^"
+		symArrowDown = "v"
+		symArrows = "^v"
+		symSkip = "-"
+		symDirty = "*"
+	}
+}
+
+func isUnicodeSupported() bool {
+	for _, env := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		val := os.Getenv(env)
+		if strings.Contains(strings.ToLower(val), "utf") {
+			return true
+		}
+	}
+	term := os.Getenv("TERM")
+	return term != "" && term != "dumb"
+}
 
 var (
 	// Colors

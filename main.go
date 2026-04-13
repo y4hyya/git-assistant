@@ -10,6 +10,12 @@ import (
 )
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--no-color" {
+			os.Setenv("NO_COLOR", "1")
+		}
+	}
+
 	if !git.IsGitRepo() {
 		fmt.Println("✗ Not a git repository")
 		os.Exit(1)

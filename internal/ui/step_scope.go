@@ -36,7 +36,7 @@ func (m Model) viewScope() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")

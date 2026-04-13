@@ -27,14 +27,14 @@ func (m Model) viewDone() string {
 
 	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(branchStyle.Render("⎇ " + m.branch))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n\n")
 
 	// Commit summary
 	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
-	b.WriteString("  " + successStyle.Render("✓") + " Committed: " + msg + "\n")
+	b.WriteString("  " + successStyle.Render(symDone) + " Committed: " + msg + "\n")
 
 	// Commit hash and stats
 	hash := git.GetLastCommitHash()
@@ -55,9 +55,9 @@ func (m Model) viewDone() string {
 
 	// Push summary
 	if m.pushed {
-		b.WriteString("  " + successStyle.Render("✓") + " Pushed to " + branchStyle.Render("origin/"+m.pushBranch) + "\n")
+		b.WriteString("  " + successStyle.Render(symDone) + " Pushed to " + branchStyle.Render("origin/"+m.pushBranch) + "\n")
 	} else if m.hasRemote {
-		b.WriteString("  " + dimStyle.Render("⊘ Push skipped") + "\n")
+		b.WriteString("  " + dimStyle.Render(symSkip + " Push skipped") + "\n")
 	}
 
 	b.WriteString("\n  " + successStyle.Render("All done!") + "\n")
