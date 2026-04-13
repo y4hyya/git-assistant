@@ -155,6 +155,15 @@ func Commit(filePaths []string, cachedPaths []string, message string) error {
 	return nil
 }
 
+// GetLastCommitHash returns the short hash of the last commit.
+func GetLastCommitHash() string {
+	out, err := exec.Command("git", "log", "-1", "--format=%h").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // GetLastCommitMessage returns the subject line of the last commit.
 func GetLastCommitMessage() string {
 	out, err := exec.Command("git", "log", "-1", "--format=%s").Output()
