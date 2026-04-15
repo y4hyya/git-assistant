@@ -166,6 +166,7 @@ type Model struct {
 	// Commit graph
 	localGraph  string
 	aheadBehind string
+	behindMain  int
 
 	// Terminal dimensions
 	width    int
@@ -257,6 +258,7 @@ func (m *Model) RefreshGraphs() {
 	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
 	m.aheadBehind = formatAheadBehind(a, b)
+	m.behindMain = git.GetBehindMain(m.branch)
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -443,8 +445,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
-				m.branchConflict = true
-				m.branchConflFiles = conflicts
+				if m.step == stepMenu {
+					// Syncing from menu — abort and show error
+					git.MergeAbort()
+					m.err = fmt.Errorf("merge conflicts with main — use Branch Manager to resolve")
+				} else {
+					m.branchConflict = true
+					m.branchConflFiles = conflicts
+				}
 			} else {
 				m.err = msg.err
 			}

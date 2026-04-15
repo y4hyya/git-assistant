@@ -424,6 +424,25 @@ func WriteFileContent(path string, content string) error {
 	return nil
 }
 
+// GetBehindMain returns how many commits the given branch is behind main.
+// Returns 0 if branch is main or if the comparison fails.
+func GetBehindMain(branch string) int {
+	if branch == "main" || branch == "master" {
+		return 0
+	}
+	out, err := exec.Command("git", "rev-list", "--count", branch+"..main").Output()
+	if err != nil {
+		// Try master if main doesn't exist
+		out, err = exec.Command("git", "rev-list", "--count", branch+"..master").Output()
+		if err != nil {
+			return 0
+		}
+	}
+	var count int
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count)
+	return count
+}
+
 // ── Config operations ──────────────────────────────────
 
 // GetConfigValue returns the value of a git config key.

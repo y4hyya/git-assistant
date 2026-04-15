@@ -37,6 +37,13 @@ func (m Model) menuItems() []menuItem {
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Forward spinner during sync
+	if m.branchMerging {
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+	}
+
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return m, nil
@@ -76,6 +83,11 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadConfigItems()
 			m.step = stepConfig
 		}
+	case "s":
+		if m.behindMain > 0 {
+			m.branchMerging = true
+			return m, tea.Batch(doMergeBranch("main"), m.spinner.Tick)
+		}
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -101,6 +113,9 @@ func (m Model) viewMenu() string {
 		status = modifiedStyle.Render(fmt.Sprintf("  %d changes", len(m.files)))
 	}
 	b.WriteString(status)
+	if m.behindMain > 0 {
+		b.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind main", symArrowDown, m.behindMain)))
+	}
 	b.WriteString("\n\n")
 
 	// Menu items
@@ -126,6 +141,11 @@ func (m Model) viewMenu() string {
 		b.WriteString(fmt.Sprintf("%s%-12s %s\n", cursor, name, desc))
 	}
 
+	// Spinner for sync
+	if m.branchMerging {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Syncing with main...") + "\n")
+	}
+
 	// Error
 	if m.err != nil {
 		b.WriteString("\n  " + formatError(m.err) + "\n")
@@ -133,11 +153,15 @@ func (m Model) viewMenu() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
+	helpEntries := []helpEntry{
 		{symArrows, "navigate"},
 		{"enter", "select"},
-		{"q", "quit"},
-	}))
+	}
+	if m.behindMain > 0 {
+		helpEntries = append(helpEntries, helpEntry{"s", "sync"})
+	}
+	helpEntries = append(helpEntries, helpEntry{"q", "quit"})
+	b.WriteString(renderHelp(helpEntries))
 
 	// Graph section
 	graphSection := m.renderGraphSection()
