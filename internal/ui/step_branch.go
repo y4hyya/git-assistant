@@ -80,6 +80,9 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Clear post-creation hint on any keypress
+	m.branchCreatedHint = ""
+
 	// ── Conflict view ──────────────────────────────────
 	if m.branchConflict {
 		switch keyMsg.String() {
@@ -128,14 +131,49 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// ── Merge target picker ────────────────────────────
+	if m.mergeTargetMode {
+		switch keyMsg.String() {
+		case "up", "k":
+			if m.mergeTargetCursor > 0 {
+				m.mergeTargetCursor--
+			}
+		case "down", "j":
+			if m.mergeTargetCursor < len(m.mergeTargets)-1 {
+				m.mergeTargetCursor++
+			}
+		case "enter":
+			target := m.mergeTargets[m.mergeTargetCursor]
+			m.mergeTarget = target.Name
+			m.mergeTargetMode = false
+			m.branchMergeMode = true
+		case "esc":
+			m.mergeTargetMode = false
+		}
+		return m, nil
+	}
+
 	// ── Merge confirmation ─────────────────────────────
 	if m.branchMergeMode {
 		switch keyMsg.String() {
 		case "y":
-			entry := m.branchEntries[m.branchCursor]
 			m.branchMergeMode = false
-			m.branchMerging = true
-			return m, tea.Batch(doMergeBranch(entry.Name), m.spinner.Tick)
+			if m.mergeTarget == m.branch {
+				// Already on target, merge directly
+				m.branchMerging = true
+				return m, tea.Batch(doMergeBranch(m.mergeSource), m.spinner.Tick)
+			}
+			// Switch to target first, then merge will trigger via branchMergePending
+			m.branchMergePending = m.mergeSource
+			m.branchSwitching = true
+			isRemote := false
+			for _, e := range m.branchEntries {
+				if e.Name == m.mergeTarget && e.IsRemote {
+					isRemote = true
+					break
+				}
+			}
+			return m, tea.Batch(doSwitchBranch(m.mergeTarget, isRemote), m.spinner.Tick)
 		default:
 			m.branchMergeMode = false
 			return m, nil
@@ -191,7 +229,20 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("cannot merge a branch into itself")
 			return m, nil
 		}
-		m.branchMergeMode = true
+		// Enter target picker: choose which branch to merge INTO
+		m.mergeSource = entry.Name
+		m.mergeTargets = nil
+		defaultIdx := 0
+		for _, e := range m.branchEntries {
+			if e.Name != entry.Name {
+				if e.IsCurrent {
+					defaultIdx = len(m.mergeTargets)
+				}
+				m.mergeTargets = append(m.mergeTargets, e)
+			}
+		}
+		m.mergeTargetCursor = defaultIdx
+		m.mergeTargetMode = true
 		return m, nil
 	case "esc":
 		if m.branchStandalone {
@@ -278,10 +329,40 @@ func (m Model) viewBranch() string {
 		return m.styledBox(b.String())
 	}
 
+	// ── Merge target picker ─────────────────────────────
+	if m.mergeTargetMode {
+		b.WriteString("  Merge " + branchStyle.Render(m.mergeSource) + " into:\n\n")
+		for i, entry := range m.mergeTargets {
+			cursor := "  "
+			if i == m.mergeTargetCursor {
+				cursor = cursorStyle.Render(symCursor + " ")
+			}
+			name := inactiveStyle.Render(entry.Name)
+			if i == m.mergeTargetCursor {
+				name = highlightStyle.Render(entry.Name)
+			}
+			label := ""
+			if entry.IsCurrent {
+				label = dimStyle.Render(" (current)")
+			} else if entry.IsRemote {
+				label = dimStyle.Render(" (remote)")
+			}
+			b.WriteString(fmt.Sprintf("%s%s%s\n", cursor, name, label))
+		}
+		b.WriteString("\n")
+		b.WriteString(renderHelp([]helpEntry{
+			{symArrows, "navigate"},
+			{"enter", "select"},
+			{"esc", "cancel"},
+		}))
+		return m.styledBox(b.String())
+	}
+
 	// ── Merge confirmation ─────────────────────────────
-	if m.branchMergeMode && m.branchCursor < len(m.branchEntries) {
-		entry := m.branchEntries[m.branchCursor]
-		b.WriteString("  " + modifiedStyle.Render("Merge "+entry.Name+" into "+m.branch+"?") + "\n")
+	if m.branchMergeMode {
+		b.WriteString("  " + branchStyle.Render(m.mergeSource) + " " + dimStyle.Render("→") + " " + branchStyle.Render(m.mergeTarget) + "\n\n")
+		b.WriteString("  " + dimStyle.Render("This will bring all changes from") + "\n")
+		b.WriteString("  " + dimStyle.Render("'"+m.mergeSource+"' into '"+m.mergeTarget+"'") + "\n")
 		b.WriteString("\n")
 		b.WriteString(renderHelp([]helpEntry{
 			{"y", "confirm"},
@@ -371,6 +452,12 @@ func (m Model) viewBranch() string {
 	}
 	if m.branchMerging {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Merging...") + "\n")
+	}
+
+	// Post-creation hint
+	if m.branchCreatedHint != "" {
+		b.WriteString("\n  " + successStyle.Render(symDone) + " Created & switched to " + branchStyle.Render(m.branchCreatedHint) + "\n")
+		b.WriteString("  " + dimStyle.Render("Make changes and commit here, then merge back when ready.") + "\n")
 	}
 
 	// Error

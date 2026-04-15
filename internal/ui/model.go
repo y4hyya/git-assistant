@@ -117,8 +117,15 @@ type Model struct {
 	branchConflict    bool
 	branchConflFiles  []string
 	branchStandalone  bool
-	branchSwitching   bool
-	branchMerging     bool
+	branchSwitching    bool
+	branchMerging      bool
+	branchCreatedHint  string
+	branchMergePending string
+	mergeSource        string
+	mergeTarget        string
+	mergeTargetMode    bool
+	mergeTargets       []types.BranchEntry
+	mergeTargetCursor  int
 
 	// Config editor
 	configCursor     int
@@ -156,10 +163,9 @@ type Model struct {
 	// Main menu
 	menuCursor int
 
-	// Graph panels
-	localGraph   string
-	remoteGraph  string
-	aheadBehind  string
+	// Commit graph
+	localGraph  string
+	aheadBehind string
 
 	// Terminal dimensions
 	width    int
@@ -238,8 +244,7 @@ func NewBranchModel(branch string) Model {
 	m.step = stepBranch
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
-	m.localGraph = git.GetLocalGraph(branch, 15)
-	m.remoteGraph = git.GetRemoteGraph(branch, 15)
+	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(branch)
 	m.aheadBehind = formatAheadBehind(a, b)
 	return m
@@ -247,8 +252,7 @@ func NewBranchModel(branch string) Model {
 
 // RefreshGraphs updates the graph data from git.
 func (m *Model) RefreshGraphs() {
-	m.localGraph = git.GetLocalGraph(m.branch, 15)
-	m.remoteGraph = git.GetRemoteGraph(m.branch, 15)
+	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
 	m.aheadBehind = formatAheadBehind(a, b)
 }
@@ -382,6 +386,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case branchSwitchResultMsg:
 		m.branchSwitching = false
 		if msg.err != nil {
+			m.branchMergePending = ""
 			m.err = msg.err
 			return m, nil
 		}
@@ -391,7 +396,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.RefreshGraphs()
 		if msg.stashConflict {
+			m.branchMergePending = ""
 			m.err = fmt.Errorf("switched to %s — changes saved in stash (conflicts). Switch back and run: git stash pop", msg.newBranch)
+			return m, nil
+		}
+		// If a merge was pending (target picker flow), start it now
+		if m.branchMergePending != "" {
+			source := m.branchMergePending
+			m.branchMergePending = ""
+			m.branchMerging = true
+			return m, tea.Batch(doMergeBranch(source), m.spinner.Tick)
 		}
 		return m, nil
 
@@ -406,6 +420,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.branchCreateMode = false
 		m.branchCreateInput.Reset()
+		m.branchCreatedHint = msg.newBranch
 		return m, nil
 
 	case branchDeleteResultMsg:

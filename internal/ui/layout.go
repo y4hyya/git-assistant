@@ -20,10 +20,10 @@ func (m Model) styledBox(content string) string {
 	return boxBorder.Width(w).MaxHeight(h).Render(content)
 }
 
-// renderGraphSection returns a compact side-by-side local/remote graph footer.
+// renderGraphSection returns a single unified commit graph footer.
 // Height-adaptive: reduces commits or hides entirely if terminal is too short.
 func (m Model) renderGraphSection() string {
-	if m.width < 60 {
+	if m.width < 40 {
 		return ""
 	}
 
@@ -33,48 +33,44 @@ func (m Model) renderGraphSection() string {
 		return "" // not enough room
 	}
 
-	// Each commit with connector = 2 lines. Titles + separator + spacing = 4 lines.
-	maxCommits := (available - 4) / 2
+	// Each commit with connector = 2 lines. Title + separator + spacing = 3 lines.
+	maxCommits := (available - 3) / 2
 	if maxCommits < 1 {
 		return ""
 	}
-	if maxCommits > 5 {
-		maxCommits = 5
+	if maxCommits > 7 {
+		maxCommits = 7
 	}
 
 	innerWidth := m.width - 12
 	if innerWidth < 30 {
 		innerWidth = 30
 	}
-	halfWidth := innerWidth / 2
 
-	localTitle := graphTitleStyle.Render("Local: " + m.branch)
-	localContent := transformGraph(m.localGraph, halfWidth-2, maxCommits*2)
-	localPanel := localTitle + "\n" + localContent
-
-	remoteTitle := graphTitleStyle.Render("Remote: origin/" + m.branch)
-	remoteContent := transformGraph(m.remoteGraph, halfWidth-2, maxCommits*2)
-	abLine := ""
+	title := graphTitleStyle.Render("Commit Graph")
 	if m.aheadBehind != "" {
-		abLine = "\n" + dimStyle.Render(m.aheadBehind)
+		padding := innerWidth - lipgloss.Width(title) - len(m.branch) - len(m.aheadBehind) - 4
+		if padding < 2 {
+			padding = 2
+		}
+		title += strings.Repeat(" ", padding) + dimStyle.Render(m.branch+": "+m.aheadBehind)
 	}
-	remotePanel := remoteTitle + "\n" + remoteContent + abLine
 
-	leftCol := lipgloss.NewStyle().Width(halfWidth).Render(localPanel)
-	rightCol := lipgloss.NewStyle().Width(halfWidth).Render(remotePanel)
+	content := transformGraph(m.localGraph, innerWidth-2, maxCommits*2)
 
 	separator := dimStyle.Render(strings.Repeat("─", innerWidth))
 
-	return separator + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+	return separator + "\n" + title + "\n" + content
 }
 
 // ── Graph transformation ──────────────────────────────
 
 type graphLine struct {
-	chars     []byte
-	message   string
-	starCol   int
-	connector bool
+	chars      []byte
+	message    string
+	decoration string
+	starCol    int
+	connector  bool
 }
 
 func transformGraph(raw string, maxWidth, maxLines int) string {
@@ -120,10 +116,37 @@ func parseLine(line string) graphLine {
 	}
 
 	if graphEnd < len(line) {
-		gl.message = strings.TrimSpace(line[graphEnd:])
+		raw := strings.TrimSpace(line[graphEnd:])
+		// Extract branch decoration from %d format: "message (HEAD -> main, origin/main)"
+		if i := strings.LastIndex(raw, " ("); i >= 0 && strings.HasSuffix(raw, ")") {
+			gl.message = strings.TrimSpace(raw[:i])
+			gl.decoration = cleanDecoration(raw[i+1:])
+		} else {
+			gl.message = raw
+		}
 	}
 
 	return gl
+}
+
+// cleanDecoration removes HEAD pointer and tag refs, keeping only branch names.
+func cleanDecoration(raw string) string {
+	// raw is "(HEAD -> main, origin/main)"
+	inner := raw[1 : len(raw)-1]
+	parts := strings.Split(inner, ", ")
+	var cleaned []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.TrimPrefix(p, "HEAD -> ")
+		if p == "HEAD" || strings.HasPrefix(p, "tag: ") {
+			continue
+		}
+		cleaned = append(cleaned, p)
+	}
+	if len(cleaned) == 0 {
+		return ""
+	}
+	return "(" + strings.Join(cleaned, ", ") + ")"
 }
 
 func insertConnectors(lines []graphLine) []graphLine {
@@ -187,7 +210,7 @@ func renderGraphLine(gl graphLine, maxWidth int) string {
 		}
 	}
 
-	if gl.connector || gl.message == "" {
+	if gl.connector || (gl.message == "" && gl.decoration == "") {
 		return visual.String()
 	}
 
@@ -198,6 +221,21 @@ func renderGraphLine(gl graphLine, maxWidth int) string {
 	}
 
 	msg := gl.message
+	deco := gl.decoration
+
+	if deco != "" {
+		// Reserve space for decoration, truncate message if needed
+		decoLen := len(deco) + 1
+		msgSpace := available - decoLen
+		if msgSpace < 10 {
+			msgSpace = 10
+		}
+		if len(msg) > msgSpace {
+			msg = msg[:msgSpace-3] + "..."
+		}
+		return visual.String() + " " + msg + " " + branchStyle.Render(deco)
+	}
+
 	if len(msg) > available {
 		msg = msg[:available-3] + "..."
 	}
