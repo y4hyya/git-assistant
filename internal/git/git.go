@@ -470,21 +470,20 @@ func GetRemoteURL() string {
 
 // ── Graph operations ───────────────────────────────────
 
-// GetLocalGraph returns the git log graph for a local branch.
+// GetLocalGraph returns the git log graph for all local branches.
 func GetLocalGraph(branch string, limit int) string {
 	out, err := exec.Command("git", "log", "--graph", "--format=%s",
-		fmt.Sprintf("-%d", limit), branch).Output()
+		fmt.Sprintf("-%d", limit), "--branches").Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimRight(string(out), "\n")
 }
 
-// GetRemoteGraph returns the git log graph for the remote tracking branch.
+// GetRemoteGraph returns the git log graph for all remote branches.
 func GetRemoteGraph(branch string, limit int) string {
-	remote := "origin/" + branch
 	out, err := exec.Command("git", "log", "--graph", "--format=%s",
-		fmt.Sprintf("-%d", limit), remote).Output()
+		fmt.Sprintf("-%d", limit), "--remotes").Output()
 	if err != nil {
 		return ""
 	}

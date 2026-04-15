@@ -48,11 +48,11 @@ func (m Model) renderGraphSection() string {
 	}
 	halfWidth := innerWidth / 2
 
-	localTitle := graphTitleStyle.Render("Local: " + m.branch)
+	localTitle := graphTitleStyle.Render("Local")
 	localContent := transformGraph(m.localGraph, halfWidth-2, maxCommits*2)
 	localPanel := localTitle + "\n" + localContent
 
-	remoteTitle := graphTitleStyle.Render("Remote: origin/" + m.branch)
+	remoteTitle := graphTitleStyle.Render("Remote")
 	remoteContent := transformGraph(m.remoteGraph, halfWidth-2, maxCommits*2)
 	abLine := ""
 	if m.aheadBehind != "" {
