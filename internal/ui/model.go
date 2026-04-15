@@ -19,6 +19,7 @@ const (
 	stepMenu    step = iota // main menu hub
 	stepFiles               // file selection
 	stepBranch              // branch manager
+	stepConfig              // config editor
 	stepType                // commit type picker
 	stepCustom              // custom type input
 	stepMessage             // commit message input (includes inline scope)
@@ -119,6 +120,13 @@ type Model struct {
 	branchSwitching   bool
 	branchMerging     bool
 
+	// Config editor
+	configCursor    int
+	configEditMode  bool
+	configEditInput textinput.Model
+	configGlobal    bool
+	configItems     []configItem
+
 	// Undo confirmation
 	confirmUndo bool
 
@@ -195,6 +203,11 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	bci.CharLimit = 100
 	bci.Width = 40
 
+	cfi := textinput.New()
+	cfi.Placeholder = "Enter value..."
+	cfi.CharLimit = 200
+	cfi.Width = 50
+
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
@@ -202,6 +215,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	return Model{
 		step:              stepMenu,
 		branchCreateInput: bci,
+		configEditInput:   cfi,
 		files:       files,
 		branch:      branch,
 		msgInput:    mi,
@@ -270,6 +284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scopeInput.Width = min(inputWidth, 50)
 		m.filterInput.Width = min(inputWidth, 60)
 		m.branchCreateInput.Width = min(inputWidth, 50)
+		m.configEditInput.Width = min(inputWidth, 50)
 		return m, nil
 
 	case undoResultMsg:
@@ -435,6 +450,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateFiles(msg)
 	case stepBranch:
 		return m.updateBranch(msg)
+	case stepConfig:
+		return m.updateConfig(msg)
 	case stepType:
 		return m.updateType(msg)
 	case stepCustom:
@@ -465,6 +482,8 @@ func (m Model) View() string {
 		content = m.viewFiles()
 	case stepBranch:
 		content = m.viewBranch()
+	case stepConfig:
+		content = m.viewConfig()
 	case stepType:
 		content = m.viewType()
 	case stepCustom:

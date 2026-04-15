@@ -30,6 +30,7 @@ func (m Model) menuItems() []menuItem {
 	return []menuItem{
 		{"Commit", commitDesc},
 		{"Branch", fmt.Sprintf("%d branches", branchCount)},
+		{"Config", "git settings"},
 	}
 }
 
@@ -68,6 +69,12 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.branchScroll = 0
 			m.branchStandalone = false
 			m.step = stepBranch
+		case 2: // Config
+			m.configCursor = 0
+			m.configGlobal = false
+			m.configEditMode = false
+			m.loadConfigItems()
+			m.step = stepConfig
 		}
 	case "q":
 		m.quitting = true

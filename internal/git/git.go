@@ -424,6 +424,50 @@ func WriteFileContent(path string, content string) error {
 	return nil
 }
 
+// ── Config operations ──────────────────────────────────
+
+// GetConfigValue returns the value of a git config key.
+// If global is true, reads from --global; otherwise --local.
+func GetConfigValue(key string, global bool) string {
+	args := []string{"config"}
+	if global {
+		args = append(args, "--global")
+	} else {
+		args = append(args, "--local")
+	}
+	args = append(args, key)
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// SetConfigValue sets a git config key to the given value.
+func SetConfigValue(key, value string, global bool) error {
+	args := []string{"config"}
+	if global {
+		args = append(args, "--global")
+	} else {
+		args = append(args, "--local")
+	}
+	args = append(args, key, value)
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("config set failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// GetRemoteURL returns the URL of the 'origin' remote.
+func GetRemoteURL() string {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // ── Graph operations ───────────────────────────────────
 
 // GetLocalGraph returns the git log graph for a local branch.
