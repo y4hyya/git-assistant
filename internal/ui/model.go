@@ -121,11 +121,14 @@ type Model struct {
 	branchMerging     bool
 
 	// Config editor
-	configCursor    int
-	configEditMode  bool
-	configEditInput textinput.Model
-	configGlobal    bool
-	configItems     []configItem
+	configCursor     int
+	configEditMode   bool
+	configEditInput  textinput.Model
+	configGlobal     bool
+	configItems      []configItem
+	configPickMode   bool
+	configPickItems  []string
+	configPickCursor int
 
 	// Undo confirmation
 	confirmUndo bool

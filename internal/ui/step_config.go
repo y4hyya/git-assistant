@@ -14,17 +14,18 @@ type configItem struct {
 	value    string
 	readonly bool
 	toggle   bool
+	pick     bool
 }
 
 func (m *Model) loadConfigItems() {
 	global := m.configGlobal
 	m.configItems = []configItem{
-		{"User name", "user.name", git.GetConfigValue("user.name", global), false, false},
-		{"User email", "user.email", git.GetConfigValue("user.email", global), false, false},
-		{"Default branch", "init.defaultBranch", git.GetConfigValue("init.defaultBranch", global), false, false},
-		{"Remote URL", "", git.GetRemoteURL(), true, false},
-		{"GPG signing", "commit.gpgsign", git.GetConfigValue("commit.gpgsign", global), false, true},
-		{"Editor", "core.editor", git.GetConfigValue("core.editor", global), false, false},
+		{"User name", "user.name", git.GetConfigValue("user.name", global), false, false, false},
+		{"User email", "user.email", git.GetConfigValue("user.email", global), false, false, false},
+		{"Default branch", "init.defaultBranch", git.GetConfigValue("init.defaultBranch", global), false, false, true},
+		{"Remote URL", "", git.GetRemoteURL(), true, false, false},
+		{"GPG signing", "commit.gpgsign", git.GetConfigValue("commit.gpgsign", global), false, true, false},
+		{"Editor", "core.editor", git.GetConfigValue("core.editor", global), false, false, false},
 	}
 }
 
@@ -33,6 +34,33 @@ func (m *Model) loadConfigItems() {
 func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
+		return m, nil
+	}
+
+	// Handle pick mode (branch selector)
+	if m.configPickMode {
+		switch keyMsg.String() {
+		case "up", "k":
+			if m.configPickCursor > 0 {
+				m.configPickCursor--
+			}
+		case "down", "j":
+			if m.configPickCursor < len(m.configPickItems)-1 {
+				m.configPickCursor++
+			}
+		case "enter":
+			selected := m.configPickItems[m.configPickCursor]
+			item := m.configItems[m.configCursor]
+			if err := git.SetConfigValue(item.key, selected, m.configGlobal); err != nil {
+				m.err = err
+			}
+			m.configPickMode = false
+			m.loadConfigItems()
+			return m, nil
+		case "esc":
+			m.configPickMode = false
+			return m, nil
+		}
 		return m, nil
 	}
 
@@ -83,6 +111,26 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = err
 			}
 			m.loadConfigItems()
+			return m, nil
+		}
+		if item.pick {
+			// Load local branch names for the picker
+			entries := git.GetAllBranches()
+			m.configPickItems = nil
+			for _, e := range entries {
+				if !e.IsRemote {
+					m.configPickItems = append(m.configPickItems, e.Name)
+				}
+			}
+			m.configPickCursor = 0
+			// Pre-select the current value if it exists
+			for i, name := range m.configPickItems {
+				if name == item.value {
+					m.configPickCursor = i
+					break
+				}
+			}
+			m.configPickMode = true
 			return m, nil
 		}
 		// Enter inline edit mode
@@ -151,6 +199,20 @@ func (m Model) viewConfig() string {
 			b.WriteString(fmt.Sprintf("%s%s %s\n", cursor, label, m.configEditInput.View()))
 			continue
 		}
+		if m.configPickMode && i == m.configCursor {
+			// Show inline branch picker
+			b.WriteString(fmt.Sprintf("%s%s\n", cursor, label))
+			for pi, name := range m.configPickItems {
+				pickCursor := "     "
+				nameStyle := dimStyle.Render(name)
+				if pi == m.configPickCursor {
+					pickCursor = "   " + cursorStyle.Render(symCursor+" ")
+					nameStyle = highlightStyle.Render(name)
+				}
+				b.WriteString(fmt.Sprintf("%s%s\n", pickCursor, nameStyle))
+			}
+			continue
+		}
 		if value == "" {
 			value = dimStyle.Render("not set")
 		} else if item.toggle {
@@ -173,7 +235,13 @@ func (m Model) viewConfig() string {
 
 	// Help bar
 	b.WriteString("\n")
-	if m.configEditMode {
+	if m.configPickMode {
+		b.WriteString(renderHelp([]helpEntry{
+			{symArrows, "navigate"},
+			{"enter", "select"},
+			{"esc", "cancel"},
+		}))
+	} else if m.configEditMode {
 		b.WriteString(renderHelp([]helpEntry{
 			{"enter", "save"},
 			{"esc", "cancel"},
