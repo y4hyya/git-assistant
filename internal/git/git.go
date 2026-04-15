@@ -470,20 +470,12 @@ func GetRemoteURL() string {
 
 // ── Graph operations ───────────────────────────────────
 
-// GetLocalGraph returns the git log graph for all local branches.
-func GetLocalGraph(branch string, limit int) string {
-	out, err := exec.Command("git", "log", "--graph", "--format=%s",
-		fmt.Sprintf("-%d", limit), "--branches").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimRight(string(out), "\n")
-}
-
-// GetRemoteGraph returns the git log graph for all remote branches.
-func GetRemoteGraph(branch string, limit int) string {
-	out, err := exec.Command("git", "log", "--graph", "--format=%s",
-		fmt.Sprintf("-%d", limit), "--remotes").Output()
+// GetUnifiedGraph returns the git log graph for all branches (local + remote).
+// Uses %d to include branch name decorations on relevant commits.
+func GetUnifiedGraph(limit int) string {
+	out, err := exec.Command("git", "log", "--graph",
+		"--format=%s%d", "--all",
+		fmt.Sprintf("-%d", limit)).Output()
 	if err != nil {
 		return ""
 	}
@@ -595,7 +587,7 @@ func DeleteBranch(name string) error {
 
 // MergeBranch merges the given branch into the current branch.
 func MergeBranch(name string) error {
-	out, err := exec.Command("git", "merge", name).CombinedOutput()
+	out, err := exec.Command("git", "merge", "--no-ff", name).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}

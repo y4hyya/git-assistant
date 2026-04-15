@@ -163,10 +163,9 @@ type Model struct {
 	// Main menu
 	menuCursor int
 
-	// Graph panels
-	localGraph   string
-	remoteGraph  string
-	aheadBehind  string
+	// Commit graph
+	localGraph  string
+	aheadBehind string
 
 	// Terminal dimensions
 	width    int
@@ -245,8 +244,7 @@ func NewBranchModel(branch string) Model {
 	m.step = stepBranch
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
-	m.localGraph = git.GetLocalGraph(branch, 15)
-	m.remoteGraph = git.GetRemoteGraph(branch, 15)
+	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(branch)
 	m.aheadBehind = formatAheadBehind(a, b)
 	return m
@@ -254,8 +252,7 @@ func NewBranchModel(branch string) Model {
 
 // RefreshGraphs updates the graph data from git.
 func (m *Model) RefreshGraphs() {
-	m.localGraph = git.GetLocalGraph(m.branch, 15)
-	m.remoteGraph = git.GetRemoteGraph(m.branch, 15)
+	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
 	m.aheadBehind = formatAheadBehind(a, b)
 }
