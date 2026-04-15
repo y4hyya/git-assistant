@@ -12,9 +12,30 @@ import (
 func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
-		case "enter", "q":
-			m.quitting = true
-			return m, tea.Quit
+		case "enter":
+			// Reset wizard state and return to menu
+			m.step = stepMenu
+			m.menuCursor = 0
+			m.typeIdx = 0
+			m.commitType = ""
+			m.breaking = false
+			m.scope = ""
+			m.msgInput.Reset()
+			m.bodyInput.Reset()
+			m.showBody = false
+			m.bodyFocused = false
+			m.pushed = false
+			m.pushBranch = ""
+			m.gitignoreCached = nil
+			m.committing = false
+			m.pushing = false
+			// Refresh files and graphs
+			files, _ := git.GetStatus()
+			m.files = files
+			m.cursor = 0
+			m.fileScroll = 0
+			m.RefreshGraphs()
+			return m, nil
 		}
 	}
 	return m, nil
@@ -65,7 +86,7 @@ func (m Model) viewDone() string {
 	// Help bar
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "exit"},
+		{"enter", "menu"},
 	}))
 
 	return m.styledBox(b.String())
