@@ -221,7 +221,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
 
-	return Model{
+	m := Model{
 		step:              stepMenu,
 		branchCreateInput: bci,
 		configEditInput:   cfi,
@@ -236,6 +236,8 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		spinner:     s,
 		hasRemote:   git.HasRemote(),
 	}
+	m.RefreshGraphs()
+	return m
 }
 
 // NewBranchModel creates a model that starts in branch manager mode.
@@ -449,6 +451,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.branchEntries = git.GetAllBranches()
+		m.RefreshGraphs()
 		return m, nil
 
 	case tea.KeyMsg:

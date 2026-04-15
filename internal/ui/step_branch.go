@@ -249,13 +249,14 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		// Return to menu, refresh files + branch
+		// Return to menu, refresh files + branch + graph
 		m.step = stepMenu
 		m.branch, _ = git.GetCurrentBranch()
 		freshFiles, _ := git.GetStatus()
 		m.files = freshFiles
 		m.cursor = 0
 		m.fileScroll = 0
+		m.RefreshGraphs()
 		return m, nil
 	case "q":
 		m.quitting = true
