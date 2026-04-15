@@ -117,8 +117,15 @@ type Model struct {
 	branchConflict    bool
 	branchConflFiles  []string
 	branchStandalone  bool
-	branchSwitching   bool
-	branchMerging     bool
+	branchSwitching    bool
+	branchMerging      bool
+	branchCreatedHint  string
+	branchMergePending string
+	mergeSource        string
+	mergeTarget        string
+	mergeTargetMode    bool
+	mergeTargets       []types.BranchEntry
+	mergeTargetCursor  int
 
 	// Config editor
 	configCursor     int
@@ -382,6 +389,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case branchSwitchResultMsg:
 		m.branchSwitching = false
 		if msg.err != nil {
+			m.branchMergePending = ""
 			m.err = msg.err
 			return m, nil
 		}
@@ -391,7 +399,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.RefreshGraphs()
 		if msg.stashConflict {
+			m.branchMergePending = ""
 			m.err = fmt.Errorf("switched to %s — changes saved in stash (conflicts). Switch back and run: git stash pop", msg.newBranch)
+			return m, nil
+		}
+		// If a merge was pending (target picker flow), start it now
+		if m.branchMergePending != "" {
+			source := m.branchMergePending
+			m.branchMergePending = ""
+			m.branchMerging = true
+			return m, tea.Batch(doMergeBranch(source), m.spinner.Tick)
 		}
 		return m, nil
 
@@ -406,6 +423,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.branchCreateMode = false
 		m.branchCreateInput.Reset()
+		m.branchCreatedHint = msg.newBranch
 		return m, nil
 
 	case branchDeleteResultMsg:
