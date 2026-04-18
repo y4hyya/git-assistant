@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -11,6 +12,10 @@ import (
 	"git-assist/internal/git"
 	"git-assist/internal/types"
 )
+
+// fetchDebounce is the minimum interval between background fetches when
+// returning to the menu. Startup always fetches regardless.
+const fetchDebounce = 30 * time.Second
 
 // step represents which screen we're on.
 type step int
@@ -26,6 +31,7 @@ const (
 	stepConfirm             // commit confirmation
 	stepPush                // branch picker + push
 	stepDone                // success screen
+	stepSync                // sync dialog (pull current / merge origin/main)
 )
 
 // Async result messages
@@ -54,6 +60,21 @@ type branchMergeResultMsg struct {
 	err           error
 	conflictFiles []string
 }
+type fetchResultMsg struct{ err error }
+type pullResultMsg struct {
+	err           error
+	conflictFiles []string
+	// kind distinguishes which operation produced this message, so the
+	// handler can craft a specific error ("pull conflict" vs "sync conflict").
+	kind pullKind
+}
+
+type pullKind int
+
+const (
+	pullKindCurrent pullKind = iota // pulled origin/<current> into current
+	pullKindMain                    // merged origin/main into current
+)
 
 // Model is the main Bubble Tea model.
 type Model struct {
@@ -164,9 +185,25 @@ type Model struct {
 	menuCursor int
 
 	// Commit graph
-	localGraph  string
-	aheadBehind string
-	behindMain  int
+	localGraph   string
+	aheadBehind  string
+	behindMain   int
+	behindOrigin int
+
+	// Background fetch
+	fetching  bool
+	lastFetch time.Time
+
+	// Sync dialog
+	syncReturnStep     step     // where to return after the dialog closes
+	syncPullCurrent    bool     // current branch is behind its origin tracking ref
+	syncSyncMain       bool     // current branch is behind origin/main (off when on main)
+	syncIncomingCurr   []string // commit subjects coming in from origin/<current>
+	syncIncomingMain   []string // commit subjects coming in from origin/main
+	syncDialogShown    bool     // suppress auto-show after the first startup prompt
+	pulling            bool     // pull in progress (blocks dialog input)
+	pullingKind        pullKind // which operation is running
+	syncMainBranchName string   // resolved main branch name (main or master)
 
 	// Terminal dimensions
 	width    int
@@ -238,7 +275,37 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		hasRemote:   git.HasRemote(),
 	}
 	m.RefreshGraphs()
+	// Show the spinner on first render if we're going to fetch immediately.
+	if m.hasRemote {
+		m.fetching = true
+	}
 	return m
+}
+
+// doFetch runs git fetch in the background and returns the result as a
+// fetchResultMsg. Failures are surfaced but handled silently by the caller.
+func doFetch() tea.Cmd {
+	return func() tea.Msg {
+		err := git.Fetch()
+		return fetchResultMsg{err: err}
+	}
+}
+
+// maybeFetch returns a fetch command if hasRemote and the debounce window
+// has elapsed. Sets m.fetching so the spinner shows immediately. If a fetch
+// is already in progress, resumes spinner ticks without starting a second one.
+func (m *Model) maybeFetch() tea.Cmd {
+	if !m.hasRemote {
+		return nil
+	}
+	if m.fetching {
+		return m.spinner.Tick
+	}
+	if !m.lastFetch.IsZero() && time.Since(m.lastFetch) < fetchDebounce {
+		return nil
+	}
+	m.fetching = true
+	return tea.Batch(doFetch(), m.spinner.Tick)
 }
 
 // NewBranchModel creates a model that starts in branch manager mode.
@@ -258,6 +325,7 @@ func (m *Model) RefreshGraphs() {
 	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
 	m.aheadBehind = formatAheadBehind(a, b)
+	m.behindOrigin = b
 	m.behindMain = git.GetBehindMain(m.branch)
 }
 
@@ -274,6 +342,9 @@ func (m Model) commitPrefix() string {
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.hasRemote {
+		return tea.Batch(doFetch(), m.spinner.Tick)
+	}
 	return nil
 }
 
@@ -439,6 +510,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case fetchResultMsg:
+		m.fetching = false
+		m.lastFetch = time.Now()
+		// Errors are intentionally swallowed — this is a background op the
+		// user didn't ask for, so failures (offline, auth, etc.) must not
+		// surface as alarming banners. Stale ahead/behind numbers are the
+		// only observable consequence.
+		m.RefreshGraphs()
+		// Auto-show the sync dialog once per session on the first successful
+		// fetch, if we're on the menu (startup) and something is out of sync.
+		// Later fetches (on return to menu) silently update indicators only.
+		if !m.syncDialogShown && m.step == stepMenu && msg.err == nil {
+			m.syncDialogShown = true
+			if m.populateSyncDialog() {
+				m.syncReturnStep = stepMenu
+				m.step = stepSync
+			}
+		}
+		return m, nil
+
+	case pullResultMsg:
+		m.pulling = false
+		if msg.err != nil {
+			// Conflict → abort cleanly, route user to Branch Manager.
+			if len(msg.conflictFiles) > 0 {
+				git.MergeAbort()
+				verb := "pull"
+				if msg.kind == pullKindMain {
+					verb = "sync with " + m.syncMainBranchName
+				}
+				m.err = fmt.Errorf("%s conflict — resolve in Branch Manager", verb)
+			} else {
+				m.err = msg.err
+			}
+			return m.exitSyncDialog(), nil
+		}
+		m.RefreshGraphs()
+		return m.exitSyncDialog(), nil
+
 	case branchMergeResultMsg:
 		m.branchMerging = false
 		m.branchMergeMode = false
@@ -493,6 +603,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updatePush(msg)
 	case stepDone:
 		return m.updateDone(msg)
+	case stepSync:
+		return m.updateSync(msg)
 	}
 
 	return m, nil
@@ -525,6 +637,8 @@ func (m Model) View() string {
 		content = m.viewPush()
 	case stepDone:
 		content = m.viewDone()
+	case stepSync:
+		content = m.viewSync()
 	}
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)

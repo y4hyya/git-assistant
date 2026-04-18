@@ -35,7 +35,7 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 			m.fileScroll = 0
 			m.RefreshGraphs()
-			return m, nil
+			return m, m.maybeFetch()
 		}
 	}
 	return m, nil

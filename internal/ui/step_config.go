@@ -145,7 +145,7 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "esc":
 		m.step = stepMenu
-		return m, nil
+		return m, m.maybeFetch()
 	case "q":
 		m.quitting = true
 		return m, tea.Quit

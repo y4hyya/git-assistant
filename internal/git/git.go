@@ -120,6 +120,16 @@ func HasRemote() bool {
 	return strings.TrimSpace(string(out)) != ""
 }
 
+// Fetch updates all remote-tracking refs. Non-destructive: never touches the
+// working tree, index, or local branches — only refs under refs/remotes/*.
+func Fetch() error {
+	out, err := exec.Command("git", "fetch", "--all", "--prune", "--quiet").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fetch: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // Commit stages the selected files and creates a commit.
 // cachedPaths are files that were gitignored and need git rm --cached
 // re-applied after the staging reset.
@@ -611,6 +621,55 @@ func MergeBranch(name string) error {
 		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// MergeFromOrigin merges origin/<branch> into the current branch. When noFF is
+// true, forces a merge commit (used for integrating upstream branches like
+// main → feature). When false, allows fast-forward (used for pulling the same
+// branch from origin — no artificial merge commits when catching up).
+func MergeFromOrigin(branch string, noFF bool) error {
+	args := []string{"merge"}
+	if noFF {
+		args = append(args, "--no-ff")
+	}
+	args = append(args, "origin/"+branch)
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// GetIncomingCommits returns commit subjects reachable from `to` but not from
+// `from`. Used to preview what a pull or merge would bring in.
+// Example: GetIncomingCommits("main", "origin/main", 10) shows what pulling
+// origin/main would add to local main.
+func GetIncomingCommits(from, to string, limit int) []string {
+	out, err := exec.Command("git", "log",
+		"--format=%s", fmt.Sprintf("-%d", limit),
+		from+".."+to).Output()
+	if err != nil {
+		return nil
+	}
+	var commits []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			commits = append(commits, line)
+		}
+	}
+	return commits
+}
+
+// ResolveMainBranch returns "main" or "master" depending on which exists as a
+// local branch. Returns "main" if neither exists (safe default).
+func ResolveMainBranch() string {
+	if exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/main").Run() == nil {
+		return "main"
+	}
+	if exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/master").Run() == nil {
+		return "master"
+	}
+	return "main"
 }
 
 // MergeAbort aborts an in-progress merge.

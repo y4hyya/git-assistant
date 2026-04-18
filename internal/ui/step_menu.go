@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
 )
@@ -37,7 +38,18 @@ func (m Model) menuItems() []menuItem {
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Forward spinner during sync
+	// Forward spinner ticks while a background fetch is in progress.
+	// Non-blocking — keypresses still route normally below, so the user
+	// can navigate the menu while fetch runs.
+	if m.fetching {
+		if _, ok := msg.(spinner.TickMsg); ok {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+	}
+
+	// Forward spinner during sync (blocking — input locked during merge)
 	if m.branchMerging {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -85,9 +97,23 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "s":
 		if m.behindMain > 0 {
+			// Merge origin/<main> into current — always the freshest source,
+			// and consistent with the post-fetch state shown in the graph.
+			// git merge accepts a remote-tracking ref directly, so we reuse
+			// doMergeBranch instead of introducing a parallel helper.
 			m.branchMerging = true
-			return m, tea.Batch(doMergeBranch("main"), m.spinner.Tick)
+			main := git.ResolveMainBranch()
+			return m, tea.Batch(doMergeBranch("origin/"+main), m.spinner.Tick)
 		}
+	case "p":
+		// Manual pull fallback. Opens the sync dialog if there's anything
+		// to pull — user may have skipped the startup dialog, or new
+		// upstream commits appeared mid-session.
+		if m.populateSyncDialog() && m.syncPullCurrent {
+			m.syncReturnStep = stepMenu
+			m.step = stepSync
+		}
+		return m, nil
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -115,6 +141,9 @@ func (m Model) viewMenu() string {
 	b.WriteString(status)
 	if m.behindMain > 0 {
 		b.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind main", symArrowDown, m.behindMain)))
+	}
+	if m.fetching {
+		b.WriteString("  " + dimStyle.Render(m.spinner.View()+" syncing"))
 	}
 	b.WriteString("\n\n")
 
@@ -156,6 +185,9 @@ func (m Model) viewMenu() string {
 	helpEntries := []helpEntry{
 		{symArrows, "navigate"},
 		{"enter", "select"},
+	}
+	if m.hasRemote && m.behindOrigin > 0 {
+		helpEntries = append(helpEntries, helpEntry{"p", "pull"})
 	}
 	if m.behindMain > 0 {
 		helpEntries = append(helpEntries, helpEntry{"s", "sync"})

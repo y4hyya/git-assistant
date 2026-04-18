@@ -257,7 +257,7 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.fileScroll = 0
 		m.RefreshGraphs()
-		return m, nil
+		return m, m.maybeFetch()
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
