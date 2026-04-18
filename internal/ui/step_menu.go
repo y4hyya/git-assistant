@@ -28,11 +28,24 @@ func (m Model) menuItems() []menuItem {
 
 	branchCount := len(git.GetAllBranches())
 
-	return []menuItem{
+	items := []menuItem{
 		{"Commit", commitDesc},
 		{"Branch", fmt.Sprintf("%d branches", branchCount)},
 		{"Config", "git settings"},
 	}
+	// Recovery entry: when this local repo has no remote and `gh` is
+	// available, offer to create the GitHub repo from here.
+	if m.canConnectGH() {
+		items = append(items, menuItem{"Connect to GitHub", "create repo + set origin via gh"})
+	}
+	return items
+}
+
+// canConnectGH reports whether the recovery menu entry is applicable.
+// Requires: we're in a git repo (always true on menu), no origin set, and
+// the gh CLI is installed. Auth is checked later in the init flow.
+func (m Model) canConnectGH() bool {
+	return !m.hasRemote && git.HasGHCLI()
 }
 
 // ── Update ──────────────────────────────────────────────
@@ -94,6 +107,21 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.configEditMode = false
 			m.loadConfigItems()
 			m.step = stepConfig
+		case 3: // Connect to GitHub (only present when canConnectGH)
+			if m.canConnectGH() {
+				m.step = stepInit
+				m.ghReuseMode = true
+				m.initCursor = int(initChoiceGHCreate)
+				m.initSuccessMsg = ""
+				m.initNameInput.SetValue(git.CurrentDirName())
+				m.initNameInput.CursorEnd()
+				if !git.IsGHAuthed() {
+					m.initPhase = initPhaseConfirmGHAuth
+				} else {
+					m.initNameInput.Focus()
+					m.initPhase = initPhaseInputRepoName
+				}
+			}
 		}
 	case "s":
 		if m.behindMain > 0 {
@@ -146,6 +174,12 @@ func (m Model) viewMenu() string {
 		b.WriteString("  " + dimStyle.Render(m.spinner.View()+" syncing"))
 	}
 	b.WriteString("\n\n")
+
+	// One-shot success banner from the init flow. Cleared on next keypress
+	// by the main Update handler, same lifecycle as m.err.
+	if m.initSuccessMsg != "" {
+		b.WriteString("  " + successStyle.Render(symDone+" "+m.initSuccessMsg) + "\n\n")
+	}
 
 	// Menu items
 	items := m.menuItems()

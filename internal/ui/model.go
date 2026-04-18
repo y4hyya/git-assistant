@@ -32,6 +32,7 @@ const (
 	stepPush                // branch picker + push
 	stepDone                // success screen
 	stepSync                // sync dialog (pull current / merge origin/main)
+	stepInit                // first-run setup when cwd is not a git repo
 )
 
 // Async result messages
@@ -209,6 +210,21 @@ type Model struct {
 	width    int
 	height   int
 	quitting bool
+
+	// Init flow (first-run setup when cwd is not a git repo)
+	initPhase            initPhase
+	initCursor           int
+	initTemplateOptions  []git.GitignoreTemplate
+	initTemplateCursor   int
+	initURLInput         textinput.Model
+	initNameInput        textinput.Model
+	initRemoteURL        string
+	initRepoName         string
+	initPrivate          bool
+	initVisibilityCursor int
+	initWorking          bool
+	initSuccessMsg       string
+	ghReuseMode          bool // init flow invoked from menu against existing repo
 }
 
 // NewModel creates the initial model.
@@ -274,6 +290,10 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		spinner:     s,
 		hasRemote:   git.HasRemote(),
 	}
+	// Initialize init-flow inputs up-front so the "Connect to GitHub"
+	// recovery entry works from an already-initialized repo. Without this,
+	// initNameInput is a zero-value textinput and .Focus() nil-derefs.
+	m.setupInitModel()
 	m.RefreshGraphs()
 	// Show the spinner on first render if we're going to fetch immediately.
 	if m.hasRemote {
@@ -306,6 +326,18 @@ func (m *Model) maybeFetch() tea.Cmd {
 	}
 	m.fetching = true
 	return tea.Batch(doFetch(), m.spinner.Tick)
+}
+
+// NewInitModel creates a model that starts in the first-run init flow. Used
+// when git-assist is launched from a non-git directory — instead of exiting,
+// we guide the user through setup.
+func NewInitModel() Model {
+	m := NewModel(nil, "")
+	m.step = stepInit
+	m.initPhase = initPhasePickOption
+	m.hasRemote = false
+	m.fetching = false // no remote yet, don't spin
+	return m
 }
 
 // NewBranchModel creates a model that starts in branch manager mode.
@@ -579,6 +611,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Clear error on any keypress
 		m.err = nil
+		// Clear the one-shot init success banner after the user acknowledges
+		// the menu by pressing any key.
+		if m.step == stepMenu {
+			m.initSuccessMsg = ""
+		}
 	}
 
 	// Route to the active step handler
@@ -605,6 +642,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDone(msg)
 	case stepSync:
 		return m.updateSync(msg)
+	case stepInit:
+		return m.updateInit(msg)
 	}
 
 	return m, nil
@@ -639,6 +678,8 @@ func (m Model) View() string {
 		content = m.viewDone()
 	case stepSync:
 		content = m.viewSync()
+	case stepInit:
+		content = m.viewInit()
 	}
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)

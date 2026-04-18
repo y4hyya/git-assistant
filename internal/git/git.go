@@ -18,6 +18,113 @@ func IsGitRepo() bool {
 	return exec.Command("git", "rev-parse", "--is-inside-work-tree").Run() == nil
 }
 
+// InitRepo runs `git init` in the current working directory. When
+// defaultBranch is non-empty, it also sets the initial branch via
+// `-b <name>` so the first commit lands on the desired branch name.
+func InitRepo(defaultBranch string) error {
+	args := []string{"init"}
+	if defaultBranch != "" {
+		args = append(args, "-b", defaultBranch)
+	}
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("init failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// AddOriginRemote adds `origin` pointing at the given URL. If origin already
+// exists with a different URL, it updates the URL instead.
+func AddOriginRemote(url string) error {
+	if existing := GetRemoteURL(); existing != "" {
+		out, err := exec.Command("git", "remote", "set-url", "origin", url).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("remote set-url failed: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	out, err := exec.Command("git", "remote", "add", "origin", url).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("remote add failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// RemoveOriginRemote removes the `origin` remote, if it exists. No-op when
+// origin isn't configured.
+func RemoveOriginRemote() error {
+	if GetRemoteURL() == "" {
+		return nil
+	}
+	out, err := exec.Command("git", "remote", "remove", "origin").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("remote remove failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// RenameBranch renames the currently checked-out branch. Used right after
+// init when the default branch name needs changing (older git versions that
+// don't support `init -b`).
+func RenameBranch(name string) error {
+	out, err := exec.Command("git", "branch", "-M", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("branch rename failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// HasGHCLI reports whether the GitHub CLI (`gh`) is on PATH.
+func HasGHCLI() bool {
+	_, err := exec.LookPath("gh")
+	return err == nil
+}
+
+// IsGHAuthed reports whether `gh` has a valid authenticated session.
+// `gh auth status` exits 0 when authenticated.
+func IsGHAuthed() bool {
+	if !HasGHCLI() {
+		return false
+	}
+	return exec.Command("gh", "auth", "status").Run() == nil
+}
+
+// GHCreateRepo creates a new GitHub repo from the current directory using
+// the `gh` CLI. Always sets `origin` via `--source=.`. When push is true,
+// also pushes the current branch — requires at least one commit. When push
+// is false, only creates the empty remote and wires `origin`, so the caller
+// can push later via the normal commit → push flow.
+func GHCreateRepo(name string, private bool, push bool) error {
+	visibility := "--public"
+	if private {
+		visibility = "--private"
+	}
+	args := []string{"repo", "create", name, visibility, "--source=.", "--remote=origin"}
+	if push {
+		args = append(args, "--push")
+	}
+	out, err := exec.Command("gh", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh repo create failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// HasAnyCommit reports whether the repo has at least one commit on HEAD.
+func HasAnyCommit() bool {
+	return exec.Command("git", "rev-parse", "--verify", "HEAD").Run() == nil
+}
+
+// PushInitial pushes the current branch to origin and sets upstream tracking.
+// Used after InitRepo + AddOriginRemote when connecting to an existing remote.
+func PushInitial(branch string) error {
+	out, err := exec.Command("git", "push", "-u", "origin", branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // GetCurrentBranch returns the name of the current branch.
 func GetCurrentBranch() (string, error) {
 	out, err := exec.Command("git", "branch", "--show-current").Output()

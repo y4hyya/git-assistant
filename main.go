@@ -16,11 +16,6 @@ func main() {
 		}
 	}
 
-	if !git.IsGitRepo() {
-		fmt.Println("✗ Not a git repository")
-		os.Exit(1)
-	}
-
 	// Subcommand: git-assist branch
 	subcommand := ""
 	for _, arg := range os.Args[1:] {
@@ -28,6 +23,23 @@ func main() {
 			subcommand = arg
 			break
 		}
+	}
+
+	// Non-git directory → launch first-run init flow instead of exiting.
+	// The branch subcommand still requires an existing repo, so skip init
+	// for that case and error clearly.
+	if !git.IsGitRepo() {
+		if subcommand == "branch" {
+			fmt.Println("✗ Not a git repository")
+			os.Exit(1)
+		}
+		m := ui.NewInitModel()
+		p := tea.NewProgram(m, tea.WithAltScreen())
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("✗ Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if subcommand == "branch" {

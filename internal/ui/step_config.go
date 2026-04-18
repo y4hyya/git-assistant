@@ -15,17 +15,18 @@ type configItem struct {
 	readonly bool
 	toggle   bool
 	pick     bool
+	remote   bool // special-case: edits origin URL via git remote, not git config
 }
 
 func (m *Model) loadConfigItems() {
 	global := m.configGlobal
 	m.configItems = []configItem{
-		{"User name", "user.name", git.GetConfigValue("user.name", global), false, false, false},
-		{"User email", "user.email", git.GetConfigValue("user.email", global), false, false, false},
-		{"Default branch", "init.defaultBranch", git.GetConfigValue("init.defaultBranch", global), false, false, true},
-		{"Remote URL", "", git.GetRemoteURL(), true, false, false},
-		{"GPG signing", "commit.gpgsign", git.GetConfigValue("commit.gpgsign", global), false, true, false},
-		{"Editor", "core.editor", git.GetConfigValue("core.editor", global), false, false, false},
+		{"User name", "user.name", git.GetConfigValue("user.name", global), false, false, false, false},
+		{"User email", "user.email", git.GetConfigValue("user.email", global), false, false, false, false},
+		{"Default branch", "init.defaultBranch", git.GetConfigValue("init.defaultBranch", global), false, false, true, false},
+		{"Remote URL", "", git.GetRemoteURL(), false, false, false, true},
+		{"GPG signing", "commit.gpgsign", git.GetConfigValue("commit.gpgsign", global), false, true, false, false},
+		{"Editor", "core.editor", git.GetConfigValue("core.editor", global), false, false, false, false},
 	}
 }
 
@@ -68,14 +69,30 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.configEditMode {
 		switch keyMsg.String() {
 		case "enter":
-			value := m.configEditInput.Value()
+			value := strings.TrimSpace(m.configEditInput.Value())
 			item := m.configItems[m.configCursor]
-			if err := git.SetConfigValue(item.key, value, m.configGlobal); err != nil {
+			var err error
+			if item.remote {
+				// Remote URL is per-repo (ignores scope toggle). Empty value
+				// clears the remote; non-empty adds or updates origin.
+				if value == "" {
+					err = git.RemoveOriginRemote()
+				} else {
+					err = git.AddOriginRemote(value)
+				}
+			} else {
+				err = git.SetConfigValue(item.key, value, m.configGlobal)
+			}
+			if err != nil {
 				m.err = err
 			}
 			m.configEditMode = false
 			m.configEditInput.Blur()
 			m.loadConfigItems()
+			// Remote URL change affects menu banner / push availability.
+			if item.remote {
+				m.hasRemote = git.HasRemote()
+			}
 			return m, nil
 		case "esc":
 			m.configEditMode = false
