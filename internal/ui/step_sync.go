@@ -17,11 +17,14 @@ func doPullCurrent(branch string) tea.Cmd {
 	return func() tea.Msg {
 		// Auto-stash if dirty, mirroring branch-switch semantics.
 		stashed := false
+		stashRef := ""
 		if git.HasUncommittedChanges() {
-			if err := git.StashChanges(); err != nil {
+			ref, err := git.StashChanges()
+			if err != nil {
 				return pullResultMsg{err: err, kind: pullKindCurrent}
 			}
 			stashed = true
+			stashRef = ref
 		}
 		if err := git.MergeFromOrigin(branch, false); err != nil {
 			conflicts := git.GetConflictFiles()
@@ -35,7 +38,7 @@ func doPullCurrent(branch string) tea.Cmd {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err:  fmt.Errorf("pulled, but stash-pop failed: %s", err.Error()),
+					err:  fmt.Errorf("pulled, but stash-pop conflicted — your changes are saved in stash %s. Resolve, then run: git stash apply %s", stashRef, stashRef),
 					kind: pullKindCurrent,
 				}
 			}
@@ -49,11 +52,14 @@ func doPullCurrent(branch string) tea.Cmd {
 func doSyncMain(mainBranch string) tea.Cmd {
 	return func() tea.Msg {
 		stashed := false
+		stashRef := ""
 		if git.HasUncommittedChanges() {
-			if err := git.StashChanges(); err != nil {
+			ref, err := git.StashChanges()
+			if err != nil {
 				return pullResultMsg{err: err, kind: pullKindMain}
 			}
 			stashed = true
+			stashRef = ref
 		}
 		if err := git.MergeFromOrigin(mainBranch, true); err != nil {
 			conflicts := git.GetConflictFiles()
@@ -66,7 +72,7 @@ func doSyncMain(mainBranch string) tea.Cmd {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err:  fmt.Errorf("merged, but stash-pop failed: %s", err.Error()),
+					err:  fmt.Errorf("merged, but stash-pop conflicted — your changes are saved in stash %s. Resolve, then run: git stash apply %s", stashRef, stashRef),
 					kind: pullKindMain,
 				}
 			}

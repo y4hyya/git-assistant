@@ -51,6 +51,7 @@ type branchSwitchResultMsg struct {
 	err           error
 	newBranch     string
 	stashConflict bool
+	stashRef      string // short SHA of the stash entry, surfaced when pop fails
 }
 type branchCreateResultMsg struct {
 	err       error
@@ -504,7 +505,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.RefreshGraphs()
 		if msg.stashConflict {
 			m.branchMergePending = ""
-			m.err = fmt.Errorf("switched to %s — changes saved in stash (conflicts). Switch back and run: git stash pop", msg.newBranch)
+			m.err = fmt.Errorf("switched to %s — your changes are saved in stash %s. After resolving conflicts, run: git stash apply %s", msg.newBranch, msg.stashRef, msg.stashRef)
 			return m, nil
 		}
 		// If a merge was pending (target picker flow), start it now

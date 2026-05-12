@@ -14,11 +14,14 @@ import (
 func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 	return func() tea.Msg {
 		stashed := false
+		stashRef := ""
 		if git.HasUncommittedChanges() {
-			if err := git.StashChanges(); err != nil {
+			ref, err := git.StashChanges()
+			if err != nil {
 				return branchSwitchResultMsg{err: err}
 			}
 			stashed = true
+			stashRef = ref
 		}
 		if err := git.SwitchBranch(name, isRemote); err != nil {
 			// Try to restore stash if switch failed
@@ -35,7 +38,11 @@ func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 				stashConflict = true
 			}
 		}
-		return branchSwitchResultMsg{newBranch: name, stashConflict: stashConflict}
+		return branchSwitchResultMsg{
+			newBranch:     name,
+			stashConflict: stashConflict,
+			stashRef:      stashRef,
+		}
 	}
 }
 
@@ -218,6 +225,10 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("cannot delete a remote branch")
 			return m, nil
 		}
+		if entry.Name == "main" || entry.Name == "master" {
+			m.err = fmt.Errorf("cannot delete %s — protected branch", entry.Name)
+			return m, nil
+		}
 		m.branchDeleteMode = true
 		return m, nil
 	case "m":
@@ -229,8 +240,15 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("cannot merge a branch into itself")
 			return m, nil
 		}
-		// Enter target picker: choose which branch to merge INTO
-		m.mergeSource = entry.Name
+		// Enter target picker: choose which branch to merge INTO.
+		// For remote-only sources, store the full "origin/<name>" ref so
+		// the eventual `git merge` resolves the right commit; otherwise a
+		// bare name collides with any local branch sharing that name.
+		if entry.IsRemote {
+			m.mergeSource = "origin/" + entry.Name
+		} else {
+			m.mergeSource = entry.Name
+		}
 		m.mergeTargets = nil
 		defaultIdx := 0
 		for _, e := range m.branchEntries {

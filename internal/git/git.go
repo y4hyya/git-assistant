@@ -241,9 +241,15 @@ func Fetch() error {
 // cachedPaths are files that were gitignored and need git rm --cached
 // re-applied after the staging reset.
 func Commit(filePaths []string, cachedPaths []string, message string) error {
-	// Reset staging area so only selected files are committed.
-	// Ignore error — fails on repos with no commits yet.
-	exec.Command("git", "reset").Run()
+	// Reset staging area so only the user's selected files are committed.
+	// `git reset` fails on repos with no commits yet (no HEAD to reset to);
+	// skip the call there. For repos with commits, propagate the error so
+	// we don't silently commit files the user didn't choose.
+	if HasAnyCommit() {
+		if out, err := exec.Command("git", "reset").CombinedOutput(); err != nil {
+			return fmt.Errorf("reset staging: %s", strings.TrimSpace(string(out)))
+		}
+	}
 
 	// Re-apply rm --cached for gitignored tracked files
 	if err := RemoveCached(cachedPaths); err != nil {
@@ -813,13 +819,23 @@ func HasUncommittedChanges() bool {
 	return strings.TrimSpace(string(out)) != ""
 }
 
-// StashChanges stashes uncommitted changes.
-func StashChanges() error {
-	out, err := exec.Command("git", "stash").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+// StashChanges stashes uncommitted changes, including untracked files. The
+// returned ref is the short SHA of the new stash entry — surface it to the
+// user when a later pop fails so they can recover via `git stash apply <ref>`
+// without having to guess which stash@{N} is theirs.
+func StashChanges() (ref string, err error) {
+	out, cmdErr := exec.Command("git", "stash", "push", "--include-untracked").CombinedOutput()
+	if cmdErr != nil {
+		return "", fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
-	return nil
+	// Resolve stash@{0} to a short SHA. The SHA is stable across subsequent
+	// stash operations; stash@{N} indices shift, which is why we don't hand
+	// the symbolic ref back to the user.
+	refOut, refErr := exec.Command("git", "rev-parse", "--short", "stash@{0}").Output()
+	if refErr != nil {
+		return "stash@{0}", nil
+	}
+	return strings.TrimSpace(string(refOut)), nil
 }
 
 // StashPop restores the most recent stash.
