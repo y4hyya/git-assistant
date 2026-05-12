@@ -33,13 +33,15 @@ func (m Model) renderGraphSection() string {
 		return "" // not enough room
 	}
 
-	// Each commit with connector = 2 lines. Title + separator + spacing = 3 lines.
-	maxCommits := (available - 3) / 2
+	// Linear commits are 1 line each; branched-history rows from
+	// `git log --graph` pass through unchanged. Title + separator +
+	// spacing = 3 lines.
+	maxCommits := available - 3
 	if maxCommits < 1 {
 		return ""
 	}
-	if maxCommits > 7 {
-		maxCommits = 7
+	if maxCommits > 10 {
+		maxCommits = 10
 	}
 
 	innerWidth := m.width - 12
@@ -56,7 +58,7 @@ func (m Model) renderGraphSection() string {
 		title += strings.Repeat(" ", padding) + dimStyle.Render(m.branch+": "+m.aheadBehind)
 	}
 
-	content := transformGraph(m.localGraph, innerWidth-2, maxCommits*2)
+	content := transformGraph(m.localGraph, innerWidth-2, maxCommits)
 
 	separator := dimStyle.Render(strings.Repeat("─", innerWidth))
 
@@ -149,33 +151,15 @@ func cleanDecoration(raw string) string {
 	return "(" + strings.Join(cleaned, ", ") + ")"
 }
 
+// insertConnectors used to inject a cosmetic `│` line between every
+// pair of adjacent linear commits. That doubled the vertical footprint
+// for no informational gain — `git log --graph` already emits its own
+// connector rows (`|\`, `|/`, `|`) at branch divergence points, and
+// those pass through as starCol < 0 lines. Keeping the function as a
+// pass-through preserves the call site while letting the compact
+// layout stand on its own.
 func insertConnectors(lines []graphLine) []graphLine {
-	var result []graphLine
-	for i, gl := range lines {
-		result = append(result, gl)
-
-		if gl.starCol < 0 {
-			continue
-		}
-
-		if i < len(lines)-1 && lines[i+1].starCol >= 0 {
-			conn := graphLine{
-				starCol:   gl.starCol,
-				connector: true,
-			}
-			for j := 0; j <= gl.starCol; j++ {
-				if j == gl.starCol {
-					conn.chars = append(conn.chars, '|')
-				} else if j < len(gl.chars) && gl.chars[j] == '|' {
-					conn.chars = append(conn.chars, '|')
-				} else {
-					conn.chars = append(conn.chars, ' ')
-				}
-			}
-			result = append(result, conn)
-		}
-	}
-	return result
+	return lines
 }
 
 func renderGraphLine(gl graphLine, maxWidth int) string {
