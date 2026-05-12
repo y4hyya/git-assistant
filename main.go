@@ -9,9 +9,17 @@ import (
 	"git-assist/internal/ui"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=…".
+// Defaults to "dev" for ad-hoc `go build` invocations.
+var Version = "dev"
+
 func main() {
 	for _, arg := range os.Args[1:] {
-		if arg == "--no-color" {
+		switch arg {
+		case "--version", "-v":
+			fmt.Printf("git-assist %s\n", Version)
+			return
+		case "--no-color":
 			os.Setenv("NO_COLOR", "1")
 		}
 	}
