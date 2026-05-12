@@ -552,11 +552,28 @@ func (m Model) viewFiles() string {
 				removing++
 			}
 		}
+		// Count tracked files in the add-set. Adding a tracked file to
+		// .gitignore alone doesn't untrack it — git keeps tracking files it
+		// already knows about. The confirm handler runs `git rm --cached`
+		// for these (see m.gitignoreCached), so warn the user up-front that
+		// "ignore" here means "remove from the index, then ignore future
+		// changes" — that surprise was easy to walk into silently.
+		trackedAdds := 0
+		for _, f := range m.files {
+			if f.Gitignored && f.Status != types.StatusUntracked {
+				trackedAdds++
+			}
+		}
 		counter := fmt.Sprintf("%d to add", ignored)
 		if removing > 0 {
 			counter += fmt.Sprintf(" · %d to remove", removing)
 		}
 		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(counter)))
+		if trackedAdds > 0 {
+			b.WriteString(fmt.Sprintf("  %s %s\n",
+				modifiedStyle.Render("!"),
+				modifiedStyle.Render(fmt.Sprintf("%d tracked file(s) will be removed from the index (git rm --cached)", trackedAdds))))
+		}
 	} else {
 		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
 	}
