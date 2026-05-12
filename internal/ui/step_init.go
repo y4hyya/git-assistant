@@ -228,6 +228,10 @@ func (m Model) updateInitInputURL(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("remote URL is required")
 			return m, nil
 		}
+		if !isValidGitURL(url) {
+			m.err = fmt.Errorf("invalid URL — expected https://, git@host:path, ssh://, or file://")
+			return m, nil
+		}
 		m.initRemoteURL = url
 		m.initURLInput.Blur()
 		return m.startInitWork()
@@ -256,6 +260,10 @@ func (m Model) updateInitInputRepoName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("repo name is required")
 			return m, nil
 		}
+		if !isValidGitHubRepoName(name) {
+			m.err = fmt.Errorf("invalid name — use letters, digits, '-', '_', '.', optionally prefixed with 'owner/'")
+			return m, nil
+		}
 		m.initRepoName = name
 		m.initNameInput.Blur()
 		m.initVisibilityCursor = 0
@@ -265,6 +273,58 @@ func (m Model) updateInitInputRepoName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.initNameInput, cmd = m.initNameInput.Update(msg)
 	return m, cmd
+}
+
+// isValidGitURL accepts the URL forms `git remote add` understands. We're not
+// trying to be exhaustive — just catch the common typos (pasting a repo name,
+// a Windows drive path, a stray "origin") before shelling out and getting a
+// noisier error back from git.
+func isValidGitURL(url string) bool {
+	prefixes := []string{"https://", "http://", "ssh://", "git://", "file://", "/"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(url, p) {
+			return true
+		}
+	}
+	// scp-like form: user@host:path
+	if i := strings.Index(url, "@"); i > 0 {
+		if j := strings.Index(url[i+1:], ":"); j > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isValidGitHubRepoName mirrors GitHub's repo naming rules: alphanumerics,
+// dashes, underscores, dots; cannot start with `-` or `.`; max 100 chars per
+// segment. An optional `owner/` prefix is allowed for org repos. We validate
+// upfront so users see a clear inline error instead of a `gh repo create`
+// failure several seconds later.
+func isValidGitHubRepoName(name string) bool {
+	parts := strings.SplitN(name, "/", 2)
+	if len(parts) == 2 {
+		if !isValidGitHubNameSegment(parts[0]) {
+			return false
+		}
+		return isValidGitHubNameSegment(parts[1])
+	}
+	return isValidGitHubNameSegment(parts[0])
+}
+
+func isValidGitHubNameSegment(s string) bool {
+	if s == "" || len(s) > 100 {
+		return false
+	}
+	for i, c := range s {
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !alnum && c != '-' && c != '_' && c != '.' {
+			return false
+		}
+		if i == 0 && (c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 func (m Model) updateInitPickVisibility(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
