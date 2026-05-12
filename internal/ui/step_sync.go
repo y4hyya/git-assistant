@@ -18,10 +18,14 @@ func doPullCurrent(branch string) tea.Cmd {
 		// Auto-stash if dirty, mirroring branch-switch semantics.
 		stashed := false
 		stashRef := ""
-		if git.HasUncommittedChanges() {
-			ref, err := git.StashChanges()
-			if err != nil {
-				return pullResultMsg{err: err, kind: pullKindCurrent}
+		dirty, err := git.HasUncommittedChanges()
+		if err != nil {
+			return pullResultMsg{err: err, kind: pullKindCurrent}
+		}
+		if dirty {
+			ref, stashErr := git.StashChanges()
+			if stashErr != nil {
+				return pullResultMsg{err: stashErr, kind: pullKindCurrent}
 			}
 			stashed = true
 			stashRef = ref
@@ -53,10 +57,14 @@ func doSyncMain(mainBranch string) tea.Cmd {
 	return func() tea.Msg {
 		stashed := false
 		stashRef := ""
-		if git.HasUncommittedChanges() {
-			ref, err := git.StashChanges()
-			if err != nil {
-				return pullResultMsg{err: err, kind: pullKindMain}
+		dirty, err := git.HasUncommittedChanges()
+		if err != nil {
+			return pullResultMsg{err: err, kind: pullKindMain}
+		}
+		if dirty {
+			ref, stashErr := git.StashChanges()
+			if stashErr != nil {
+				return pullResultMsg{err: stashErr, kind: pullKindMain}
 			}
 			stashed = true
 			stashRef = ref

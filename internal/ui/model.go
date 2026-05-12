@@ -192,6 +192,10 @@ type Model struct {
 	behindMain   int
 	behindOrigin int
 
+	// Cached branch count — refreshed by RefreshGraphs so the menu can read
+	// it without forking `git branch` on every keypress.
+	branchCount int
+
 	// Background fetch
 	fetching  bool
 	lastFetch time.Time
@@ -353,13 +357,16 @@ func NewBranchModel(branch string) Model {
 	return m
 }
 
-// RefreshGraphs updates the graph data from git.
+// RefreshGraphs updates the graph data from git, plus the cached branch
+// count so the menu can show it without forking `git branch` on every
+// keypress.
 func (m *Model) RefreshGraphs() {
 	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
 	m.aheadBehind = formatAheadBehind(a, b)
 	m.behindOrigin = b
 	m.behindMain = git.GetBehindMain(m.branch)
+	m.branchCount = len(git.GetAllBranches())
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -504,8 +511,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.RefreshGraphs()
 		if msg.stashConflict {
+			pendingNote := ""
+			if m.branchMergePending != "" {
+				pendingNote = fmt.Sprintf(" Pending merge of %s was cancelled — re-initiate after resolving.", m.branchMergePending)
+			}
 			m.branchMergePending = ""
-			m.err = fmt.Errorf("switched to %s — your changes are saved in stash %s. After resolving conflicts, run: git stash apply %s", msg.newBranch, msg.stashRef, msg.stashRef)
+			m.err = fmt.Errorf("switched to %s — your changes are saved in stash %s.%s After resolving conflicts, run: git stash apply %s", msg.newBranch, msg.stashRef, pendingNote, msg.stashRef)
 			return m, nil
 		}
 		// If a merge was pending (target picker flow), start it now
@@ -588,14 +599,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
-				if m.step == stepMenu {
-					// Syncing from menu — abort and show error
-					git.MergeAbort()
-					m.err = fmt.Errorf("merge conflicts with main — use Branch Manager to resolve")
-				} else {
-					m.branchConflict = true
-					m.branchConflFiles = conflicts
-				}
+				// Always auto-abort merge conflicts — there's no in-TUI
+				// resolution path, and leaving the repo in a half-merged
+				// state surprises users on the next operation. The error
+				// tells them how many files conflicted so they know how
+				// much work awaits in their terminal.
+				git.MergeAbort()
+				m.err = fmt.Errorf("merge aborted — %d conflicting file(s). Resolve in your terminal (git status, edit, git add, git merge --continue) and retry", len(conflicts))
 			} else {
 				m.err = msg.err
 			}

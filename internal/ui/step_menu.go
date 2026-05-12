@@ -26,11 +26,9 @@ func (m Model) menuItems() []menuItem {
 		commitDesc = fmt.Sprintf("%d changes", changeCount)
 	}
 
-	branchCount := len(git.GetAllBranches())
-
 	items := []menuItem{
 		{"Commit", commitDesc},
-		{"Branch", fmt.Sprintf("%d branches", branchCount)},
+		{"Branch", fmt.Sprintf("%d branches", m.branchCount)},
 		{"Config", "git settings"},
 	}
 	// Recovery entry: when this local repo has no remote and `gh` is

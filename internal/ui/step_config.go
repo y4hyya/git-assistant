@@ -12,21 +12,38 @@ type configItem struct {
 	label    string
 	key      string
 	value    string
+	set      bool // false = key not configured (distinct from value == "")
 	readonly bool
 	toggle   bool
 	pick     bool
 	remote   bool // special-case: edits origin URL via git remote, not git config
 }
 
+// configValue is a small wrapper around git.GetConfigValue that collapses
+// errors and unset into the same display value. The set flag is preserved
+// so the view can render "not set" hints; actual errors are silently
+// treated as "not set" because the editor is not the right place to
+// surface a config-read failure.
+func configValue(key string, global bool) (value string, set bool) {
+	v, s, _ := git.GetConfigValue(key, global)
+	return v, s
+}
+
 func (m *Model) loadConfigItems() {
 	global := m.configGlobal
+	name, nameSet := configValue("user.name", global)
+	email, emailSet := configValue("user.email", global)
+	defBranch, defBranchSet := configValue("init.defaultBranch", global)
+	gpgsign, gpgsignSet := configValue("commit.gpgsign", global)
+	editor, editorSet := configValue("core.editor", global)
+	remoteURL := git.GetRemoteURL()
 	m.configItems = []configItem{
-		{"User name", "user.name", git.GetConfigValue("user.name", global), false, false, false, false},
-		{"User email", "user.email", git.GetConfigValue("user.email", global), false, false, false, false},
-		{"Default branch", "init.defaultBranch", git.GetConfigValue("init.defaultBranch", global), false, false, true, false},
-		{"Remote URL", "", git.GetRemoteURL(), false, false, false, true},
-		{"GPG signing", "commit.gpgsign", git.GetConfigValue("commit.gpgsign", global), false, true, false, false},
-		{"Editor", "core.editor", git.GetConfigValue("core.editor", global), false, false, false, false},
+		{"User name", "user.name", name, nameSet, false, false, false, false},
+		{"User email", "user.email", email, emailSet, false, false, false, false},
+		{"Default branch", "init.defaultBranch", defBranch, defBranchSet, false, false, true, false},
+		{"Remote URL", "", remoteURL, remoteURL != "", false, false, false, true},
+		{"GPG signing", "commit.gpgsign", gpgsign, gpgsignSet, false, true, false, false},
+		{"Editor", "core.editor", editor, editorSet, false, false, false, false},
 	}
 }
 
@@ -230,7 +247,7 @@ func (m Model) viewConfig() string {
 			}
 			continue
 		}
-		if value == "" {
+		if !item.set {
 			value = dimStyle.Render("not set")
 		} else if item.toggle {
 			if value == "true" {

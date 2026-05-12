@@ -548,41 +548,50 @@ func WriteFileContent(path string, content string) error {
 }
 
 // GetBehindMain returns how many commits the given branch is behind main.
-// Returns 0 if branch is main or if the comparison fails.
+// Tries local main/master first, then origin/main / origin/master so users
+// who clone fresh (no local main yet) still get the "behind" indicator.
+// Returns 0 if branch is main/master itself or if no candidate ref resolves.
 func GetBehindMain(branch string) int {
 	if branch == "main" || branch == "master" {
 		return 0
 	}
-	out, err := exec.Command("git", "rev-list", "--count", branch+"..main").Output()
-	if err != nil {
-		// Try master if main doesn't exist
-		out, err = exec.Command("git", "rev-list", "--count", branch+"..master").Output()
+	for _, ref := range []string{"main", "master", "origin/main", "origin/master"} {
+		out, err := exec.Command("git", "rev-list", "--count", branch+".."+ref).Output()
 		if err != nil {
-			return 0
+			continue
 		}
+		var count int
+		fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count)
+		return count
 	}
-	var count int
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count)
-	return count
+	return 0
 }
 
 // ── Config operations ──────────────────────────────────
 
-// GetConfigValue returns the value of a git config key.
-// If global is true, reads from --global; otherwise --local.
-func GetConfigValue(key string, global bool) string {
+// GetConfigValue returns the value of a git config key. The `set` flag
+// distinguishes "key not configured" (git exits 1) from "value is the
+// empty string" — the previous bool-free signature lost that distinction
+// and made the config editor unable to show a useful "not set" hint.
+// A non-nil err means git itself failed (missing binary, broken config),
+// which is different from the key simply not being set.
+func GetConfigValue(key string, global bool) (value string, set bool, err error) {
 	args := []string{"config"}
 	if global {
 		args = append(args, "--global")
 	} else {
 		args = append(args, "--local")
 	}
-	args = append(args, key)
-	out, err := exec.Command("git", args...).Output()
-	if err != nil {
-		return ""
+	args = append(args, "--", key)
+	out, runErr := exec.Command("git", args...).Output()
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// Exit 1 = key is not set. Normal, not an error.
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("git config: %w", runErr)
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(string(out)), true, nil
 }
 
 // SetConfigValue sets a git config key to the given value.
@@ -810,13 +819,16 @@ func GetConflictFiles() []string {
 	return files
 }
 
-// HasUncommittedChanges returns true if the working tree has uncommitted changes.
-func HasUncommittedChanges() bool {
+// HasUncommittedChanges reports whether the working tree has uncommitted
+// changes. Callers must check the error — returning a default of "clean"
+// when git itself fails would let downstream destructive ops (like
+// branch switch with auto-stash) proceed on an unknown working tree.
+func HasUncommittedChanges() (bool, error) {
 	out, err := exec.Command("git", "status", "--porcelain").Output()
 	if err != nil {
-		return false
+		return false, fmt.Errorf("git status: %w", err)
 	}
-	return strings.TrimSpace(string(out)) != ""
+	return strings.TrimSpace(string(out)) != "", nil
 }
 
 // StashChanges stashes uncommitted changes, including untracked files. The

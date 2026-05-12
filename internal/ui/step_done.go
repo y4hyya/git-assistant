@@ -12,7 +12,7 @@ import (
 func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
-		case "enter":
+		case "enter", "esc":
 			// Reset wizard state and return to menu
 			m.step = stepMenu
 			m.menuCursor = 0
@@ -36,6 +36,9 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fileScroll = 0
 			m.RefreshGraphs()
 			return m, m.maybeFetch()
+		case "q":
+			m.quitting = true
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -87,6 +90,7 @@ func (m Model) viewDone() string {
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
 		{"enter", "menu"},
+		{"q", "quit"},
 	}))
 
 	return m.styledBox(b.String())

@@ -15,10 +15,14 @@ func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 	return func() tea.Msg {
 		stashed := false
 		stashRef := ""
-		if git.HasUncommittedChanges() {
-			ref, err := git.StashChanges()
-			if err != nil {
-				return branchSwitchResultMsg{err: err}
+		dirty, err := git.HasUncommittedChanges()
+		if err != nil {
+			return branchSwitchResultMsg{err: err}
+		}
+		if dirty {
+			ref, stashErr := git.StashChanges()
+			if stashErr != nil {
+				return branchSwitchResultMsg{err: stashErr}
 			}
 			stashed = true
 			stashRef = ref
@@ -75,8 +79,14 @@ func doMergeBranch(name string) tea.Cmd {
 // ── Update ─────────────────────────────────────────────
 
 func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Forward spinner ticks during async operations
+	// While an async op is in flight, block all input (the model.go
+	// outer Update still handles ctrl+c before we get here, so quitting
+	// remains possible). Spinner ticks are non-key messages and are
+	// forwarded so the animation keeps running.
 	if m.branchSwitching || m.branchMerging {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
