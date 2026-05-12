@@ -4,7 +4,9 @@ build:
 	go build -o git-assist .
 
 install: build
-	cp git-assist /usr/local/bin/
+	mkdir -p $(HOME)/.local/bin
+	cp git-assist $(HOME)/.local/bin/
+	@if [ "$$(uname -s)" = "Darwin" ]; then codesign -s - $(HOME)/.local/bin/git-assist; fi
 
 clean:
 	rm -f git-assist
