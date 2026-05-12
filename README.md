@@ -35,14 +35,22 @@ Requires **Go 1.26+** and **Git**.
 ```bash
 git clone https://github.com/y4hyya/Git-Assistant.git
 cd Git-Assistant
-make build
-sudo make install
+make install
+```
+
+This builds and installs to `~/.local/bin/git-assist`. Make sure
+`~/.local/bin` is on your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Then run inside any git repo:
 
 ```bash
-git-assist
+git-assist            # interactive dashboard
+git-assist branch     # branch manager
+git-assist --version  # show installed version
 ```
 
 ## Keybindings
