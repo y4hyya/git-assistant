@@ -71,18 +71,22 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Subject → confirm
 			val := strings.TrimSpace(m.msgInput.Value())
-			if val != "" {
-				m.scope = strings.TrimSpace(m.scopeInput.Value())
-				m.step = stepConfirm
+			if val == "" {
+				m.err = fmt.Errorf("subject cannot be empty")
+				return m, nil
 			}
+			m.scope = strings.TrimSpace(m.scopeInput.Value())
+			m.step = stepConfirm
 			return m, nil
 
 		case "ctrl+d":
 			val := strings.TrimSpace(m.msgInput.Value())
-			if val != "" {
-				m.scope = strings.TrimSpace(m.scopeInput.Value())
-				m.step = stepConfirm
+			if val == "" {
+				m.err = fmt.Errorf("subject cannot be empty")
+				return m, nil
 			}
+			m.scope = strings.TrimSpace(m.scopeInput.Value())
+			m.step = stepConfirm
 			return m, nil
 
 		case "up":
