@@ -7,6 +7,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-05-13
+
+First UX-gap feature from the roadmap: editing the last commit without losing its message.
+
+### Added
+- **Amend last commit** — new entry on the main menu. Pre-loads the commit wizard with the previous commit's scope, subject, body, and type so the user only edits what's actually changing. Optionally stages additional files in the Files step (empty selection is fine for message-only amends). The final step runs `git commit --amend`. Hidden when the repo has no commits yet.
+- Parser for conventional-commit subjects (`type(scope)!: rest`) so the type / scope / breaking-change flag survive the round-trip. Non-conventional commits fall through to the "custom" type with the original subject preserved verbatim.
+- Confirm step shows "Amend `<short-sha>`" and warns when the commit is already on a remote that the next push will need `git push --force-with-lease`.
+- `git.Amend()`, `git.IsLastCommitPushed()`, `git.GetLastCommitFull()` in the git package.
+
+### Changed
+- After an amend, the wizard routes directly to Done instead of through the push step. Auto-pushing after an amend would either fail (non-FF on already-pushed commits) or surprise the user; the Confirm step warning sets up the manual `--force-with-lease` push expectation.
+- `hasAnyCommit` is now cached in `RefreshGraphs` alongside `branchCount`, so menu rendering doesn't fork `git rev-parse` per keypress.
+
 ## [1.1.0] — 2026-05-13
 
 Tier-2 hardening bundle from the post-v1.0 audit.
@@ -59,7 +73,8 @@ First public release.
 - macOS-conditional codesigning on `make install`.
 - Unicode symbols with automatic ASCII fallback for terminals that don't support them.
 
-[Unreleased]: https://github.com/y4hyya/Git-Assistant/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/y4hyya/Git-Assistant/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/y4hyya/Git-Assistant/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/y4hyya/Git-Assistant/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/y4hyya/Git-Assistant/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/y4hyya/Git-Assistant/releases/tag/v1.0.0
