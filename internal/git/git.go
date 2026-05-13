@@ -296,6 +296,53 @@ func GetLastCommitMessage() string {
 	return strings.TrimSpace(string(out))
 }
 
+// GetLastCommitFull returns the subject (first line) and body of the most
+// recent commit as separate strings. Used by the amend flow to pre-fill the
+// wizard with the existing commit content. Empty strings if anything fails.
+func GetLastCommitFull() (subject, body string) {
+	s, err := exec.Command("git", "log", "-1", "--format=%s").Output()
+	if err != nil {
+		return "", ""
+	}
+	subject = strings.TrimSpace(string(s))
+	b, bErr := exec.Command("git", "log", "-1", "--format=%b").Output()
+	if bErr != nil {
+		return subject, ""
+	}
+	body = strings.TrimSpace(string(b))
+	return subject, body
+}
+
+// IsLastCommitPushed reports whether HEAD is contained in any remote-tracking
+// branch (i.e. already pushed). The amend flow uses this to warn the user
+// that amending a pushed commit will require `git push --force-with-lease`
+// to update upstream — silently amending and then failing the next plain
+// push is a worse experience than the up-front warning.
+func IsLastCommitPushed() bool {
+	out, err := exec.Command("git", "branch", "-r", "--contains", "HEAD").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// Amend stages any newly-selected files on top of the existing index and
+// re-runs the last commit with the given message. Unlike Commit, we don't
+// `git reset` first — the whole point of amend is to keep what's already
+// in HEAD and layer additional changes (if any) into the same commit.
+func Amend(filePaths []string, message string) error {
+	for _, p := range filePaths {
+		if out, err := exec.Command("git", "add", "--", p).CombinedOutput(); err != nil {
+			return fmt.Errorf("staging %s: %s", p, strings.TrimSpace(string(out)))
+		}
+	}
+	out, err := exec.Command("git", "commit", "--amend", "-m", message).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("amend failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // UndoLastCommit performs a soft reset, keeping changes staged.
 func UndoLastCommit() error {
 	out, err := exec.Command("git", "reset", "--soft", "HEAD~1").CombinedOutput()
