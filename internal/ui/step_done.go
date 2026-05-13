@@ -29,6 +29,8 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.gitignoreCached = nil
 			m.committing = false
 			m.pushing = false
+			m.amendMode = false
+			m.scopeInput.Reset()
 			// Refresh files and graphs
 			files, _ := git.GetStatus()
 			m.files = files
@@ -56,9 +58,13 @@ func (m Model) viewDone() string {
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n\n")
 
-	// Commit summary
+	// Commit / amend summary
 	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
-	b.WriteString("  " + successStyle.Render(symDone) + " Committed: " + msg + "\n")
+	verb := "Committed"
+	if m.amendMode {
+		verb = "Amended"
+	}
+	b.WriteString("  " + successStyle.Render(symDone) + " " + verb + ": " + msg + "\n")
 
 	// Commit hash and stats
 	hash := git.GetLastCommitHash()

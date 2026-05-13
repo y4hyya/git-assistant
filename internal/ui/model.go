@@ -176,6 +176,11 @@ type Model struct {
 	committing bool
 	pushing    bool
 	pushed     bool
+	amendMode  bool // when true, the commit wizard ends with `git commit --amend`
+
+	// Cached: whether the repo has at least one commit. Refreshed by
+	// RefreshGraphs so menuItems doesn't fork git per keypress.
+	hasAnyCommit bool
 
 	// Spinner for async operations
 	spinner spinner.Model
@@ -358,8 +363,8 @@ func NewBranchModel(branch string) Model {
 }
 
 // RefreshGraphs updates the graph data from git, plus the cached branch
-// count so the menu can show it without forking `git branch` on every
-// keypress.
+// count and hasAnyCommit flag so the menu can render without forking
+// `git branch` / `git rev-parse` on every keypress.
 func (m *Model) RefreshGraphs() {
 	m.localGraph = git.GetUnifiedGraph(15)
 	a, b := git.GetAheadBehind(m.branch)
@@ -367,6 +372,7 @@ func (m *Model) RefreshGraphs() {
 	m.behindOrigin = b
 	m.behindMain = git.GetBehindMain(m.branch)
 	m.branchCount = len(git.GetAllBranches())
+	m.hasAnyCommit = git.HasAnyCommit()
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -479,6 +485,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.RefreshGraphs()
+		// Amends route straight to Done — auto-routing to push after an
+		// amend would either fail (non-FF on pushed commits) or surprise
+		// the user by force-pushing. The Confirm step already warned
+		// about --force-with-lease; the user pushes manually afterward.
+		if m.amendMode {
+			m.step = stepDone
+			return m, nil
+		}
 		if m.hasRemote {
 			m.branches = git.GetBranches(m.branch)
 			m.step = stepPush

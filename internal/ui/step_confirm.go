@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"git-assist/internal/git"
 )
 
 // ── Update ──────────────────────────────────────────────
@@ -33,6 +34,9 @@ func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 				paths = append(paths, f.Path)
 			}
 		}
+		if m.amendMode {
+			return m, tea.Batch(doAmend(paths, fullMsg), m.spinner.Tick)
+		}
 		return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
 	case "esc":
 		m.step = stepMessage
@@ -60,8 +64,21 @@ func (m Model) viewConfirm() string {
 	b.WriteString("\n")
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
-	b.WriteString(stepStyle.Render("  Review before committing"))
+	if m.amendMode {
+		shortSHA := git.GetLastCommitHash()
+		b.WriteString(stepStyle.Render("  Amend " + shortSHA))
+	} else {
+		b.WriteString(stepStyle.Render("  Review before committing"))
+	}
 	b.WriteString("\n\n")
+
+	// Warn before amending a commit that's already on a remote — the
+	// next push will need --force-with-lease to update upstream, and
+	// surfacing that here avoids the "why is my push rejected" loop.
+	if m.amendMode && git.IsLastCommitPushed() {
+		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin. Amending will require:") + "\n")
+		b.WriteString("  " + modifiedStyle.Render("    git push --force-with-lease") + "\n\n")
+	}
 
 	// Full commit message preview
 	val := strings.TrimSpace(m.msgInput.Value())

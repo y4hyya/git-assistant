@@ -163,6 +163,17 @@ func doCommit(paths []string, cachedPaths []string, message string) tea.Cmd {
 	}
 }
 
+// doAmend stages the given paths on top of the existing index and re-runs
+// the last commit with a new message. Reuses commitResultMsg — the handler
+// in model.go branches on m.amendMode to skip the push step and route
+// straight to Done.
+func doAmend(paths []string, message string) tea.Cmd {
+	return func() tea.Msg {
+		err := git.Amend(paths, message)
+		return commitResultMsg{err: err}
+	}
+}
+
 // ── View ────────────────────────────────────────────────
 
 func (m Model) viewMessage() string {

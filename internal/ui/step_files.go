@@ -341,7 +341,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		if !hasSelected {
+		// In amend mode the user can advance without selecting anything —
+		// they may just want to edit the message of the existing commit.
+		if !hasSelected && !m.amendMode {
 			return m, nil
 		}
 		m.step = stepType
@@ -442,6 +444,8 @@ func (m Model) viewFiles() string {
 	b.WriteString("\n")
 	if m.gitignoreMode {
 		b.WriteString(stepStyle.Render("  Select files to add .gitignore"))
+	} else if m.amendMode {
+		b.WriteString(stepStyle.Render("  Amending last commit — optionally add files"))
 	} else {
 		b.WriteString(stepStyle.Render("  Select files to commit"))
 	}
