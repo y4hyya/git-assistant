@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
 	"git-assist/internal/types"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // ── Async commands ─────────────────────────────────────

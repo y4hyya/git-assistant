@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"time"
 
+	"git-assist/internal/git"
+	"git-assist/internal/types"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"git-assist/internal/git"
-	"git-assist/internal/types"
 )
 
 // fetchDebounce is the minimum interval between background fetches when
@@ -130,16 +130,16 @@ type Model struct {
 	filterCursor  int
 
 	// Branch manager
-	branchEntries     []types.BranchEntry
-	branchCursor      int
-	branchScroll      int
-	branchCreateMode  bool
-	branchCreateInput textinput.Model
-	branchDeleteMode  bool
-	branchMergeMode   bool
-	branchConflict    bool
-	branchConflFiles  []string
-	branchStandalone  bool
+	branchEntries      []types.BranchEntry
+	branchCursor       int
+	branchScroll       int
+	branchCreateMode   bool
+	branchCreateInput  textinput.Model
+	branchDeleteMode   bool
+	branchMergeMode    bool
+	branchConflict     bool
+	branchConflFiles   []string
+	branchStandalone   bool
 	branchSwitching    bool
 	branchMerging      bool
 	branchCreatedHint  string
@@ -289,16 +289,16 @@ func NewModel(files []types.FileEntry, branch string) Model {
 		step:              stepMenu,
 		branchCreateInput: bci,
 		configEditInput:   cfi,
-		files:       files,
-		branch:      branch,
-		msgInput:    mi,
-		customInput: ci,
-		scopeInput:  si,
-		bodyInput:   bi,
-		editArea:    ei,
-		filterInput: fi,
-		spinner:     s,
-		hasRemote:   git.HasRemote(),
+		files:             files,
+		branch:            branch,
+		msgInput:          mi,
+		customInput:       ci,
+		scopeInput:        si,
+		bodyInput:         bi,
+		editArea:          ei,
+		filterInput:       fi,
+		spinner:           s,
+		hasRemote:         git.HasRemote(),
 	}
 	// Initialize init-flow inputs up-front so the "Connect to GitHub"
 	// recovery entry works from an already-initialized repo. Without this,

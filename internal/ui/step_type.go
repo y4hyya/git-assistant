@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
+	"git-assist/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"git-assist/internal/types"
 )
 
 // ── Update ──────────────────────────────────────────────

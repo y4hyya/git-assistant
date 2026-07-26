@@ -4,7 +4,7 @@ package types
 type FileStatus int
 
 const (
-	StatusModified  FileStatus = iota
+	StatusModified FileStatus = iota
 	StatusAdded
 	StatusDeleted
 	StatusRenamed

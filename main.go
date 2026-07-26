@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
 	"git-assist/internal/ui"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Version is set at build time via -ldflags "-X main.Version=…".

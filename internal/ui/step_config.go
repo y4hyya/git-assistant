@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type configItem struct {

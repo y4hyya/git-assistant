@@ -4,16 +4,16 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
 	"git-assist/internal/types"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // focus tracks which input field is active in the message step.
 type focus int
 
 const (
-	focusScope   focus = iota
+	focusScope focus = iota
 	focusSubject
 	focusBody
 )

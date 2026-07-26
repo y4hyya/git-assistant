@@ -3,8 +3,8 @@ package ui
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // ── Update ──────────────────────────────────────────────
@@ -87,7 +87,7 @@ func (m Model) viewDone() string {
 	if m.pushed {
 		b.WriteString("  " + successStyle.Render(symDone) + " Pushed to " + branchStyle.Render("origin/"+m.pushBranch) + "\n")
 	} else if m.hasRemote {
-		b.WriteString("  " + dimStyle.Render(symSkip + " Push skipped") + "\n")
+		b.WriteString("  " + dimStyle.Render(symSkip+" Push skipped") + "\n")
 	}
 
 	b.WriteString("\n  " + successStyle.Render("All done!") + "\n")

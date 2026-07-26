@@ -5,9 +5,9 @@ import (
 	"os/exec"
 	"strings"
 
+	"git-assist/internal/git"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"git-assist/internal/git"
 )
 
 // initPhase tracks which screen inside the init flow we're on. A single step
@@ -15,24 +15,24 @@ import (
 type initPhase int
 
 const (
-	initPhasePickOption    initPhase = iota // 4-option radio list
-	initPhasePickTemplate                   // .gitignore template picker
-	initPhaseInputURL                       // paste remote URL
-	initPhaseInputRepoName                  // repo name for gh create
-	initPhasePickVisibility                 // public / private
-	initPhaseConfirmGHAuth                  // offer to run gh auth login
-	initPhaseWorking                        // async op in flight
-	initPhaseDone                           // success → fall through to menu
+	initPhasePickOption     initPhase = iota // 4-option radio list
+	initPhasePickTemplate                    // .gitignore template picker
+	initPhaseInputURL                        // paste remote URL
+	initPhaseInputRepoName                   // repo name for gh create
+	initPhasePickVisibility                  // public / private
+	initPhaseConfirmGHAuth                   // offer to run gh auth login
+	initPhaseWorking                         // async op in flight
+	initPhaseDone                            // success → fall through to menu
 )
 
 // initChoice enumerates the 4 top-level options the user sees first.
 type initChoice int
 
 const (
-	initChoiceLocal   initChoice = iota // A: local init only
-	initChoiceConnect                   // B: init + connect to existing URL
-	initChoiceGHCreate                  // C: init + `gh repo create`
-	initChoiceCancel                    // D: exit
+	initChoiceLocal    initChoice = iota // A: local init only
+	initChoiceConnect                    // B: init + connect to existing URL
+	initChoiceGHCreate                   // C: init + `gh repo create`
+	initChoiceCancel                     // D: exit
 )
 
 var initChoiceLabels = []struct {

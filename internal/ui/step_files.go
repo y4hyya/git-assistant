@@ -6,10 +6,10 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"git-assist/internal/git"
 	"git-assist/internal/types"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type gitignoreResultMsg struct{ err error }
@@ -479,7 +479,7 @@ func (m Model) viewFiles() string {
 			}
 		}
 		if start > 0 {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp,start)) + "\n")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp, start)) + "\n")
 		}
 	}
 
@@ -520,7 +520,7 @@ func (m Model) viewFiles() string {
 
 	// Scroll-down indicator
 	if !m.gitignoreMode && end < len(m.files) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown,len(m.files)-end)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown, len(m.files)-end)) + "\n")
 	}
 
 	// Existing gitignore entries (only in gitignore mode)
@@ -827,7 +827,7 @@ func formatError(err error) string {
 
 	result := errorStyle.Render("Error: " + msg)
 	if hint != "" {
-		result += "\n  " + dimStyle.Render("Hint: " + hint)
+		result += "\n  " + dimStyle.Render("Hint: "+hint)
 	}
 	return result
 }
@@ -858,11 +858,11 @@ func renderProgress(current step) string {
 	var parts []string
 	for i, name := range names {
 		if i < currentIdx {
-			parts = append(parts, successStyle.Render(symDone + " "+name))
+			parts = append(parts, successStyle.Render(symDone+" "+name))
 		} else if i == currentIdx {
-			parts = append(parts, activeStyle.Render(symCursor + " "+name))
+			parts = append(parts, activeStyle.Render(symCursor+" "+name))
 		} else {
-			parts = append(parts, dimStyle.Render(symUnselected + " "+name))
+			parts = append(parts, dimStyle.Render(symUnselected+" "+name))
 		}
 	}
 	return "  " + strings.Join(parts, "  ")
@@ -934,7 +934,7 @@ func (m Model) viewFilter() string {
 	}
 
 	if start > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp,start)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp, start)) + "\n")
 	}
 
 	// Matched files
@@ -963,7 +963,7 @@ func (m Model) viewFilter() string {
 	}
 
 	if end < len(m.filterMatches) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown,len(m.filterMatches)-end)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown, len(m.filterMatches)-end)) + "\n")
 	}
 
 	// Counter
