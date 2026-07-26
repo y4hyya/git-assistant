@@ -44,8 +44,8 @@ These are real behavioral gaps, not just polish. Roughly grouped by area.
 - **M20** — `gh auth login --web` can return success when the user cancelled in the browser. Next step (repo create) then fails with an auth error.
 
 ### General / git package
-- **M29** — Push refspec accepts any branch string. Not shell-injection (no shell), but defensive validation would prevent weird inputs from reaching git.
-- **M30** — Force push not offered with `--force-with-lease` safety. A rebased branch's plain push fails; the formatError hint says "Run `git pull` first" which is **wrong** for a rebase.
+- ~~**M29** — Push refspec accepts any branch string.~~ **Fixed** — `Push(branch)` pushes `origin <branch>`; the `HEAD:<target>` refspec and the branch picker that fed it are gone.
+- ~~**M30** — Force push not offered with `--force-with-lease` safety.~~ **Fixed** — the push step becomes a force-with-lease confirmation (`f`) after a local rewrite, gated on origin still holding the rewritten commit and leased against its SHA.
 - **M31** — Help bar wraps on terminals narrower than ~80 chars.
 
 ---
@@ -92,7 +92,7 @@ These would substantially improve the tool but are not bugs.
 - **`--amend`** flow for fixing the last commit without losing the message
 - **Conflict resolution UI** — currently a conflict kicks the user to terminal; an in-TUI conflict-file picker + "mark resolved" + "abort" would close the loop
 - **Branch rename** — common operation, not exposed
-- **`--force-with-lease` push** — for rebased branches, with safety
+- ~~**`--force-with-lease` push** — for rebased branches, with safety~~ **Built** — see M30; the Done screen and the dashboard route into it instead of printing the command
 - **Stash management** — list / apply / drop entries; right now stashes created by auto-stash become orphans the user manages from the terminal
 - **Revert / cherry-pick** — useful for the target audience (git beginners)
 - **`git-assist --help`** — there's no help output for the CLI itself

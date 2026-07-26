@@ -80,7 +80,12 @@ func (m *Model) setupInitModel() {
 	m.initURLInput = urlInput
 	m.initNameInput = nameInput
 	m.initTemplateOptions = git.GitignoreTemplates()
-	m.initTemplateCursor = indexOfTemplate(m.initTemplateOptions, git.DetectGitignoreTemplate())
+	// One detection pass, its result kept. Both the preselected cursor and the
+	// "(detected: Go)" label are the same answer, and the label used to be
+	// recomputed by viewInitPickTemplate — an os.ReadDir of the working
+	// directory on every keypress, resize and spinner tick.
+	m.initDetectedTemplate = git.DetectGitignoreTemplate()
+	m.initTemplateCursor = indexOfTemplate(m.initTemplateOptions, m.initDetectedTemplate)
 }
 
 func indexOfTemplate(tpls []git.GitignoreTemplate, name string) int {
@@ -610,7 +615,7 @@ func (m Model) viewInitPickTemplate() string {
 	var b strings.Builder
 	b.WriteString(highlightStyle.Render("Pick a .gitignore template"))
 	b.WriteString("  ")
-	b.WriteString(dimStyle.Render("(detected: " + git.DetectGitignoreTemplate() + ")"))
+	b.WriteString(dimStyle.Render("(detected: " + m.initDetectedTemplate + ")"))
 	b.WriteString("\n\n")
 
 	for i, tpl := range m.initTemplateOptions {

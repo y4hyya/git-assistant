@@ -35,6 +35,13 @@ func (m Model) menuItems() []menuItem {
 	if m.hasAnyCommit {
 		items = append(items, menuItem{"Amend", "edit last commit"})
 	}
+	// Push, whenever there is something origin does not have. Without this
+	// entry the push step was reachable ONLY in the seconds after a commit: a
+	// push that was skipped, that failed, or that an amend made necessary could
+	// not be run from inside the tool at all.
+	if m.canPush() {
+		items = append(items, menuItem{"Push", m.pushMenuDesc()})
+	}
 	items = append(items,
 		menuItem{"Branch", fmt.Sprintf("%d branches", m.branchCount)},
 		menuItem{"Config", "git settings"},
@@ -136,6 +143,31 @@ func (m Model) mainLabel() string {
 		return m.mainName
 	}
 	return "main"
+}
+
+// canPush gates the dashboard's Push entry. Three states deserve it, and they
+// are exactly the three the entry can describe: commits waiting to go out, a
+// branch origin has never seen, and a local rewrite origin still contradicts.
+// A branch that is merely BEHIND is not one of them — that is Pull's job.
+func (m Model) canPush() bool {
+	if !m.hasRemote || !m.hasAnyCommit {
+		return false
+	}
+	return m.aheadOrigin > 0 || !m.hasUpstream || m.historyRewritten
+}
+
+// pushMenuDesc says which of the three states the Push entry is offering, in
+// priority order: a rewrite outranks a plain backlog, because the push it needs
+// is a different (and louder) operation.
+func (m Model) pushMenuDesc() string {
+	switch {
+	case m.historyRewritten:
+		return symWarn + " force required (history rewritten)"
+	case !m.hasUpstream:
+		return "publish branch (no upstream yet)"
+	default:
+		return fmt.Sprintf("%s%d ahead", symArrowUp, m.aheadOrigin)
+	}
 }
 
 // canConnectGH reports whether the recovery menu entry is applicable.
@@ -294,6 +326,11 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "Amend":
 			m.refreshFiles()
 			return m.startAmend(), nil
+		case "Push":
+			// Same step the wizard uses; enterPush reads what this particular
+			// push would send and decides whether it has to be a force.
+			m.enterPush(true)
+			return m, nil
 		case "Branch":
 			m.branchEntries = git.GetAllBranches()
 			m.branchCursor = 0

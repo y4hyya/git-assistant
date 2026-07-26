@@ -480,8 +480,8 @@ func TestOrdinaryErrorIsClearedOnAnyKeypress(t *testing.T) {
 
 func TestPushSyncCheckFiresOncePerVisit(t *testing.T) {
 	m := wizardModel(t, stepPush)
-	m.branches = []string{"main"}
 	m.hasRemote = false
+	m.pushHasUpstream = true
 
 	if m.pushCheckDone {
 		t.Fatal("behind-check latch pre-armed")
@@ -630,23 +630,6 @@ func TestMergeTargetPickerEmptyEnterDoesNotPanic(t *testing.T) {
 	if m.branchMergeMode {
 		t.Fatal("merge confirmation opened with no target")
 	}
-}
-
-// ── Push branch index ──────────────────────────────────
-
-func TestPushClampsStaleBranchIdx(t *testing.T) {
-	m := Model{step: stepPush, branches: []string{"main", "dev"}, branchIdx: 5, height: 30}
-	m, _ = key(t, m, "up")
-	if m.branchIdx != 0 {
-		t.Fatalf("branchIdx = %d, want 0", m.branchIdx)
-	}
-
-	empty := Model{step: stepPush, height: 30}
-	empty, cmd := key(t, empty, "enter")
-	if cmd != nil {
-		t.Fatal("push dispatched with no branches")
-	}
-	_ = empty
 }
 
 // ── ctrl+c during a mutation ───────────────────────────
@@ -2044,8 +2027,17 @@ func TestFormatErrorHints(t *testing.T) {
 			name:    "rejected push after a rewrite",
 			msg:     "! [rejected] main -> main (non-fast-forward)",
 			rewrote: true,
-			want:    "--force-with-lease",
+			want:    "force-with-lease",
 			wantNot: "git pull first",
+		},
+		{
+			// The lease did its job: origin moved, so nothing was overwritten.
+			// Answering that with the force advice would be a retry loop.
+			name:    "force-with-lease refused because origin moved",
+			msg:     "! [rejected] main -> main (stale info)",
+			rewrote: true,
+			want:    "Pull first",
+			wantNot: "Press f",
 		},
 		{
 			name: "merge would clobber local work",
@@ -2084,8 +2076,11 @@ func TestPushHintFollowsAnAmendOfAPushedCommit(t *testing.T) {
 	m.step = stepPush
 	m.err = errors.New("! [rejected] main -> main (non-fast-forward)")
 	out := m.viewPush()
-	if !strings.Contains(out, "--force-with-lease") {
+	if !strings.Contains(out, "force-with-lease") {
 		t.Errorf("the push hint would undo the amend:\n%s", out)
+	}
+	if strings.Contains(out, "git pull first") {
+		t.Errorf("the push hint still offers the pull that undoes the amend:\n%s", out)
 	}
 }
 
@@ -2317,7 +2312,7 @@ func TestFailedPushStaysOnTheStepAndDoneTellsTheTruth(t *testing.T) {
 func TestEscOnPushIsLabelledAsASkip(t *testing.T) {
 	m := wizardModel(t, stepPush, file("a.txt"))
 	m.hasRemote = true
-	m.branches = []string{"main"}
+	m.pushHasUpstream = true
 	m.msgInput.SetValue("do things")
 	m.commitType = "feat"
 
@@ -2358,8 +2353,8 @@ func TestAmendBreadcrumbDropsPushAndStatesTheNextStep(t *testing.T) {
 	if strings.Contains(out, "Push skipped") {
 		t.Errorf("an amend does not \"skip\" a push:\n%s", out)
 	}
-	if !strings.Contains(out, "--force-with-lease") {
-		t.Errorf("Done never names the manual next step:\n%s", out)
+	if !strings.Contains(out, "force-with-lease") {
+		t.Errorf("Done never names the push this state needs:\n%s", out)
 	}
 
 	// Without a remote, the breadcrumb drops Push for ordinary commits too.
@@ -2576,5 +2571,584 @@ func TestPullReportsUpToDateAndTheStashRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(note, "stashed and restored") {
 		t.Errorf("the auto-stash round trip is still silent: %q", note)
+	}
+}
+
+// ── The push loop ──────────────────────────────────────
+//
+// stepPush used to be reachable ONLY in the seconds after a commit, it offered
+// a branch PICKER whose every non-current entry pushed the current commits onto
+// somebody else's remote branch, and the one push it could never run — the
+// force-with-lease an amend makes necessary — was printed as a command to type
+// somewhere else.
+
+// tempRepoWithOrigin is tempRepo plus a bare repository wired up as origin,
+// with the seed commit already published and tracking set up. Returns origin's
+// path. The push loop is a relationship between two repositories; there is no
+// honest way to exercise it against one.
+func tempRepoWithOrigin(t *testing.T, subject string) string {
+	t.Helper()
+	tempRepo(t, subject, "")
+	origin := t.TempDir()
+	gitRun(t, "init", "-q", "--bare", origin)
+	gitRun(t, "remote", "add", "origin", origin)
+	gitRun(t, "push", "-q", "-u", "origin", "main")
+	return origin
+}
+
+// gitOut runs a read-only git command and returns its output.
+func gitOut(t *testing.T, args ...string) []byte {
+	t.Helper()
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return out
+}
+
+// hasMenuItem reports whether the dashboard is currently offering an entry,
+// and what it says about it.
+func hasMenuItem(m Model, name string) (menuItem, bool) {
+	for _, it := range m.menuItems() {
+		if it.name == name {
+			return it, true
+		}
+	}
+	return menuItem{}, false
+}
+
+func TestMenuPushEntryVisibility(t *testing.T) {
+	base := func() Model {
+		return Model{hasRemote: true, hasAnyCommit: true, hasUpstream: true}
+	}
+	cases := []struct {
+		name string
+		tune func(*Model)
+		want string // "" = the entry must not be offered
+	}{
+		{
+			name: "commits waiting to go out",
+			tune: func(m *Model) { m.aheadOrigin = 3 },
+			want: "3 ahead",
+		},
+		{
+			name: "branch origin has never seen",
+			tune: func(m *Model) { m.hasUpstream = false },
+			want: "publish branch",
+		},
+		{
+			name: "history rewritten under a pushed commit",
+			tune: func(m *Model) { m.historyRewritten = true; m.aheadOrigin = 1 },
+			want: "force required",
+		},
+		{
+			name: "a rewrite outranks a plain backlog",
+			tune: func(m *Model) { m.historyRewritten = true; m.aheadOrigin = 4; m.hasUpstream = false },
+			want: "force required",
+		},
+		{
+			name: "in sync — nothing to push",
+			tune: func(m *Model) {},
+		},
+		{
+			// Behind is the PULL case. Offering Push here is how a beginner
+			// ends up force-pushing over somebody else's work.
+			name: "merely behind origin",
+			tune: func(m *Model) { m.behindOrigin = 5 },
+		},
+		{
+			name: "no remote at all",
+			tune: func(m *Model) { m.hasRemote = false; m.aheadOrigin = 2 },
+		},
+		{
+			name: "repository with no commits yet",
+			tune: func(m *Model) { m.hasAnyCommit = false; m.hasUpstream = false },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base()
+			tc.tune(&m)
+			item, ok := hasMenuItem(m, "Push")
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("Push offered as %q when it should not be", item.desc)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("Push entry missing; menu = %v", m.menuItems())
+			}
+			if !strings.Contains(item.desc, tc.want) {
+				t.Errorf("Push desc = %q, want it to mention %q", item.desc, tc.want)
+			}
+		})
+	}
+}
+
+// Everything the screen shows is read on entry — never from the View, which
+// runs on every keypress, resize and spinner tick.
+func TestEnterPushCachesWhatTheScreenShows(t *testing.T) {
+	tempRepoWithOrigin(t, "chore: seed")
+	writeFile(t, "a.txt", "a\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: one")
+	writeFile(t, "b.txt", "b\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: two")
+
+	m := wizardModel(t, stepMenu)
+	m.hasRemote = true
+	m.enterPush(true)
+
+	if m.step != stepPush {
+		t.Fatalf("step = %v, want stepPush", m.step)
+	}
+	if !m.pushReturnToMenu {
+		t.Error("the menu entry point was not recorded")
+	}
+	if m.pushOutgoingTotal != 2 {
+		t.Errorf("pushOutgoingTotal = %d, want 2", m.pushOutgoingTotal)
+	}
+	if len(m.pushOutgoing) != 2 {
+		t.Errorf("pushOutgoing = %v, want both subjects", m.pushOutgoing)
+	}
+	if !m.pushHasUpstream || m.pushAhead != 2 || m.pushBehind != 0 {
+		t.Errorf("upstream=%v ahead=%d behind=%d, want true/2/0", m.pushHasUpstream, m.pushAhead, m.pushBehind)
+	}
+	if m.pushForce {
+		t.Error("force offered on a branch whose history was never rewritten")
+	}
+	if m.pushBranch != m.branch {
+		t.Errorf("pushBranch = %q, want the current branch %q", m.pushBranch, m.branch)
+	}
+
+	// Rendered from a directory that is not a repository: anything the View
+	// forked would come back empty.
+	t.Chdir(t.TempDir())
+	out := m.viewPush()
+	for _, want := range []string{"Push 2 commits to origin/main", "feat: one", "feat: two"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("push screen never says %q:\n%s", want, out)
+		}
+	}
+	// The picker is gone: no branch list, no navigation.
+	if strings.Contains(out, "Select branch") || strings.Contains(out, symArrows) {
+		t.Errorf("the branch picker survived:\n%s", out)
+	}
+}
+
+func TestEnterPushOnAnUnpublishedBranchIsAPublish(t *testing.T) {
+	tempRepoWithOrigin(t, "chore: seed")
+	gitRun(t, "checkout", "-q", "-b", "feat")
+	writeFile(t, "a.txt", "a\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: work")
+
+	m := wizardModel(t, stepMenu)
+	m.branch = "feat"
+	m.hasRemote = true
+	m.enterPush(true)
+
+	if m.pushHasUpstream {
+		t.Fatal("a branch origin has never seen reports an upstream")
+	}
+	out := m.viewPush()
+	if !strings.Contains(out, "Publish branch feat") {
+		t.Errorf("the publish case is not named:\n%s", out)
+	}
+	if !strings.Contains(out, "tracking") {
+		t.Errorf("nothing says the push sets tracking up:\n%s", out)
+	}
+}
+
+// The safety property of the whole feature: force is offered only after THIS
+// session rewrote a commit origin already had.
+func TestForcePushIsNeverOfferedWithoutARewrite(t *testing.T) {
+	cases := []struct {
+		name string
+		m    Model
+		want bool
+	}{
+		{
+			name: "diverged after an amend of a pushed commit",
+			m:    Model{historyRewritten: true, pushAhead: 1, pushBehind: 1, pushHasUpstream: true},
+			want: true,
+		},
+		{
+			name: "the amend flow knows before the counts do",
+			m:    Model{historyRewritten: true, amendPushed: true, pushHasUpstream: true},
+			want: true,
+		},
+		{
+			// Diverged, but nothing here rewrote anything: the branch forked
+			// or someone else pushed. Forcing deletes their commits.
+			name: "diverged without a rewrite",
+			m:    Model{pushAhead: 2, pushBehind: 3, pushHasUpstream: true},
+			want: false,
+		},
+		{
+			name: "merely behind",
+			m:    Model{pushBehind: 4, pushHasUpstream: true},
+			want: false,
+		},
+		{
+			name: "amendPushed left over from an earlier amend, no rewrite recorded",
+			m:    Model{amendPushed: true, pushHasUpstream: true, pushBehind: 1},
+			want: false,
+		},
+		{
+			name: "rewritten, but origin agrees again (already force-pushed)",
+			m:    Model{historyRewritten: true, pushAhead: 0, pushBehind: 0, pushHasUpstream: true},
+			want: false,
+		},
+		{
+			// The dangerous one. We rewrote a commit origin had, and then
+			// somebody pushed on top of it — which our own background fetch
+			// dutifully imported. A force here deletes their work, and git's
+			// default lease would not stop it.
+			name: "somebody pushed on top of the commit we rewrote",
+			m: Model{
+				historyRewritten: true, amendPushed: true, pushHasUpstream: true,
+				pushAhead: 1, pushBehind: 2,
+				rewriteBaseSHA: "aaaa111", pushLeaseSHA: "bbbb222",
+			},
+			want: false,
+		},
+		{
+			name: "origin still holds exactly the commit we rewrote",
+			m: Model{
+				historyRewritten: true, pushHasUpstream: true,
+				pushAhead: 1, pushBehind: 1,
+				rewriteBaseSHA: "aaaa111", pushLeaseSHA: "aaaa111",
+			},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.m.forcePushRequired(); got != tc.want {
+				t.Errorf("forcePushRequired() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Force mode is entered with `f`, deliberately not with enter: replacing a
+// commit on origin is not something to walk into with the key that means next.
+func TestForcePushNeedsItsOwnKey(t *testing.T) {
+	m := wizardModel(t, stepPush)
+	m.hasRemote = true
+	m.pushForce = true
+	m.pushHasUpstream = true
+	m.pushAhead, m.pushBehind = 1, 1
+
+	next, cmd := key(t, m, "enter")
+	if cmd != nil || next.pushing {
+		t.Fatal("enter ran the force push")
+	}
+	next, cmd = key(t, m, "f")
+	if cmd == nil || !next.pushing {
+		t.Fatal("f did not dispatch the force push")
+	}
+
+	out := m.viewPush()
+	for _, want := range []string{"Force push required", "rewritten", "rejected", "nobody else pushed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the force explainer never says %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "f force-push") {
+		t.Errorf("the help bar does not offer f:\n%s", out)
+	}
+
+	// And f is inert on an ordinary push, where there is nothing to force.
+	plain := wizardModel(t, stepPush)
+	plain.hasRemote = true
+	plain.pushHasUpstream = true
+	if next, cmd := key(t, plain, "f"); cmd != nil || next.pushing {
+		t.Fatal("f force-pushed a branch that never rewrote anything")
+	}
+}
+
+func TestMenuInitiatedPushReturnsToTheMenuWithANote(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+
+	cases := []struct {
+		name  string
+		tune  func(*Model)
+		msg   pushResultMsg
+		wants []string
+	}{
+		{
+			name:  "ordinary push",
+			tune:  func(m *Model) { m.pushHasUpstream = true; m.pushOutgoingTotal = 3 },
+			wants: []string{"Pushed 3 commits to origin/main"},
+		},
+		{
+			name:  "publish",
+			tune:  func(m *Model) { m.pushHasUpstream = false; m.branch = "feat" },
+			wants: []string{"Published branch feat to origin"},
+		},
+		{
+			name:  "force-with-lease",
+			tune:  func(m *Model) { m.pushHasUpstream = true; m.pushOutgoingTotal = 1; m.historyRewritten = true },
+			msg:   pushResultMsg{forced: true},
+			wants: []string{"Force-pushed 1 commit to origin/main", "replaced"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := wizardModel(t, stepPush)
+			m.hasRemote = true
+			m.pushReturnToMenu = true
+			m.pushing = true
+			tc.tune(&m)
+
+			next, _ := m.Update(tc.msg)
+			out := next.(Model)
+			if out.step != stepMenu {
+				t.Fatalf("step = %v, want stepMenu — a push started from the dashboard belongs back there", out.step)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(out.statusNote, want) {
+					t.Errorf("note = %q, want it to contain %q", out.statusNote, want)
+				}
+			}
+			if out.historyRewritten {
+				t.Error("a successful push left the rewrite flag set — the menu keeps offering a force")
+			}
+		})
+	}
+}
+
+// The wizard's own push still ends on the summary screen it was written for.
+func TestWizardPushStillEndsOnDone(t *testing.T) {
+	m := wizardModel(t, stepPush, file("a.txt"))
+	m.hasRemote = true
+	m.pushing = true
+	m.pushHasUpstream = true
+	m.pushOutgoingTotal = 1
+	m.pushBranch = "main"
+
+	next, _ := m.Update(pushResultMsg{})
+	out := next.(Model)
+	if out.step != stepDone {
+		t.Fatalf("step = %v, want stepDone", out.step)
+	}
+	if out.statusNote != "" {
+		t.Errorf("the wizard path invented a menu note: %q", out.statusNote)
+	}
+	if !strings.Contains(out.viewDone(), "Pushed to") {
+		t.Errorf("Done does not report the push:\n%s", out.viewDone())
+	}
+}
+
+// Skipping follows the same rule as succeeding: back where you came from.
+func TestPushSkipRoutingFollowsTheEntryPoint(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+
+	fromMenu := wizardModel(t, stepPush)
+	fromMenu.hasRemote = true
+	fromMenu.pushReturnToMenu = true
+	if next, _ := key(t, fromMenu, "esc"); next.step != stepMenu {
+		t.Errorf("step = %v, want stepMenu", next.step)
+	}
+	if !strings.Contains(fromMenu.viewPush(), "back to menu") {
+		t.Errorf("the footer mislabels the exit:\n%s", fromMenu.viewPush())
+	}
+
+	fromWizard := wizardModel(t, stepPush, file("a.txt"))
+	fromWizard.hasRemote = true
+	if next, _ := key(t, fromWizard, "esc"); next.step != stepDone {
+		t.Errorf("step = %v, want stepDone", next.step)
+	}
+}
+
+// A menu-initiated push bypasses the wizard entirely, so the wizard's own reset
+// never runs: the second push of a session used to open on the first one's
+// error banner and its "already pushed" verdict.
+func TestEnterPushClearsThePreviousAttempt(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+
+	m := wizardModel(t, stepMenu)
+	m.hasRemote = true
+	m.pushed = true
+	m.pushFailed = true
+	m.pushErr = errors.New("! [rejected] main -> main (fetch first)")
+	m.pushCheckDone = true
+
+	m.enterPush(true)
+	if m.pushed || m.pushFailed || m.pushErr != nil {
+		t.Errorf("a fresh visit inherited the previous push's verdict: pushed=%v failed=%v err=%v",
+			m.pushed, m.pushFailed, m.pushErr)
+	}
+	if m.pushCheckDone {
+		t.Error("the behind-origin check was still latched from the last visit")
+	}
+}
+
+// The end of the amend loop: Done offers the force-with-lease as a keypress
+// instead of printing a command for the user to run in a terminal.
+func TestDoneOffersTheForcePushAfterAmendingAPushedCommit(t *testing.T) {
+	tempRepoWithOrigin(t, "chore: seed")
+	writeFile(t, "seed.txt", "amended\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "--amend", "-m", "chore: seed amended")
+
+	m := wizardModel(t, stepDone)
+	m.hasRemote = true
+	m.amendMode = true
+	m.amendPushed = true
+	m.historyRewritten = true
+	m.commitHash = "abc1234"
+
+	out := m.viewDone()
+	if strings.Contains(out, "git push --force-with-lease") {
+		t.Errorf("Done still tells the user to run the command by hand:\n%s", out)
+	}
+	if !strings.Contains(out, "p push now (force-with-lease)") {
+		t.Errorf("Done does not offer the in-app push:\n%s", out)
+	}
+
+	m, _ = key(t, m, "p")
+	if m.step != stepPush {
+		t.Fatalf("step = %v, want stepPush", m.step)
+	}
+	if !m.pushForce {
+		t.Fatal("the push screen did not come up in force mode after a rewrite")
+	}
+	if m.pushReturnToMenu {
+		t.Error("a push started from Done should return to Done")
+	}
+	if m.pushAhead != 1 || m.pushBehind != 1 {
+		t.Errorf("ahead=%d behind=%d, want the divergence the amend created", m.pushAhead, m.pushBehind)
+	}
+	// The lease is pinned to the commit the screen is describing. Leaving it to
+	// git's default would lease against the remote-tracking ref, which this app
+	// moves on its own every 30 seconds — see git.PushForceWithLease.
+	originTip := strings.TrimSpace(string(gitOut(t, "rev-parse", "refs/remotes/origin/main")))
+	if m.pushLeaseSHA == "" || m.pushLeaseSHA != originTip {
+		t.Errorf("pushLeaseSHA = %q, want origin's tip %q", m.pushLeaseSHA, originTip)
+	}
+
+	// And the force push itself clears the rewrite, so neither the menu nor a
+	// later push keeps offering one.
+	m.pushing = true
+	next, _ := m.Update(pushResultMsg{forced: true})
+	after := next.(Model)
+	if after.historyRewritten || after.pushForce {
+		t.Error("a completed force push left the rewrite state behind")
+	}
+	if after.step != stepDone {
+		t.Errorf("step = %v, want stepDone", after.step)
+	}
+	if _, ok := hasMenuItem(after, "Push"); ok && after.aheadOrigin == 0 && after.hasUpstream {
+		t.Error("the menu still offers a push after everything was pushed")
+	}
+}
+
+// A plain push rejected as non-fast-forward AFTER a rewrite is exactly what
+// force-with-lease exists for — the screen must offer it rather than ending the
+// session with advice about another program.
+func TestRejectedPushAfterARewriteOffersTheForce(t *testing.T) {
+	m := wizardModel(t, stepPush)
+	m.hasRemote = true
+	m.pushing = true
+	m.pushHasUpstream = true
+	m.historyRewritten = true
+	m.pushAhead, m.pushBehind = 1, 1
+
+	next, _ := m.Update(pushResultMsg{err: errors.New("! [rejected] main -> main (non-fast-forward)")})
+	out := next.(Model)
+	if !out.pushForce {
+		t.Fatal("the rejection did not open the force-with-lease path")
+	}
+	if out.step != stepPush {
+		t.Fatalf("step = %v, want stepPush", out.step)
+	}
+
+	// Without a rewrite the same rejection means origin has work we don't —
+	// the answer is a pull, and force must stay unreachable.
+	plain := wizardModel(t, stepPush)
+	plain.hasRemote = true
+	plain.pushing = true
+	plain.pushHasUpstream = true
+	plain.pushAhead, plain.pushBehind = 1, 1
+	next, _ = plain.Update(pushResultMsg{err: errors.New("! [rejected] main -> main (fetch first)")})
+	if next.(Model).pushForce {
+		t.Fatal("a plain rejection unlocked a force push")
+	}
+
+	// And a rejection cannot unlock a force the entry gate would have refused:
+	// origin has moved past the commit we rewrote.
+	moved := wizardModel(t, stepPush)
+	moved.hasRemote = true
+	moved.pushing = true
+	moved.pushHasUpstream = true
+	moved.historyRewritten = true
+	moved.pushAhead, moved.pushBehind = 1, 2
+	moved.rewriteBaseSHA = "aaaa111"
+	moved.pushLeaseSHA = "bbbb222" // somebody else pushed on top
+	next, _ = moved.Update(pushResultMsg{err: errors.New("! [rejected] main -> main (non-fast-forward)")})
+	if next.(Model).pushForce {
+		t.Fatal("a rejection unlocked a force that would delete somebody else's commit")
+	}
+}
+
+// The lease git is given is the commit we rewrote, not "whatever origin had
+// when the screen opened". They differ exactly when it matters: git-assist
+// fetches on its own every 30 seconds, and the default lease would quietly
+// come to expect the other person's commit.
+func TestForcePushLeasesAgainstTheRewrittenCommit(t *testing.T) {
+	m := Model{rewriteBaseSHA: "aaaa111", pushLeaseSHA: "bbbb222"}
+	if got := m.forceLeaseSHA(); got != "aaaa111" {
+		t.Errorf("forceLeaseSHA() = %q, want the rewritten commit", got)
+	}
+	// No recorded rewrite: fall back to what origin held on entry rather than
+	// leaving the lease off entirely.
+	m = Model{pushLeaseSHA: "bbbb222"}
+	if got := m.forceLeaseSHA(); got != "bbbb222" {
+		t.Errorf("forceLeaseSHA() = %q, want the entry reading", got)
+	}
+}
+
+// Withholding the force is only honest if the screen says why.
+func TestPushScreenExplainsAWithheldForce(t *testing.T) {
+	m := wizardModel(t, stepPush)
+	m.hasRemote = true
+	m.pushHasUpstream = true
+	m.historyRewritten = true
+	m.pushAhead, m.pushBehind = 1, 2
+	m.pushOutgoingTotal = 1
+	m.rewriteBaseSHA = "aaaa111"
+	m.pushLeaseSHA = "bbbb222"
+	m.pushForce = m.forcePushRequired()
+
+	if m.pushForce {
+		t.Fatal("force offered although origin moved past the rewritten commit")
+	}
+	out := m.viewPush()
+	if !strings.Contains(out, "Someone pushed on top of the commit you rewrote") {
+		t.Errorf("the screen does not say why the force is missing:\n%s", out)
+	}
+	if strings.Contains(out, "f force-push") {
+		t.Errorf("the help bar still offers the force:\n%s", out)
+	}
+}
+
+// The sync dialog used to print the raw command for the diverged case, for the
+// same reason Done did: there was no in-app path to point at.
+func TestSyncDialogPointsAtTheInAppForcePush(t *testing.T) {
+	m := wizardModel(t, stepSync)
+	m.syncDiverged = true
+	m.syncPullCurrent = true
+	m.syncAhead, m.syncCurrTotal = 1, 1
+	out := m.viewSync()
+	if strings.Contains(out, "git push --force-with-lease") {
+		t.Errorf("the dialog still prints a command to run elsewhere:\n%s", out)
+	}
+	if !strings.Contains(out, "Push from the menu") {
+		t.Errorf("the dialog does not point at the in-app path:\n%s", out)
 	}
 }

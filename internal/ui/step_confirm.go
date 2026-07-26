@@ -37,6 +37,10 @@ func (m *Model) enterConfirm() {
 		}
 		m.amendSHA = git.GetLastCommitHash()
 		m.amendPushed = git.IsLastCommitPushed()
+		// The full name of the commit about to be rewritten. If the amend
+		// lands, this is the commit origin is expected to still be holding —
+		// the lease, and the gate, for the force push that follows.
+		m.rewritePendingSHA = git.HeadSHA()
 	}
 	m.step = stepConfirm
 }
@@ -164,8 +168,9 @@ func (m Model) viewConfirm() string {
 	// next push will need --force-with-lease to update upstream, and
 	// surfacing that here avoids the "why is my push rejected" loop.
 	if m.amendMode && m.amendPushed {
-		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin. Amending will require:") + "\n")
-		b.WriteString("  " + modifiedStyle.Render("    git push --force-with-lease") + "\n\n")
+		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin. Amending rewrites it, so origin's copy") + "\n")
+		b.WriteString("  " + modifiedStyle.Render("    has to be replaced — git-assist offers that as a force-with-lease") + "\n")
+		b.WriteString("  " + modifiedStyle.Render("    on the next screen.") + "\n\n")
 	}
 
 	// Full commit message preview

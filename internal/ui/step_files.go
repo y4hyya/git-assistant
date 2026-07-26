@@ -520,6 +520,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// saying out loud before the soft reset.
 		m.undoPushed = git.IsLastCommitPushed()
 		m.undoSubject = git.GetLastCommitMessage()
+		// The commit origin will still be holding once this one is gone
+		// locally — the lease for any force push that follows the undo.
+		m.rewritePendingSHA = git.HeadSHA()
 	case "enter":
 		hasSelected := false
 		for _, f := range m.files {
@@ -1045,11 +1048,14 @@ func formatErrorCtx(err error, historyRewritten bool) string {
 		hint = "Go back and select at least one file."
 	case strings.Contains(msg, "CONFLICT"):
 		hint = "Resolve merge conflicts before committing."
+	// Before the "rejected" case on purpose: a refused lease says both, and
+	// only this branch has the right answer. The lease held origin to where our
+	// last fetch saw it, and it moved — someone else pushed.
+	case strings.Contains(msg, "stale info"):
+		hint = "Someone else pushed to origin since your last fetch, so the force was refused\n  and nothing was overwritten. Pull first (p on the menu), then push again."
 	case strings.Contains(msg, "rejected"), strings.Contains(msg, "non-fast-forward"):
 		if historyRewritten {
-			// Two lines on purpose: one long line wraps mid-command inside the
-			// box, and a wrapped `git push --force-with-lease` is not copyable.
-			hint = "You rewrote a pushed commit (amend/undo) — origin still has the old one.\n  Update it with: git push --force-with-lease"
+			hint = "You rewrote a pushed commit (amend/undo) — origin still has the old one.\n  Press f to replace it with a force-with-lease (the safe force)."
 		} else {
 			hint = "Remote has newer changes. Run git pull first."
 		}
@@ -1106,7 +1112,7 @@ func (m Model) progressPlan() (names []string, idx int) {
 		{name: "Type", steps: []step{stepType, stepCustom}, skip: m.amendRaw},
 		{name: "Message", steps: []step{stepMessage}},
 		{name: "Confirm", steps: []step{stepConfirm}},
-		{name: "Push", steps: []step{stepPush}, skip: m.amendMode || !m.hasRemote},
+		{name: "Push", steps: []step{stepPush}, skip: !m.hasRemote || m.amendSkipsPush()},
 	}
 	idx = -1
 	for _, e := range entries {
@@ -1126,6 +1132,18 @@ func (m Model) progressPlan() (names []string, idx int) {
 		idx = len(names)
 	}
 	return names, idx
+}
+
+// amendSkipsPush reports whether the breadcrumb should leave Push out of an
+// amend run. Amends route straight to Done, so listing a step the wizard will
+// never visit is a promise it does not keep — but the Done screen's `p` key can
+// still take the user there, and from that point on the step is part of this
+// run and has to appear.
+func (m Model) amendSkipsPush() bool {
+	if !m.amendMode {
+		return false
+	}
+	return m.step != stepPush && !m.pushed && !m.pushFailed
 }
 
 func (m Model) renderProgress() string {

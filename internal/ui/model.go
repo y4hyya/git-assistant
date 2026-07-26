@@ -48,7 +48,13 @@ type commitResultMsg struct {
 	hash  string
 	stats string
 }
-type pushResultMsg struct{ err error }
+type pushResultMsg struct {
+	err error
+	// forced records which push ran. The result note and the historyRewritten
+	// bookkeeping differ between the two, and reading it off a model field the
+	// push screen may have changed since dispatch is how those drift apart.
+	forced bool
+}
 type undoResultMsg struct {
 	err   error
 	files []types.FileEntry
@@ -270,20 +276,48 @@ type Model struct {
 	undoSubject string
 
 	// Step 4 — push
-	branches   []string
-	branchIdx  int
 	hasRemote  bool
 	pushBranch string
 	// pushCheckDone marks the pre-push behind-origin check as already run for
 	// this visit to the push step. Without it the check re-fires on every
 	// enter and declining the offered pull makes pushing unreachable.
 	pushCheckDone bool
+	// The push screen's whole picture, read once by enterPush. It used to be a
+	// branch PICKER — every entry of which pushed the current commits onto some
+	// other branch's remote ref — with no statement anywhere of what the push
+	// would actually send.
+	pushOutgoing      []string // subjects origin/<branch> does not have yet
+	pushOutgoingTotal int      // true size of that set; the sample is capped
+	pushHasUpstream   bool     // false ⇒ this is a publish, and needs -u
+	pushAhead         int      // commits we have that origin does not
+	pushBehind        int      // commits origin has that we do not
+	// pushForce turns the screen into a force-with-lease confirmation. Only
+	// ever set through forcePushRequired, which gates on historyRewritten:
+	// offering a force to a branch that is merely behind deletes the commits it
+	// is behind by.
+	pushForce bool
+	// pushLeaseSHA is the commit origin held when this screen was built — the
+	// explicit lease handed to git, so a background fetch cannot widen the
+	// permission the user actually gave.
+	pushLeaseSHA string
+	// pushReturnToMenu records that this visit was started from the dashboard
+	// rather than by finishing a commit. Those two want different exits: the
+	// wizard has a Done screen to summarize, the menu has a status note.
+	pushReturnToMenu bool
 	// pushFailed/pushErr remember a push that was attempted and did not work.
 	// m.err is wiped by the next keypress, so without these the Done screen
 	// reported a failed push as the neutral "Push skipped" — indistinguishable
 	// from deliberately declining, with the reason gone.
 	pushFailed bool
 	pushErr    error
+	// rewriteBaseSHA is the commit the rewrite replaced — the one origin is
+	// expected to be holding. It is both the gate and the lease for the force
+	// push: if origin's tip is anything else, somebody pushed on top of the
+	// commit we rewrote and a force would delete their work. Set only when a
+	// rewrite actually lands; rewritePendingSHA is the reading taken before the
+	// operation runs, promoted here on success.
+	rewriteBaseSHA    string
+	rewritePendingSHA string
 	// historyRewritten records that this session amended or undid a commit that
 	// was already on origin. The next push is then rejected as non-fast-forward,
 	// and the stock "run git pull first" hint is the one piece of advice that
@@ -353,6 +387,12 @@ type Model struct {
 	aheadBehind  string
 	behindMain   int
 	behindOrigin int
+	// aheadOrigin/hasUpstream come from the same GetAheadBehind reading as
+	// behindOrigin. The dashboard needs all three to decide whether Push is
+	// worth offering and which of its three meanings applies (send commits,
+	// publish a branch, replace a rewritten one).
+	aheadOrigin int
+	hasUpstream bool
 	// mainName/mainRef come from the same resolution behindMain was measured
 	// with, so the badge, the "s" shortcut's visibility and the ref it merges
 	// can never disagree about what "main" is.
@@ -410,10 +450,14 @@ type Model struct {
 	forceQuitArmed bool
 
 	// Init flow (first-run setup when cwd is not a git repo)
-	initPhase            initPhase
-	initCursor           int
-	initTemplateOptions  []git.GitignoreTemplate
-	initTemplateCursor   int
+	initPhase           initPhase
+	initCursor          int
+	initTemplateOptions []git.GitignoreTemplate
+	initTemplateCursor  int
+	// initDetectedTemplate is the auto-detected template name, read once by
+	// setupInitModel. The picker's label used to re-derive it from an
+	// os.ReadDir inside its View func.
+	initDetectedTemplate string
 	initURLInput         textinput.Model
 	initNameInput        textinput.Model
 	initRemoteURL        string
@@ -562,7 +606,9 @@ type dashboardSnapshot struct {
 	branch       string // the branch it was computed for; a switch invalidates it
 	graph        string
 	aheadBehind  string
+	aheadOrigin  int
 	behindOrigin int
+	hasUpstream  bool
 	behindMain   int
 	mainName     string
 	mainRef      string
@@ -581,7 +627,9 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 	snap.graph = git.GetUnifiedGraph(15)
 	a, b, up := git.GetAheadBehind(branch)
 	snap.aheadBehind = formatAheadBehind(a, b, up)
+	snap.aheadOrigin = a
 	snap.behindOrigin = b
+	snap.hasUpstream = up
 	main := git.ResolveMainSync(branch)
 	snap.behindMain = main.Behind
 	snap.mainName = main.Name
@@ -607,7 +655,9 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.localGraph = s.graph
 	m.aheadBehind = s.aheadBehind
+	m.aheadOrigin = s.aheadOrigin
 	m.behindOrigin = s.behindOrigin
+	m.hasUpstream = s.hasUpstream
 	m.behindMain = s.behindMain
 	m.mainName = s.mainName
 	m.mainRef = s.mainRef
@@ -679,6 +729,11 @@ func (m *Model) resetWizard() {
 	m.amendMode = false
 	m.amendRaw = false
 	m.amendStaged = nil
+	// The amend screens' cached view of the commit being rewritten. Left set,
+	// amendPushed outlived the amend that read it and told the NEXT push it was
+	// dealing with a rewritten commit.
+	m.amendSHA = ""
+	m.amendPushed = false
 	m.typeIdx = 0
 	m.commitType = ""
 	m.scope = ""
@@ -687,10 +742,17 @@ func (m *Model) resetWizard() {
 	m.bodyFocused = false
 	m.pushed = false
 	m.pushBranch = ""
-	m.branchIdx = 0
 	m.pushCheckDone = false
 	m.pushFailed = false
 	m.pushErr = nil
+	m.pushOutgoing = nil
+	m.pushOutgoingTotal = 0
+	m.pushHasUpstream = false
+	m.pushAhead = 0
+	m.pushBehind = 0
+	m.pushForce = false
+	m.pushLeaseSHA = ""
+	m.pushReturnToMenu = false
 	m.gitignoreCached = nil
 	m.confirmScroll = 0
 	m.commitHash = ""
@@ -955,6 +1017,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// instead of the "run git pull first" advice that would restore it.
 		if wasPushed {
 			m.historyRewritten = true
+			m.rewriteBaseSHA = m.rewritePendingSHA
 		}
 		// The commit the wizard was pointed at no longer exists. Staying
 		// latched in amendMode would make the next confirm rewrite the
@@ -1061,6 +1124,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// See historyRewritten: the push it makes fail needs different advice.
 		if m.amendMode && m.amendPushed {
 			m.historyRewritten = true
+			m.rewriteBaseSHA = m.rewritePendingSHA
 		}
 		refresh := m.requestDashboardRefresh()
 		// Amends route straight to Done — auto-routing to push after an
@@ -1072,16 +1136,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, refresh
 		}
 		if m.hasRemote {
-			m.branches = git.GetBranches(m.branch)
-			// The picker selection is per-wizard-run: a stale index from an
-			// earlier run would preselect (and push to) the wrong branch, or
-			// point past the end of a list that shrank after a prune.
-			// GetBranches puts the current branch first.
-			m.branchIdx = 0
-			// Fresh visit to the push step: the behind-origin check gets one
-			// shot, so declining the offered pull still leaves push reachable.
-			m.pushCheckDone = false
-			m.step = stepPush
+			// enterPush reads what this push would send — there is no branch to
+			// choose any more, so the screen's job is to say what happens.
+			m.enterPush(false)
 		} else {
 			m.step = stepDone
 		}
@@ -1091,22 +1148,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushing = false
 		m.startResult()
 		if msg.err != nil {
-			// Stay on the push step so the user can retry or pick another
-			// branch, and remember the failure: m.err is gone on the next
-			// keypress, but the Done screen still has to tell the truth about
-			// what happened here.
+			// Stay on the push step so the user can retry, and remember the
+			// failure: m.err is gone on the next keypress, but the Done screen
+			// still has to tell the truth about what happened here.
 			m.err = msg.err
 			m.pushFailed = true
 			m.pushErr = msg.err
+			// A plain push rejected as non-fast-forward AFTER this session
+			// rewrote a pushed commit is precisely what force-with-lease is
+			// for. Offer it right here instead of ending the session in a
+			// terminal — through the same gate as the entry path, so a
+			// rejection can never unlock a force the screen would have refused.
+			if !msg.forced && isNonFastForward(msg.err) && m.forcePushRequired() {
+				m.pushForce = true
+			}
 			return m, nil
 		}
 		m.pushed = true
 		m.pushFailed = false
 		m.pushErr = nil
-		// Whatever the local history looked like, origin has it now.
+		published := !m.pushHasUpstream
+		// Whatever the local history looked like, origin has it now. This is
+		// also what clears the dashboard's "force required" Push entry.
 		m.historyRewritten = false
-		m.step = stepDone
-		return m, m.requestDashboardRefresh()
+		m.pushForce = false
+		// The branch tracks origin from here on, whichever push did it.
+		m.pushHasUpstream = true
+		if !m.pushReturnToMenu {
+			m.step = stepDone
+			return m, m.requestDashboardRefresh()
+		}
+		// Started from the dashboard: there is no commit summary to show, so
+		// the result has to be said in the one line the menu renders.
+		switch {
+		case published:
+			m.setStatusNote("Published branch %s to origin", m.branch)
+		case msg.forced:
+			m.setStatusNote("Force-pushed %s to origin/%s — origin's copy was replaced",
+				plural(m.pushOutgoingTotal, "commit", "commits"), m.branch)
+		default:
+			m.setStatusNote("Pushed %s to origin/%s",
+				plural(m.pushOutgoingTotal, "commit", "commits"), m.branch)
+		}
+		// returnToMenu re-reads the dashboard, so ahead/behind and the Push
+		// entry itself reflect the push that just landed.
+		return m, m.returnToMenu()
 
 	case branchSwitchResultMsg:
 		m.branchSwitching = false

@@ -11,6 +11,15 @@ import (
 func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
+		case "p":
+			// The push that did not happen — skipped, failed, or made into a
+			// force-with-lease by an amend. This screen used to print the git
+			// command for that last case and send the user to a terminal.
+			if !m.canPushFromDone() {
+				return m, nil
+			}
+			m.enterPush(false)
+			return m, nil
 		case "enter", "esc":
 			m.menuCursor = 0
 			m.committing = false
@@ -76,15 +85,15 @@ func (m Model) viewDone() string {
 			reason = firstLine(m.pushErr.Error())
 		}
 		b.WriteString("  " + errorStyle.Render(symWarn+" Push failed — "+reason) + "\n")
-		b.WriteString("  " + dimStyle.Render("The commit is safe locally. Try Push again from the menu.") + "\n")
+		b.WriteString("  " + dimStyle.Render("The commit is safe locally — press p to try again.") + "\n")
 	case m.amendMode && m.amendPushed:
-		// The amend flow never pushes: the rewritten commit is already on
-		// origin, so the only correct push is a force-with-lease the user runs
-		// deliberately. Say that instead of "Push skipped".
-		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin — update it with:") + "\n")
-		b.WriteString("  " + modifiedStyle.Render("    git push --force-with-lease") + "\n")
+		// The rewritten commit is already on origin, so the only push that can
+		// land is a force-with-lease. This used to print that command for the
+		// user to run in a terminal; now it is a keypress away.
+		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin — its copy there is now out of date") + "\n")
+		b.WriteString("  " + dimStyle.Render("    press p to replace it with force-with-lease (the safe force)") + "\n")
 	case m.amendMode && m.hasRemote:
-		b.WriteString("  " + dimStyle.Render(symSkip+" Amended locally — push when you're ready") + "\n")
+		b.WriteString("  " + dimStyle.Render(symSkip+" Amended locally — press p to push when you're ready") + "\n")
 	case m.hasRemote:
 		b.WriteString("  " + dimStyle.Render(symSkip+" Push skipped — the commit is local only") + "\n")
 	}
@@ -97,12 +106,29 @@ func (m Model) viewDone() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter/esc", "menu"},
-		{"q", "quit"},
-	}))
+	entries := []helpEntry{}
+	if m.canPushFromDone() {
+		label := "push now"
+		if m.amendMode && m.amendPushed {
+			label = "push now (force-with-lease)"
+		}
+		entries = append(entries, helpEntry{"p", label})
+	}
+	entries = append(entries,
+		helpEntry{"enter/esc", "menu"},
+		helpEntry{"q", "quit"},
+	)
+	b.WriteString(renderHelp(entries))
 
 	return m.styledBox(b.String())
+}
+
+// canPushFromDone reports whether this screen can still push what it is
+// summarizing. Everything that reaches Done without a push — an amend, a skip,
+// a failure — leaves the commit sitting locally, and the only way to send it
+// used to be quitting the app.
+func (m Model) canPushFromDone() bool {
+	return m.hasRemote && !m.pushed
 }
 
 // firstLine trims an error down to its first line for the one-line summary on

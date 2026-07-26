@@ -534,11 +534,6 @@ func TestBranchListingsIgnoreNonOriginRemotes(t *testing.T) {
 	runGit(t, "push", "-q", "origin", "main:main")
 	runGit(t, "push", "-q", "upstream", "main:release")
 
-	for _, b := range GetBranches("main") {
-		if b == "release" || strings.HasPrefix(b, "upstream/") {
-			t.Errorf("GetBranches() leaked a non-origin branch: %q (all: %v)", b, GetBranches("main"))
-		}
-	}
 	for _, e := range GetAllBranches() {
 		if e.Name == "release" || strings.HasPrefix(e.Name, "upstream/") {
 			t.Errorf("GetAllBranches() leaked a non-origin branch: %q", e.Name)
@@ -833,6 +828,258 @@ func TestCountIncomingCommits(t *testing.T) {
 	// The count is the whole set; GetIncomingCommits only samples it.
 	if sample := GetIncomingCommits("main", "ahead", 2); len(sample) != 2 {
 		t.Errorf("GetIncomingCommits(limit 2) returned %d subjects", len(sample))
+	}
+}
+
+// ── Push ───────────────────────────────────────────────
+
+// bareOrigin creates a bare repository, wires it up as `origin`, and returns
+// its path. Real refs, real rejections, no network.
+func bareOrigin(t *testing.T) string {
+	t.Helper()
+	origin := t.TempDir()
+	runGit(t, "init", "-q", "--bare", origin)
+	runGit(t, "remote", "add", "origin", origin)
+	return origin
+}
+
+// rev resolves a ref in the repo at dir ("" for the current one).
+func rev(t *testing.T, dir, ref string) string {
+	t.Helper()
+	if dir == "" {
+		return strings.TrimSpace(runGit(t, "rev-parse", ref))
+	}
+	return strings.TrimSpace(runGit(t, "-C", dir, "rev-parse", ref))
+}
+
+// The first push has to set tracking up (-u), or every later ahead/behind
+// reading on the branch answers "no upstream".
+func TestPushPublishesAndTracksTheCurrentBranch(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "init")
+	origin := bareOrigin(t)
+
+	if HasUpstream("main") {
+		t.Fatal("a never-pushed branch reports an upstream")
+	}
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+	if !HasUpstream("main") {
+		t.Error("the first push did not set tracking — -u was not applied")
+	}
+	if got, want := rev(t, origin, "main"), rev(t, "", "main"); got != want {
+		t.Errorf("origin/main = %s, want %s", got, want)
+	}
+
+	// A second push has nothing to set up. It must still work — and must not
+	// re-declare the upstream it already has.
+	write(t, "a.txt", "aa\n")
+	commitAll(t, "second")
+	if err := Push("main"); err != nil {
+		t.Fatalf("second Push(main): %v", err)
+	}
+	if got, want := rev(t, origin, "main"), rev(t, "", "main"); got != want {
+		t.Errorf("after the second push origin/main = %s, want %s", got, want)
+	}
+}
+
+// The landmine the old two-argument Push carried: with a target that was not
+// the current branch it pushed `HEAD:<target>`, i.e. the commits you are
+// standing on onto somebody else's branch. Push takes one branch now, and that
+// branch is both the source and the destination.
+func TestPushOnlyEverMovesItsOwnBranch(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "init")
+	origin := bareOrigin(t)
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+	mainBefore := rev(t, origin, "main")
+
+	runGit(t, "checkout", "-q", "-b", "feat")
+	write(t, "b.txt", "b\n")
+	commitAll(t, "feat work")
+	if err := Push("feat"); err != nil {
+		t.Fatalf("Push(feat): %v", err)
+	}
+
+	if got, want := rev(t, origin, "feat"), rev(t, "", "feat"); got != want {
+		t.Errorf("origin/feat = %s, want %s", got, want)
+	}
+	if got := rev(t, origin, "main"); got != mainBefore {
+		t.Errorf("pushing feat moved origin/main to %s (was %s)", got, mainBefore)
+	}
+}
+
+func TestPushRejectsAnEmptyBranch(t *testing.T) {
+	scratchRepo(t)
+	if err := Push(""); err == nil {
+		t.Error("Push(\"\") succeeded — git would have pushed the default refspec")
+	}
+	if err := PushForceWithLease("", ""); err == nil {
+		t.Error("PushForceWithLease(\"\") succeeded")
+	}
+}
+
+// The amend loop, end to end: rewrite a commit origin already has, watch the
+// plain push bounce, then replace origin's copy with the lease held.
+func TestPushForceWithLeaseReplacesARewrittenCommit(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "original")
+	origin := bareOrigin(t)
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+
+	lease := RemoteTrackingSHA("main")
+	if lease == "" {
+		t.Fatal("RemoteTrackingSHA(main) is empty right after a push")
+	}
+	write(t, "a.txt", "amended\n")
+	runGit(t, "add", "-A")
+	runGit(t, "commit", "-q", "--amend", "-m", "rewritten")
+
+	if err := Push("main"); err == nil {
+		t.Fatal("a plain push of a rewritten commit succeeded — the remote was overwritten")
+	}
+	if err := PushForceWithLease("main", lease); err != nil {
+		t.Fatalf("PushForceWithLease(main): %v", err)
+	}
+	if got, want := rev(t, origin, "main"), rev(t, "", "main"); got != want {
+		t.Errorf("origin/main = %s, want %s", got, want)
+	}
+	if subj := strings.TrimSpace(runGit(t, "-C", origin, "log", "-1", "--format=%s", "main")); subj != "rewritten" {
+		t.Errorf("origin's subject = %q, want %q", subj, "rewritten")
+	}
+}
+
+// The lease is the whole point: if someone else pushed since we were shown what
+// we would be replacing, git must refuse and leave their commit alone.
+//
+// The fetch in the middle is not incidental — it is the reason the lease is
+// pinned to an explicit SHA. git-assist fetches at startup and every 30
+// seconds, and a bare --force-with-lease leases against the remote-tracking ref
+// that fetch updates: with the default lease this exact sequence DELETES their
+// commit, while the screen promises it cannot.
+func TestPushForceWithLeaseRefusesWhenOriginMoved(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "original")
+	origin := bareOrigin(t)
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+	// What the user is shown, and therefore what they consent to replace.
+	lease := RemoteTrackingSHA("main")
+
+	// Someone else clones, commits and pushes.
+	other := filepath.Join(t.TempDir(), "other")
+	runGit(t, "clone", "-q", origin, other)
+	runGit(t, "-C", other, "config", "user.name", "someone else")
+	runGit(t, "-C", other, "config", "user.email", "else@example.invalid")
+	if err := os.WriteFile(filepath.Join(other, "theirs.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "-C", other, "add", "-A")
+	runGit(t, "-C", other, "commit", "-q", "-m", "their work")
+	runGit(t, "-C", other, "push", "-q", "origin", "main")
+	theirs := rev(t, origin, "main")
+
+	// Meanwhile we rewrite our copy of the shared commit — and the background
+	// fetch lands, moving the ref a default lease would have trusted.
+	write(t, "a.txt", "amended\n")
+	runGit(t, "add", "-A")
+	runGit(t, "commit", "-q", "--amend", "-m", "rewritten")
+	if err := Fetch(); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	err := PushForceWithLease("main", lease)
+	if err == nil {
+		t.Fatal("force-with-lease overwrote a commit it had never seen")
+	}
+	if !strings.Contains(err.Error(), "stale info") {
+		t.Errorf("error = %q, want git's 'stale info' wording (the UI hint keys off it)", err)
+	}
+	if got := rev(t, origin, "main"); got != theirs {
+		t.Errorf("origin/main = %s, want %s — their commit was destroyed", got, theirs)
+	}
+}
+
+// Amending a commit in a fresh clone is a legitimate rewrite: nothing else has
+// moved, and the lease must not stand in the way. (git's --force-if-includes,
+// the other candidate fix for the fetch hole above, rejects exactly this.)
+func TestPushForceWithLeaseAllowsARewriteInAFreshClone(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "original")
+	origin := bareOrigin(t)
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	runGit(t, "clone", "-q", origin, clone)
+	t.Chdir(clone)
+	runGit(t, "config", "user.name", "git-assist test")
+	runGit(t, "config", "user.email", "test@example.invalid")
+	runGit(t, "config", "commit.gpgsign", "false")
+
+	lease := RemoteTrackingSHA("main")
+	runGit(t, "commit", "-q", "--amend", "-m", "rewritten in a clone")
+	if err := PushForceWithLease("main", lease); err != nil {
+		t.Fatalf("PushForceWithLease in a fresh clone: %v", err)
+	}
+	if subj := strings.TrimSpace(runGit(t, "-C", origin, "log", "-1", "--format=%s", "main")); subj != "rewritten in a clone" {
+		t.Errorf("origin's subject = %q, want the rewrite", subj)
+	}
+}
+
+// ── Outgoing commits ───────────────────────────────────
+
+func TestOutgoingCommits(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "one")
+	bareOrigin(t)
+	if err := Push("main"); err != nil {
+		t.Fatalf("Push(main): %v", err)
+	}
+
+	if got := CountOutgoingCommits("main"); got != 0 {
+		t.Errorf("CountOutgoingCommits right after a push = %d, want 0", got)
+	}
+	for _, s := range []string{"two", "three"} {
+		write(t, s+".txt", s+"\n")
+		commitAll(t, s)
+	}
+	if got := CountOutgoingCommits("main"); got != 2 {
+		t.Errorf("CountOutgoingCommits(main) = %d, want 2", got)
+	}
+	// Newest first, and the sample is capped — the caller pairs it with the
+	// count so the screen can say what it is not showing.
+	sample := GetOutgoingCommits("main", 1)
+	if len(sample) != 1 || sample[0] != "three" {
+		t.Errorf("GetOutgoingCommits(main, 1) = %v, want [three]", sample)
+	}
+	// A branch origin has never heard of: nothing to compare, and no error to
+	// leak into the screen.
+	runGit(t, "checkout", "-q", "-b", "unpublished")
+	if got := CountOutgoingCommits("unpublished"); got != 0 {
+		t.Errorf("CountOutgoingCommits on an unpublished branch = %d, want 0", got)
+	}
+	if got := GetOutgoingCommits("unpublished", 5); got != nil {
+		t.Errorf("GetOutgoingCommits on an unpublished branch = %v, want nil", got)
+	}
+	if got := CountOutgoingCommits(""); got != 0 {
+		t.Errorf("CountOutgoingCommits(\"\") = %d, want 0", got)
+	}
+	if HasUpstream("unpublished") {
+		t.Error("a branch created locally reports an upstream")
 	}
 }
 

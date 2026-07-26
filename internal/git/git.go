@@ -303,35 +303,6 @@ func parseStatusZ(data string) []types.FileEntry {
 	return files
 }
 
-// GetBranches returns available branches for pushing.
-// The current branch is always listed first.
-func GetBranches(currentBranch string) []string {
-	branches := []string{currentBranch}
-
-	out, err := exec.Command("git", "branch", "-r").Output()
-	if err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			branch := strings.TrimSpace(line)
-			if branch == "" || strings.Contains(branch, "->") {
-				continue
-			}
-			// Only origin is addressable: every push/checkout built from this
-			// list hardcodes `origin`, so an `upstream/main` entry would turn
-			// into `git push origin HEAD:upstream/main` and create a junk
-			// branch on the user's own remote.
-			if !strings.HasPrefix(branch, "origin/") {
-				continue
-			}
-			branch = strings.TrimPrefix(branch, "origin/")
-			if branch != currentBranch {
-				branches = append(branches, branch)
-			}
-		}
-	}
-
-	return branches
-}
-
 // HasRemote checks if any remote is configured.
 func HasRemote() bool {
 	out, err := exec.Command("git", "remote").Output()
@@ -426,6 +397,17 @@ func Commit(files []types.FileEntry, cachedPaths []string, message string) error
 // GetLastCommitHash returns the short hash of the last commit.
 func GetLastCommitHash() string {
 	out, err := exec.Command("git", "log", "-1", "--format=%h").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// HeadSHA returns the full object name of HEAD, or "" when there is none.
+// Read before a rewrite (amend, undo) so callers can remember exactly which
+// commit origin is expected to be holding — see PushForceWithLease.
+func HeadSHA() string {
+	out, err := exec.Command("git", "rev-parse", "--verify", "--quiet", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
@@ -530,20 +512,136 @@ func UndoLastCommit() error {
 	return nil
 }
 
-// Push pushes to the specified remote branch.
-func Push(currentBranch, targetBranch string) error {
-	var args []string
-	if currentBranch == targetBranch {
-		args = []string{"push", "-u", "origin", targetBranch}
-	} else {
-		args = []string{"push", "origin", "HEAD:" + targetBranch}
+// Push publishes the given branch to origin/<branch>.
+//
+// One branch, one destination: the branch you are on goes to the remote branch
+// of the same name. The old two-argument form built `HEAD:<target>` when the
+// picker's selection differed from the checked-out branch, which pushed the
+// CURRENT commits onto some other branch's remote ref — a rename, a
+// force-in-disguise or a junk branch, depending on what the two sides held, and
+// nothing on screen said so.
+//
+// -u only when the branch tracks nothing yet. Passing it on every push
+// re-declares an upstream the branch already has: harmless, but git answers
+// with a "set up to track" line that reads like something changed.
+func Push(branch string) error {
+	if branch == "" {
+		return errors.New("no branch to push")
 	}
+	args := []string{"push"}
+	if !HasUpstream(branch) {
+		args = append(args, "-u")
+	}
+	args = append(args, "origin", branch)
 
 	out, err := runNetwork("git", args...)
 	if err != nil {
 		return netFail("", out, err)
 	}
 	return nil
+}
+
+// PushForceWithLease replaces origin/<branch> with the local branch, but only
+// if origin still points at expect. That "lease" is the difference between this
+// and --force: if anyone else pushed in the meantime, git refuses (with "stale
+// info") instead of deleting their commits.
+//
+// expect is spelled out — `--force-with-lease=<branch>:<sha>` — rather than
+// left to git's default, and that is the whole safety story here. Bare
+// --force-with-lease leases against the local remote-tracking ref, which THIS
+// APP moves on its own: git-assist fetches at startup and every 30 seconds. A
+// fetch that lands between the rewrite and the push quietly teaches the lease
+// that the other person's commit is expected, and the force then deletes it —
+// verified, not theorised. Pinning the SHA the user was shown makes the promise
+// on screen ("only if nobody else pushed meanwhile") the one git enforces.
+//
+// An empty expect falls back to the default lease: `=<branch>:` means "expect
+// this ref not to exist", which would be a very different (and destructive)
+// request.
+//
+// The one legitimate caller is a local history rewrite — an amend or an undo of
+// a commit origin already has. Callers must gate on that; a branch that is
+// merely behind needs a pull, and force-pushing it destroys the commits it was
+// behind by.
+func PushForceWithLease(branch, expect string) error {
+	if branch == "" {
+		return errors.New("no branch to push")
+	}
+	lease := "--force-with-lease"
+	if expect != "" {
+		lease += "=" + branch + ":" + expect
+	}
+	out, err := runNetwork("git", "push", lease, "origin", branch)
+	if err != nil {
+		return netFail("", out, err)
+	}
+	return nil
+}
+
+// RemoteTrackingSHA returns the commit origin/<branch> currently points at, as
+// this repository last saw it. Empty when there is no such remote-tracking ref.
+// Read at the moment the user is shown what a force push would replace, and
+// handed back to PushForceWithLease as the lease.
+func RemoteTrackingSHA(branch string) string {
+	if branch == "" {
+		return ""
+	}
+	out, err := exec.Command("git", "rev-parse", "--verify", "--quiet",
+		"refs/remotes/origin/"+branch).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// upstreamRef returns the remote-tracking branch `branch` follows
+// ("origin/main"), and whether it tracks anything at all. Never-pushed branches
+// and branches whose upstream was pruned both report false.
+func upstreamRef(branch string) (string, bool) {
+	if branch == "" {
+		return "", false
+	}
+	out, err := exec.Command("git", "rev-parse", "--abbrev-ref",
+		branch+"@{upstream}").Output()
+	if err != nil {
+		return "", false
+	}
+	ref := strings.TrimSpace(string(out))
+	if ref == "" {
+		return "", false
+	}
+	return ref, true
+}
+
+// HasUpstream reports whether branch tracks a remote branch. A false here is
+// what turns a push into a publish: the first push has to set tracking up.
+func HasUpstream(branch string) bool {
+	_, ok := upstreamRef(branch)
+	return ok
+}
+
+// GetOutgoingCommits returns the subjects of commits the given branch has and
+// origin/<branch> does not — exactly what a push would send. The mirror image
+// of GetIncomingCommits, and the same sampling contract: at most limit
+// subjects, with CountOutgoingCommits for the true size.
+//
+// Measured against origin/<branch> rather than the configured upstream on
+// purpose: origin/<branch> is where Push sends them.
+func GetOutgoingCommits(branch string, limit int) []string {
+	if branch == "" {
+		return nil
+	}
+	return GetIncomingCommits("origin/"+branch, branch, limit)
+}
+
+// CountOutgoingCommits returns how many commits the push would send. 0 when
+// origin has no such branch yet (nothing to compare against) — the publish
+// case, which callers detect with HasUpstream.
+func CountOutgoingCommits(branch string) int {
+	if branch == "" {
+		return 0
+	}
+	return CountIncomingCommits("origin/"+branch, branch)
 }
 
 // ignoreKey normalizes a .gitignore line for duplicate detection so that
@@ -1083,16 +1181,8 @@ func GetUnifiedGraph(limit int) string {
 // or the tracking ref is gone) — callers must not render that case as 0/0,
 // which reads identically to a fully synced branch.
 func GetAheadBehind(branch string) (ahead, behind int, hasUpstream bool) {
-	if branch == "" {
-		return 0, 0, false
-	}
-	upOut, err := exec.Command("git", "rev-parse", "--abbrev-ref",
-		branch+"@{upstream}").Output()
-	if err != nil {
-		return 0, 0, false
-	}
-	upstream := strings.TrimSpace(string(upOut))
-	if upstream == "" {
+	upstream, ok := upstreamRef(branch)
+	if !ok {
 		return 0, 0, false
 	}
 

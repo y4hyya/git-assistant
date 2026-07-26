@@ -205,7 +205,7 @@ internal/
     step_type.go           Commit type picker
     step_message.go        Commit message input
     step_confirm.go        Confirmation
-    step_push.go           Push picker
+    step_push.go           Push confirm (outgoing commits, publish, force-with-lease)
     step_done.go           Done screen
 ```
 

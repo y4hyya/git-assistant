@@ -201,8 +201,8 @@ func (m Model) viewSync() string {
 		b.WriteString("  " + modifiedStyle.Render(fmt.Sprintf("%s diverged from origin (%d ahead / %d behind)",
 			symWarn, m.syncAhead, m.syncCurrTotal)) + "\n")
 		b.WriteString("  " + dimStyle.Render("Pulling will merge the old commits back in. If you rewrote history") + "\n")
-		b.WriteString("  " + dimStyle.Render("(amend or undo), you want a force-push instead:") + "\n")
-		b.WriteString("  " + helpKeyStyle.Render("git push --force-with-lease") + "\n\n")
+		b.WriteString("  " + dimStyle.Render("(amend or undo), skip this and open Push from the menu — it offers") + "\n")
+		b.WriteString("  " + dimStyle.Render("a force-with-lease, which replaces origin's copy safely.") + "\n\n")
 	}
 
 	// Pull current — commit list
