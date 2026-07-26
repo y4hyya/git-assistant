@@ -10,6 +10,7 @@ import (
 
 	"git-assist/internal/git"
 	"git-assist/internal/types"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -1037,27 +1038,33 @@ func TestMergeAutoStashesAndRestoresADirtyTree(t *testing.T) {
 	// The success note has to state what happened to the changes.
 	m := wizardModel(t, stepBranch)
 	next, _ := m.Update(msg)
-	if note := next.(Model).branchOpNote; !strings.Contains(note, "stashed and restored") {
+	if note := next.(Model).statusNote; !strings.Contains(note, "stashed and restored") {
 		t.Errorf("result note = %q, want the stash disclosed", note)
+	}
+	if out := next.(Model).viewBranch(); !strings.Contains(out, "stashed and restored") {
+		t.Errorf("the branch manager does not render the note:\n%s", out)
 	}
 }
 
-// The menu's sync shortcut merges from outside the branch manager, where
-// there is no note line — the stash round-trip still has to be stated, and
-// nothing may be parked on the model to resurface later.
+// The menu's sync shortcut merges from outside the branch manager. It used to
+// have no note line to render into and smuggled the stash disclosure out
+// through m.err; now both screens render the same one-shot note.
 func TestMergeStashNoteReachesTheMenuToo(t *testing.T) {
 	tempRepo(t, "chore: seed", "")
 	m := wizardModel(t, stepMenu)
 	next, _ := m.Update(branchMergeResultMsg{source: "origin/main", merged: true, stashRestored: true})
 	got := next.(Model)
-	if got.branchOpNote != "" {
-		t.Errorf("a stale branch-manager note was parked on the model: %q", got.branchOpNote)
+	if !strings.Contains(got.statusNote, "stashed and restored") {
+		t.Fatalf("the stash round-trip was not stated on the menu: %q", got.statusNote)
 	}
-	if got.err == nil || !strings.Contains(got.err.Error(), "stashed and restored") {
-		t.Fatalf("the stash round-trip was not stated on the menu: %v", got.err)
+	if !strings.Contains(got.statusNote, "Merged origin/main into") {
+		t.Errorf("note = %q, want the merge itself reported too", got.statusNote)
 	}
-	if !strings.HasPrefix(got.err.Error(), symWarn) {
-		t.Errorf("advisory note = %q, want the symWarn prefix so it renders as a note", got.err)
+	if got.err != nil {
+		t.Errorf("a successful merge still reports through the error banner: %v", got.err)
+	}
+	if out := got.viewMenu(); !strings.Contains(out, "stashed and restored") {
+		t.Errorf("the dashboard does not render the note:\n%s", out)
 	}
 }
 
@@ -1329,4 +1336,446 @@ func stashDepth(t *testing.T) int {
 		return 0
 	}
 	return len(strings.Split(trimmed, "\n"))
+}
+
+// ── Asynchronous dashboard refresh ─────────────────────
+
+func fullSnapshot(branch string) dashboardSnapshot {
+	return dashboardSnapshot{
+		branch:       branch,
+		graph:        "* feat: something",
+		aheadBehind:  "2 ahead",
+		behindOrigin: 2,
+		behindMain:   3,
+		mainName:     "main",
+		mainRef:      "origin/main",
+		branchCount:  4,
+		hasAnyCommit: true,
+		files:        []types.FileEntry{file("fresh.go")},
+		filesOK:      true,
+	}
+}
+
+func TestDashboardRefreshAppliesTheSnapshot(t *testing.T) {
+	m := Model{step: stepMenu, branch: "main", width: 120, height: 40, refreshing: true}
+	next, cmd := m.Update(dashboardRefreshMsg{snap: fullSnapshot("main")})
+	got := next.(Model)
+
+	if got.refreshing {
+		t.Error("the in-flight flag survived the result")
+	}
+	if cmd != nil {
+		t.Error("an unrequested follow-up refresh was dispatched")
+	}
+	if got.localGraph != "* feat: something" || got.aheadBehind != "2 ahead" {
+		t.Errorf("graph/chip not applied: %q / %q", got.localGraph, got.aheadBehind)
+	}
+	if got.behindOrigin != 2 || got.behindMain != 3 || got.branchCount != 4 || !got.hasAnyCommit {
+		t.Errorf("counters not applied: origin=%d main=%d branches=%d anyCommit=%v",
+			got.behindOrigin, got.behindMain, got.branchCount, got.hasAnyCommit)
+	}
+	if got.mainName != "main" || got.mainRef != "origin/main" {
+		t.Errorf("main resolution not applied: %q / %q", got.mainName, got.mainRef)
+	}
+	if len(got.files) != 1 || got.files[0].Path != "fresh.go" {
+		t.Errorf("the working tree was not applied on the dashboard: %v", got.files)
+	}
+}
+
+// A snapshot landing after the user has walked into the file selector must not
+// reset their cursor or drop their selections — the wizard re-reads status for
+// itself on the way in.
+func TestDashboardRefreshDoesNotClobberTheFileSelector(t *testing.T) {
+	sel := file("a.go")
+	sel.Selected = true
+	m := Model{step: stepFiles, branch: "main", files: []types.FileEntry{file("z.go"), sel}, cursor: 1, refreshing: true}
+
+	next, _ := m.Update(dashboardRefreshMsg{snap: fullSnapshot("main")})
+	got := next.(Model)
+	if len(got.files) != 2 || !got.files[1].Selected {
+		t.Fatalf("the selection was wiped by a background refresh: %v", got.files)
+	}
+	if got.cursor != 1 {
+		t.Errorf("cursor = %d, want 1 — the refresh moved it", got.cursor)
+	}
+	// The dashboard half still applies.
+	if got.behindMain != 3 {
+		t.Errorf("behindMain = %d, want 3", got.behindMain)
+	}
+}
+
+func TestDashboardRefreshDropsASnapshotFromAnotherBranch(t *testing.T) {
+	m := Model{step: stepMenu, branch: "feat", refreshing: true}
+	next, cmd := m.Update(dashboardRefreshMsg{snap: fullSnapshot("main")})
+	got := next.(Model)
+
+	if got.behindMain != 0 || got.branchCount != 0 {
+		t.Errorf("a snapshot taken for another branch was applied: main=%d branches=%d",
+			got.behindMain, got.branchCount)
+	}
+	if cmd == nil || !got.refreshing {
+		t.Error("no fresh reading was taken after the stale one was dropped")
+	}
+}
+
+// Two refreshes requested back to back must not run two fleets of git
+// processes; the second is remembered and dispatched when the first lands.
+func TestDashboardRefreshesCoalesce(t *testing.T) {
+	m := Model{step: stepMenu, branch: "main"}
+
+	first := m.requestDashboardRefresh()
+	if first == nil || !m.refreshing {
+		t.Fatal("the first refresh was not dispatched")
+	}
+	second := m.requestDashboardRefresh()
+	if second != nil {
+		t.Fatal("a second refresh was stacked on top of the in-flight one")
+	}
+	if !m.refreshPending {
+		t.Fatal("the coalesced request was dropped instead of remembered")
+	}
+
+	next, cmd := m.Update(dashboardRefreshMsg{snap: fullSnapshot("main")})
+	got := next.(Model)
+	if cmd == nil {
+		t.Fatal("the pending refresh was never dispatched")
+	}
+	if got.refreshPending {
+		t.Error("refreshPending stayed set — every later refresh would be swallowed")
+	}
+	if !got.refreshing {
+		t.Error("the re-dispatched refresh is not marked in flight")
+	}
+}
+
+// The centerpiece: returning to the menu must not fork git inside Update. The
+// sentinel values survive the call and only a command comes back.
+func TestReturnToMenuDefersTheGitWork(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepFiles, file("a.go"))
+	m.localGraph = "SENTINEL"
+	m.branchCount = 99
+	m.files = []types.FileEntry{file("stale.go")}
+
+	cmd := m.returnToMenu()
+	if cmd == nil {
+		t.Fatal("returnToMenu dispatched no refresh at all")
+	}
+	if m.step != stepMenu {
+		t.Fatalf("step = %v, want stepMenu", m.step)
+	}
+	if m.localGraph != "SENTINEL" || m.branchCount != 99 || m.files[0].Path != "stale.go" {
+		t.Fatal("returnToMenu still read git synchronously — the menu blocks on every return")
+	}
+	if !m.refreshing {
+		t.Error("the deferred refresh was not marked in flight")
+	}
+}
+
+// The snapshot the dashboard renders and the ref the "s" shortcut merges come
+// from the same resolution pass.
+func TestDashboardSnapshotAgreesWithTheSyncShortcut(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	remote := t.TempDir()
+	gitRun(t, "init", "-q", "--bare", remote)
+	gitRun(t, "remote", "add", "origin", remote)
+	gitRun(t, "push", "-q", "-u", "origin", "main")
+	gitRun(t, "branch", "feat")
+	writeFile(t, "a.txt", "a\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: a")
+	gitRun(t, "push", "-q", "origin", "main")
+	// Local main falls behind the commit it just pushed.
+	gitRun(t, "reset", "-q", "--hard", "HEAD~1")
+	gitRun(t, "checkout", "-q", "feat")
+
+	snap := readDashboard("feat", false)
+	if snap.behindMain != 1 {
+		t.Errorf("snapshot behindMain = %d, want 1", snap.behindMain)
+	}
+	if snap.mainRef != "origin/main" || snap.mainName != "main" {
+		t.Errorf("snapshot main = %q / %q, want main / origin/main", snap.mainName, snap.mainRef)
+	}
+
+	m := Model{step: stepMenu, branch: "feat", width: 120, height: 40}
+	m.applyDashboard(snap)
+	if !m.canSyncMain() {
+		t.Fatal("the badge is showing but the sync shortcut is gated off")
+	}
+	if out := m.viewMenu(); !strings.Contains(out, "1 behind main") {
+		t.Errorf("badge missing from the dashboard:\n%s", out)
+	}
+}
+
+func TestSyncShortcutNeedsAResolvedMainRef(t *testing.T) {
+	m := Model{step: stepMenu, width: 120, height: 40, behindMain: 2}
+	if m.canSyncMain() {
+		t.Fatal("a sync was offered with no ref to merge")
+	}
+	m, cmd := key(t, m, "s")
+	if cmd != nil || m.branchMerging {
+		t.Fatal("pressing s merged something with no main ref resolved")
+	}
+
+	m.mainRef = "origin/main"
+	m.behindMain = 2
+	m, cmd = key(t, m, "s")
+	if cmd == nil || !m.branchMerging {
+		t.Fatal("s did not start the sync when the ref was known")
+	}
+}
+
+// ── Status notes ───────────────────────────────────────
+
+func TestStatusNoteSurvivesNavigationAndClearsOnAnAction(t *testing.T) {
+	m := Model{step: stepMenu, width: 120, height: 40, statusNote: "Merged feat into main"}
+
+	if out := m.viewMenu(); !strings.Contains(out, "Merged feat into main") {
+		t.Fatalf("the note is not rendered on the dashboard:\n%s", out)
+	}
+
+	m, _ = key(t, m, "j")
+	if m.statusNote == "" {
+		t.Fatal("moving the cursor wiped the note")
+	}
+	m, _ = key(t, m, "down")
+	if m.statusNote == "" {
+		t.Fatal("an arrow key wiped the note")
+	}
+
+	m, _ = key(t, m, "s")
+	if m.statusNote != "" {
+		t.Fatal("the note survived a real action")
+	}
+}
+
+// The .gitignore apply lands back in the file selector, which has nowhere to
+// render a note. It has to keep until the dashboard can say what happened.
+func TestStatusNoteWaitsForAScreenThatShowsIt(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepFiles)
+	m.statusNote = "Updated .gitignore — 2 entries added"
+	for _, k := range []string{"j", "d", "esc"} {
+		m, _ = key(t, m, k)
+	}
+	if m.step != stepMenu {
+		t.Fatalf("step = %v, want stepMenu (esc left the file selector)", m.step)
+	}
+	if m.statusNote == "" {
+		t.Fatal("the note was cleared on a step that never displayed it")
+	}
+	if out := m.viewMenu(); !strings.Contains(out, "Updated .gitignore") {
+		t.Errorf("the dashboard never got to say what happened:\n%s", out)
+	}
+}
+
+// One note per operation: the newest result owns it.
+func TestANewResultDropsThePreviousNote(t *testing.T) {
+	m := Model{step: stepMenu, statusNote: "Undid the last commit"}
+	next, _ := m.Update(branchCreateResultMsg{newBranch: "feat"})
+	if got := next.(Model).statusNote; got != "" {
+		t.Errorf("a stale note survived the next operation: %q", got)
+	}
+}
+
+func TestBranchDeleteReportsSuccess(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepBranch)
+	m.branchDeleting = true
+
+	next, _ := m.Update(branchDeleteResultMsg{name: "old-ui"})
+	got := next.(Model)
+	if !strings.Contains(got.statusNote, "Deleted branch old-ui") {
+		t.Errorf("a silent delete: note = %q", got.statusNote)
+	}
+	if out := got.viewBranch(); !strings.Contains(out, "Deleted branch old-ui") {
+		t.Errorf("the branch manager does not render it:\n%s", out)
+	}
+}
+
+func TestPullSuccessSaysWhatArrived(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepSync)
+	m.pulling = true
+	m.syncCurrTotal = 3
+	m.syncReturnStep = stepMenu
+
+	next, _ := m.Update(pullResultMsg{kind: pullKindCurrent})
+	got := next.(Model)
+	if !strings.Contains(got.statusNote, "Pulled 3 commits from origin/main") {
+		t.Errorf("a silent pull: note = %q", got.statusNote)
+	}
+	if got.step != stepMenu {
+		t.Fatalf("step = %v, want stepMenu", got.step)
+	}
+	if out := got.viewMenu(); !strings.Contains(out, "Pulled 3 commits") {
+		t.Errorf("the dashboard does not render it:\n%s", out)
+	}
+}
+
+func TestGitignoreApplyReportsWhatChanged(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	ignored := file("secret.env")
+	ignored.Gitignored = true
+	m := wizardModel(t, stepFiles, ignored, file("keep.go"))
+	m.gitignoring = true
+	m.gitignoreMode = true
+	m.removeIgnored = map[string]bool{"dist/": true}
+	m.gitignoreCached = []string{"secret.env"}
+
+	next, _ := m.Update(gitignoreResultMsg{})
+	got := next.(Model).statusNote
+	for _, want := range []string{"Updated .gitignore", "1 entry added", "1 entry removed", "1 file untracked"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("note %q is missing %q", got, want)
+		}
+	}
+}
+
+func TestSwitchDisclosesTheAutoStash(t *testing.T) {
+	m := Model{step: stepBranch, branch: "main", width: 120, height: 40,
+		files: []types.FileEntry{file("a.go"), file("b.go"), file("c.go")}, branchSwitching: true}
+
+	next, _ := m.Update(branchSwitchResultMsg{newBranch: "feat", stashRef: "stash@{0}"})
+	got := next.(Model)
+	if !strings.Contains(got.statusNote, "Switched to feat") {
+		t.Fatalf("note = %q", got.statusNote)
+	}
+	if !strings.Contains(got.statusNote, "3 changed files stashed and restored") {
+		t.Errorf("the carried-over changes were not disclosed: %q", got.statusNote)
+	}
+
+	// A clean switch says so without inventing a stash.
+	clean := Model{step: stepBranch, branch: "main", branchSwitching: true}
+	next, _ = clean.Update(branchSwitchResultMsg{newBranch: "feat"})
+	if note := next.(Model).statusNote; strings.Contains(note, "stash") {
+		t.Errorf("a clean switch claimed a stash: %q", note)
+	}
+}
+
+// ── Fetch failure handling (M28) ───────────────────────
+
+func TestFailedFetchRetriesOnTheNextMenuReturn(t *testing.T) {
+	m := Model{step: stepMenu, hasRemote: true, fetching: true, syncDialogShown: true}
+
+	next, _ := m.Update(fetchResultMsg{err: errTest})
+	got := next.(Model)
+	if !got.lastFetch.IsZero() {
+		t.Fatal("a failed fetch started the debounce clock — the retry is suppressed for 30s")
+	}
+	if !got.fetchStale {
+		t.Fatal("the failure left no trace at all")
+	}
+	if cmd := got.maybeFetch(); cmd == nil {
+		t.Fatal("the retry was debounced away")
+	}
+
+	// A later success clears the marker and does start the clock.
+	got.fetching = true
+	next, _ = got.Update(fetchResultMsg{})
+	ok := next.(Model)
+	if ok.fetchStale {
+		t.Error("the stale marker survived a successful fetch")
+	}
+	if ok.lastFetch.IsZero() {
+		t.Error("a successful fetch did not start the debounce clock")
+	}
+}
+
+func TestMenuShowsAQuietStaleHint(t *testing.T) {
+	m := Model{step: stepMenu, width: 120, height: 40, branch: "main", hasRemote: true, fetchStale: true}
+	out := m.viewMenu()
+	if !strings.Contains(out, "offline") {
+		t.Errorf("the dashboard presents last-known refs as current:\n%s", out)
+	}
+
+	// While a fetch is running the spinner speaks for it.
+	m.fetching = true
+	if out := m.viewMenu(); strings.Contains(out, "offline") {
+		t.Errorf("the stale hint shows next to the syncing spinner:\n%s", out)
+	}
+}
+
+// ── Sync dialog gating ─────────────────────────────────
+
+func TestSyncDialogDoesNotOpenOverAnInFlightOperation(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepMenu)
+	m.hasRemote = true
+	m.fetching = true
+	m.branchMerging = true // the menu's "s" shortcut is already running
+
+	next, _ := m.Update(fetchResultMsg{})
+	got := next.(Model)
+	if got.step == stepSync {
+		t.Fatal("the dialog opened on top of an in-flight merge — two operations driving one repo")
+	}
+	if got.syncDialogShown {
+		t.Error("the once-per-session latch was burned while the dialog was suppressed")
+	}
+
+	// Once the merge is done the dialog is still available.
+	got.branchMerging = false
+	got.fetching = true
+	next, _ = got.Update(fetchResultMsg{})
+	if !next.(Model).syncDialogShown {
+		t.Error("the dialog never got its chance after the operation finished")
+	}
+}
+
+// ── Confirm screen reads git once, not per frame ───────
+
+func TestAmendConfirmUsesCachedGitState(t *testing.T) {
+	// Deliberately not a repository: anything the view forks would come back
+	// empty and the assertions below would fail.
+	t.Chdir(t.TempDir())
+	m := wizardModel(t, stepConfirm)
+	m.branch = "main"
+	m.amendMode = true
+	m.amendSHA = "deadbee"
+	m.amendPushed = true
+	m.msgInput.SetValue("fix: a thing")
+
+	out := m.viewConfirm()
+	if !strings.Contains(out, "deadbee") {
+		t.Errorf("the cached short SHA is not used:\n%s", out)
+	}
+	if !strings.Contains(out, "force-with-lease") {
+		t.Errorf("the cached pushed-state is not used:\n%s", out)
+	}
+}
+
+// ── Resize reaches every input ─────────────────────────
+
+func TestWindowResizeReachesTheEditorAndInitInputs(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepFiles)
+	m.editMode = true
+
+	// textarea reserves cells for its prompt, so compare against a reference
+	// sized the same way rather than against the raw numbers.
+	want := func(w, h int) (int, int) {
+		ref := textarea.New()
+		ref.SetWidth(editAreaWidth(w))
+		ref.SetHeight(editAreaHeight(h))
+		return ref.Width(), ref.Height()
+	}
+
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 60})
+	grown := next.(Model)
+	if w, h := want(200, 60); grown.editArea.Width() != w || grown.editArea.Height() != h {
+		t.Errorf("editor stayed at %dx%d after growing, want %dx%d",
+			grown.editArea.Width(), grown.editArea.Height(), w, h)
+	}
+
+	next, _ = grown.Update(tea.WindowSizeMsg{Width: 50, Height: 16})
+	shrunk := next.(Model)
+	if _, h := want(50, 16); shrunk.editArea.Height() != h {
+		t.Errorf("editor height = %d after shrinking, want %d — its bottom rows are clipped",
+			shrunk.editArea.Height(), h)
+	}
+	if shrunk.initURLInput.Width > 50 || shrunk.initNameInput.Width > 50 {
+		t.Errorf("init inputs still at their fixed width: %d / %d",
+			shrunk.initURLInput.Width, shrunk.initNameInput.Width)
+	}
 }

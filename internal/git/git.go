@@ -852,24 +852,117 @@ func WriteFileContent(path string, content string) error {
 	return nil
 }
 
-// GetBehindMain returns how many commits the given branch is behind main.
-// Tries local main/master first, then origin/main / origin/master so users
-// who clone fresh (no local main yet) still get the "behind" indicator.
-// Returns 0 if branch is main/master itself or if no candidate ref resolves.
-func GetBehindMain(branch string) int {
-	if branch == "main" || branch == "master" {
-		return 0
+// mainRefState records which of the four candidate "main" refs exist. One
+// for-each-ref answers all of them, so every caller that needs to know what
+// "main" means pays a single fork — the old probe loop spent up to four
+// *failing* rev-lists per call, on the UI thread, on repos that have neither.
+type mainRefState struct {
+	localMain, localMaster   bool
+	originMain, originMaster bool
+}
+
+func readMainRefs() mainRefState {
+	out, err := exec.Command("git", "for-each-ref", "--format=%(refname)",
+		"refs/heads/main", "refs/heads/master",
+		"refs/remotes/origin/main", "refs/remotes/origin/master").Output()
+	if err != nil {
+		return mainRefState{}
 	}
-	for _, ref := range []string{"main", "master", "origin/main", "origin/master"} {
-		out, err := exec.Command("git", "rev-list", "--count", branch+".."+ref).Output()
-		if err != nil {
-			continue
+	var s mainRefState
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		switch strings.TrimSpace(line) {
+		case "refs/heads/main":
+			s.localMain = true
+		case "refs/heads/master":
+			s.localMaster = true
+		case "refs/remotes/origin/main":
+			s.originMain = true
+		case "refs/remotes/origin/master":
+			s.originMaster = true
 		}
-		var count int
-		fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count)
-		return count
 	}
-	return 0
+	return s
+}
+
+// name is the branch name this repository spells "main" with. Local refs
+// decide it; a fresh clone with no local main yet falls back to whichever
+// spelling origin uses, so a master-based remote is not mislabelled "main".
+func (s mainRefState) name() string {
+	switch {
+	case s.localMain:
+		return "main"
+	case s.localMaster:
+		return "master"
+	case s.originMain:
+		return "main"
+	case s.originMaster:
+		return "master"
+	}
+	return "main"
+}
+
+// ref is the ref that stands in for "main" when syncing: origin/<main> when
+// that remote-tracking ref exists, the local branch otherwise, "" when neither
+// does. Preferring origin is what keeps the dashboard's "behind main" badge
+// and the sync action pointed at the same commits — measuring the badge
+// against a local main that origin has moved past left a badge no amount of
+// syncing could clear.
+func (s mainRefState) ref() string {
+	name := s.name()
+	other := "master"
+	if name == "master" {
+		other = "main"
+	}
+	has := map[string]bool{
+		"origin/main":   s.originMain,
+		"origin/master": s.originMaster,
+		"main":          s.localMain,
+		"master":        s.localMaster,
+	}
+	for _, cand := range []string{"origin/" + name, "origin/" + other, name, other} {
+		if has[cand] {
+			return cand
+		}
+	}
+	return ""
+}
+
+// MainSync is the single definition of "the main line" shared by the dashboard
+// badge, the menu's sync shortcut and the sync dialog. All three used to
+// resolve it independently — the badge against local main, the action against
+// origin/main — which made the badge unclearable in one direction and silently
+// absent in the other.
+type MainSync struct {
+	Name   string // display name: "main" or "master"
+	Ref    string // ref to measure and merge against; "" when none resolves
+	Behind int    // commits `branch` is behind Ref
+}
+
+// ResolveMainSync answers all three questions in one pass: what main is called
+// here, which ref represents it, and how far behind it `branch` is. Behind is
+// 0 when branch IS main (there is nothing to sync into itself; catching up
+// with origin on main is the pull path) or when no main ref resolves.
+func ResolveMainSync(branch string) MainSync {
+	s := readMainRefs()
+	ms := MainSync{Name: s.name(), Ref: s.ref()}
+	if branch == "" || ms.Ref == "" || branch == ms.Name || branch == ms.Ref {
+		return ms
+	}
+	ms.Behind = CountIncomingCommits(branch, ms.Ref)
+	return ms
+}
+
+// GetBehindMain returns how many commits the given branch is behind the main
+// line — measured against exactly the ref the sync action merges. See
+// ResolveMainSync.
+func GetBehindMain(branch string) int {
+	return ResolveMainSync(branch).Behind
+}
+
+// MainSyncRef returns the ref the sync action should merge, or "" when this
+// repository has no main branch at all.
+func MainSyncRef() string {
+	return readMainRefs().ref()
 }
 
 // ── Config operations ──────────────────────────────────
@@ -1233,16 +1326,12 @@ func UnrelatedHistories() (remoteRef string, unrelated bool) {
 	return ref, true
 }
 
-// ResolveMainBranch returns "main" or "master" depending on which exists as a
-// local branch. Returns "main" if neither exists (safe default).
+// ResolveMainBranch returns the name this repository uses for its main branch,
+// "main" or "master". Local refs decide; a fresh clone with no local main yet
+// takes origin's spelling rather than defaulting to "main" and then asking git
+// for an origin/main that does not exist. "main" when nothing resolves.
 func ResolveMainBranch() string {
-	if exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/main").Run() == nil {
-		return "main"
-	}
-	if exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/master").Run() == nil {
-		return "master"
-	}
-	return "main"
+	return readMainRefs().name()
 }
 
 // MergeAbort aborts an in-progress merge.

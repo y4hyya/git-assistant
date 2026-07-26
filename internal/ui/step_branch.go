@@ -163,9 +163,9 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Clear transient post-operation notes on any keypress
+	// Clear transient post-operation notes on any keypress. m.statusNote has
+	// its own lifecycle in the outer Update (it survives cursor movement).
 	m.branchCreatedHint = ""
-	m.branchOpNote = ""
 
 	// ── Create mode ────────────────────────────────────
 	if m.branchCreateMode {
@@ -608,9 +608,9 @@ func (m Model) viewBranch() string {
 		b.WriteString("  " + dimStyle.Render("Make changes and commit here, then merge back when ready.") + "\n")
 	}
 
-	// Post-operation note (merge result, stash disclosure)
-	if m.branchOpNote != "" {
-		b.WriteString("\n  " + successStyle.Render(symDone) + " " + m.branchOpNote + "\n")
+	// Post-operation note (merge result, stash disclosure, delete)
+	if note := m.renderStatusNote(); note != "" {
+		b.WriteString("\n" + note + "\n")
 	}
 
 	// Error

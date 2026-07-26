@@ -77,8 +77,9 @@ func main() {
 	branch, _ := git.GetCurrentBranch()
 	files, _ := git.GetStatus() // nil if clean, that's fine
 
+	// NewModel already takes the one synchronous dashboard reading; a second
+	// pass here just doubled the git processes between launch and first frame.
 	m := ui.NewModel(files, branch)
-	m.RefreshGraphs()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

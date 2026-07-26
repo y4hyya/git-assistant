@@ -919,3 +919,100 @@ func TestRemoteDefaultBranchFallsBackToAnyOriginRef(t *testing.T) {
 		t.Errorf("RemoteDefaultBranch() = %q, want origin/trunk", got)
 	}
 }
+
+// ── "behind main" measures the ref the sync action merges ──
+
+// mainFixture builds: origin with main @ seed, a local `feat` branch at seed,
+// and returns with `feat` checked out. Callers then move local main and/or
+// origin/main apart to create the divergence they want to test.
+func mainFixture(t *testing.T) {
+	t.Helper()
+	scratchRepo(t)
+	remote := t.TempDir()
+	runGit(t, "init", "-q", "--bare", remote)
+	write(t, "seed.txt", "seed\n")
+	commitAll(t, "chore: seed")
+	runGit(t, "remote", "add", "origin", remote)
+	runGit(t, "push", "-q", "-u", "origin", "main")
+	runGit(t, "branch", "feat")
+}
+
+// The badge counted local main while `s` merged origin/main. With origin ahead
+// of a stale local main the badge read 0, so the shortcut was hidden — while
+// the sync dialog, which measures origin/main, was offering the very same merge.
+func TestBehindMainCountsAgainstOriginNotAStaleLocalMain(t *testing.T) {
+	mainFixture(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "feat: a")
+	runGit(t, "push", "-q", "origin", "main")
+	// Local main falls behind what it just pushed; origin/main keeps the commit.
+	runGit(t, "reset", "-q", "--hard", "HEAD~1")
+	runGit(t, "checkout", "-q", "feat")
+
+	if got := CountIncomingCommits("feat", "main"); got != 0 {
+		t.Fatalf("fixture wrong: feat is %d behind LOCAL main, want 0", got)
+	}
+	if got := MainSyncRef(); got != "origin/main" {
+		t.Fatalf("MainSyncRef() = %q, want origin/main", got)
+	}
+	if got := GetBehindMain("feat"); got != 1 {
+		t.Errorf("GetBehindMain(feat) = %d, want 1 — the badge is blind to origin/main", got)
+	}
+}
+
+// The other direction: an unpushed commit on local main used to make every
+// branch look "behind main" forever, because `s` merged origin/main and got
+// "Already up to date" while the badge kept measuring the local ref.
+func TestBehindMainIgnoresUnpushedLocalMainCommits(t *testing.T) {
+	mainFixture(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "feat: unpushed hotfix")
+	runGit(t, "checkout", "-q", "feat")
+
+	if got := CountIncomingCommits("feat", "main"); got != 1 {
+		t.Fatalf("fixture wrong: feat is %d behind LOCAL main, want 1", got)
+	}
+	if got := GetBehindMain("feat"); got != 0 {
+		t.Errorf("GetBehindMain(feat) = %d, want 0 — syncing with origin/main can never clear it", got)
+	}
+}
+
+// Remoteless repositories still get a badge, measured (and merged) against the
+// local branch.
+func TestBehindMainFallsBackToLocalMainWithoutARemote(t *testing.T) {
+	scratchRepo(t)
+	write(t, "seed.txt", "seed\n")
+	commitAll(t, "chore: seed")
+	runGit(t, "branch", "feat")
+	write(t, "a.txt", "a\n")
+	commitAll(t, "feat: a")
+	runGit(t, "checkout", "-q", "feat")
+
+	if got := MainSyncRef(); got != "main" {
+		t.Fatalf("MainSyncRef() = %q, want main", got)
+	}
+	if got := GetBehindMain("feat"); got != 1 {
+		t.Errorf("GetBehindMain(feat) = %d, want 1", got)
+	}
+	if got := GetBehindMain("main"); got != 0 {
+		t.Errorf("GetBehindMain(main) = %d, want 0 — main is not behind itself", got)
+	}
+}
+
+// A fresh clone of a master-based remote has no local branch to read the
+// spelling off. Defaulting to "main" made the dialog label the branch wrongly
+// and ask git for an origin/main that does not exist.
+func TestResolveMainBranchTakesOriginsSpelling(t *testing.T) {
+	scratchRepo(t)
+	runGit(t, "remote", "add", "origin", seedRemote(t, "master"))
+	if err := Fetch(); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	// Leave the local branch as the scratch repo's unborn "main".
+	if got := ResolveMainBranch(); got != "master" {
+		t.Errorf("ResolveMainBranch() = %q, want master", got)
+	}
+	if got := MainSyncRef(); got != "origin/master" {
+		t.Errorf("MainSyncRef() = %q, want origin/master", got)
+	}
+}

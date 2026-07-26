@@ -121,6 +121,23 @@ func clampMenuCursor(cursor, n int) int {
 	return cursor
 }
 
+// canSyncMain gates the "s" shortcut, its help entry and the behind-main badge
+// on one condition, so the dashboard can never offer a sync it cannot perform
+// (or hide one it should). mainRef is empty in a repository with no main
+// branch at all, where there is nothing to sync with.
+func (m Model) canSyncMain() bool {
+	return m.behindMain > 0 && m.mainRef != ""
+}
+
+// mainLabel names the main branch for display. Falls back to "main" before the
+// first dashboard snapshot has landed.
+func (m Model) mainLabel() string {
+	if m.mainName != "" {
+		return m.mainName
+	}
+	return "main"
+}
+
 // canConnectGH reports whether the recovery menu entry is applicable.
 // Requires: we're in a git repo (always true on menu), no origin set, and
 // the gh CLI is installed. Auth is checked later in the init flow.
@@ -306,14 +323,18 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "s":
-		if m.behindMain > 0 {
-			// Merge origin/<main> into current — always the freshest source,
-			// and consistent with the post-fetch state shown in the graph.
-			// git merge accepts a remote-tracking ref directly, so we reuse
-			// doMergeBranch instead of introducing a parallel helper.
+		if m.canSyncMain() {
+			// Merge the exact ref m.behindMain was measured against — normally
+			// origin/<main>, the local branch in a repo with no remote. Picking
+			// the ref independently here is what let the badge count one thing
+			// while "s" merged another: it could report "behind" forever
+			// because every sync answered "Already up to date", or merge
+			// origin/main in a repository that has no origin at all.
+			//
+			// git merge takes a remote-tracking ref directly, so doMergeBranch
+			// covers both (and auto-stashes a dirty tree on the way).
 			m.branchMerging = true
-			main := git.ResolveMainBranch()
-			return m, tea.Batch(doMergeBranch("origin/"+main), m.spinner.Tick)
+			return m, tea.Batch(doMergeBranch(m.mainRef), m.spinner.Tick)
 		}
 	case "p":
 		// Manual pull fallback. Opens the sync dialog if there's anything
@@ -353,10 +374,17 @@ func (m Model) viewMenu() string {
 		head.WriteString(modifiedStyle.Render(fmt.Sprintf("  %d changes", len(m.files))))
 	}
 	if m.behindMain > 0 {
-		head.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind main", symArrowDown, m.behindMain)))
+		head.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind %s", symArrowDown, m.behindMain, m.mainLabel())))
 	}
-	if m.fetching {
+	switch {
+	case m.fetching:
 		head.WriteString("  " + dimStyle.Render(m.spinner.View()+" syncing"))
+	case m.fetchStale:
+		// The last fetch failed, so everything remote on this screen dates from
+		// the one before it. Said quietly and next to the numbers it qualifies:
+		// a background fetch that could not reach the network is noise, not an
+		// error, and it retries on the next return to the menu.
+		head.WriteString("  " + dimStyle.Render("(offline — sync info may be stale)"))
 	}
 
 	blocks := []string{head.String()}
@@ -365,6 +393,12 @@ func (m Model) viewMenu() string {
 	// by the main Update handler, same lifecycle as m.err.
 	if m.initSuccessMsg != "" {
 		blocks = append(blocks, "  "+successStyle.Render(symDone+" "+m.initSuccessMsg))
+	}
+
+	// What the last operation did — merge, pull, delete, stashed switch,
+	// .gitignore edit. All of those used to finish in complete silence.
+	if note := m.renderStatusNote(); note != "" {
+		blocks = append(blocks, note)
 	}
 
 	// ── Menu items ───────────────────────────────────
@@ -395,7 +429,7 @@ func (m Model) viewMenu() string {
 
 	// Spinner for sync
 	if m.branchMerging {
-		blocks = append(blocks, "  "+m.spinner.View()+" "+dimStyle.Render("Syncing with main..."))
+		blocks = append(blocks, "  "+m.spinner.View()+" "+dimStyle.Render("Syncing with "+m.mainLabel()+"..."))
 	}
 
 	// Error
@@ -426,7 +460,7 @@ func (m Model) viewMenu() string {
 	if m.hasRemote && m.behindOrigin > 0 {
 		helpEntries = append(helpEntries, helpEntry{"p", "pull"})
 	}
-	if m.behindMain > 0 {
+	if m.canSyncMain() {
 		helpEntries = append(helpEntries, helpEntry{"s", "sync"})
 	}
 	helpEntries = append(helpEntries, helpEntry{"q", "quit"})

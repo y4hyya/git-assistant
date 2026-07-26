@@ -71,6 +71,18 @@ func clampLines(content string, maxLines, width int) string {
 	return content
 }
 
+// renderStatusNote renders the one-shot "what just happened" line for the
+// steps that show it. Shared so a merge, a pull, a branch delete or a stash
+// round-trip reads identically wherever it was started from — the menu used to
+// have nowhere to put this and smuggled it out through the error banner.
+// Returns "" when there is nothing to say.
+func (m Model) renderStatusNote() string {
+	if m.statusNote == "" {
+		return ""
+	}
+	return "  " + successStyle.Render(symDone) + " " + m.statusNote
+}
+
 // renderGraphSection returns the unified commit graph footer, sized to fit
 // maxLines rows (separator + title + commit rows). The caller owns the budget:
 // it is the only code that knows how many rows the menu above already spent,

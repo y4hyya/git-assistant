@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"git-assist/internal/git"
@@ -82,6 +83,11 @@ type branchMergeResultMsg struct {
 	stashRestored bool
 }
 type fetchResultMsg struct{ err error }
+
+// dashboardRefreshMsg delivers one off-thread reading of everything the
+// dashboard shows. See requestDashboardRefresh.
+type dashboardRefreshMsg struct{ snap dashboardSnapshot }
+
 type pullResultMsg struct {
 	err           error
 	conflictFiles []string
@@ -204,7 +210,6 @@ type Model struct {
 	branchCreating     bool
 	branchDeleting     bool
 	branchCreatedHint  string
-	branchOpNote       string // transient success note (merge result, stash disclosure)
 	branchMergePending string
 	mergeSource        string
 	mergeTarget        string
@@ -258,9 +263,15 @@ type Model struct {
 	// confirm step. `git commit --amend` commits the WHOLE index, so anything
 	// staged outside the wizard rides along and has to be disclosed.
 	amendStaged []string
+	// amendSHA/amendPushed are the confirm screen's view of the commit being
+	// rewritten, also read once on entering the step. They used to be read from
+	// viewConfirm, which runs on every spinner tick — two git subprocesses ten
+	// times a second for the whole duration of "Committing...".
+	amendSHA    string
+	amendPushed bool
 
-	// Cached: whether the repo has at least one commit. Refreshed by
-	// RefreshGraphs so menuItems doesn't fork git per keypress.
+	// Cached: whether the repo has at least one commit. Refreshed by the
+	// dashboard snapshot so menuItems doesn't fork git per keypress.
 	hasAnyCommit bool
 
 	// Spinner for async operations
@@ -268,6 +279,14 @@ type Model struct {
 
 	// Error (shown on current step, cleared on next keypress)
 	err error
+
+	// statusNote is the one-shot "what just happened" line: merged, pulled,
+	// deleted, switched-with-stash, .gitignore updated. Every mutating
+	// operation that used to succeed in complete silence writes one here, and
+	// the menu and branch manager render it identically. Survives navigation
+	// keys, cleared by the next real action — see the tea.KeyMsg branch of
+	// Update and isNavKey.
+	statusNote string
 
 	// Main menu
 	menuCursor int
@@ -277,14 +296,29 @@ type Model struct {
 	aheadBehind  string
 	behindMain   int
 	behindOrigin int
+	// mainName/mainRef come from the same resolution behindMain was measured
+	// with, so the badge, the "s" shortcut's visibility and the ref it merges
+	// can never disagree about what "main" is.
+	mainName string
+	mainRef  string
 
-	// Cached branch count — refreshed by RefreshGraphs so the menu can read
-	// it without forking `git branch` on every keypress.
+	// Cached branch count — refreshed by the dashboard snapshot so the menu
+	// can read it without forking `git branch` on every keypress.
 	branchCount int
+
+	// Dashboard refresh (async). refreshing marks one in flight; refreshPending
+	// remembers a request that arrived while it was, so refreshes coalesce
+	// instead of stacking a second fleet of git processes on the first.
+	refreshing     bool
+	refreshPending bool
 
 	// Background fetch
 	fetching  bool
 	lastFetch time.Time
+	// fetchStale is set when a background fetch failed. The ahead/behind
+	// numbers on screen are then from the last successful fetch, and the menu
+	// says so — quietly, since a failed background fetch is noise, not an error.
+	fetchStale bool
 
 	// Sync dialog
 	syncReturnStep     step     // where to return after the dialog closes
@@ -380,7 +414,10 @@ func NewModel(files []types.FileEntry, branch string) Model {
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED"))
+	// The adaptive palette entry, not the pinned brand hex: this glyph sits on
+	// the terminal's own background, where the dark-only purple was close to
+	// unreadable on a light theme.
+	s.Style = lipgloss.NewStyle().Foreground(purple)
 
 	m := Model{
 		step:              stepMenu,
@@ -448,28 +485,129 @@ func NewInitModel() Model {
 }
 
 // NewBranchModel creates a model that starts in branch manager mode.
+// NewModel has already taken the one synchronous dashboard reading; only the
+// branch list is extra here.
 func NewBranchModel(branch string) Model {
 	m := NewModel(nil, branch)
 	m.step = stepBranch
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
-	m.localGraph = git.GetUnifiedGraph(15)
-	a, b, up := git.GetAheadBehind(branch)
-	m.aheadBehind = formatAheadBehind(a, b, up)
 	return m
 }
 
-// RefreshGraphs updates the graph data from git, plus the cached branch
-// count and hasAnyCommit flag so the menu can render without forking
-// `git branch` / `git rev-parse` on every keypress.
+// dashboardSnapshot is everything the dashboard reads out of git in one go.
+// It is computed off the Bubble Tea loop and applied to the model in a single
+// assignment, so no git process ever runs inside Update.
+type dashboardSnapshot struct {
+	branch       string // the branch it was computed for; a switch invalidates it
+	graph        string
+	aheadBehind  string
+	behindOrigin int
+	behindMain   int
+	mainName     string
+	mainRef      string
+	branchCount  int
+	hasAnyCommit bool
+
+	files   []types.FileEntry
+	filesOK bool // false when withStatus was off, or git status failed
+}
+
+// readDashboard forks the six-to-nine git processes the dashboard needs. It
+// touches no Model state — it runs on a Bubble Tea command goroutine, where
+// reading the model would be a data race.
+func readDashboard(branch string, withStatus bool) dashboardSnapshot {
+	snap := dashboardSnapshot{branch: branch}
+	snap.graph = git.GetUnifiedGraph(15)
+	a, b, up := git.GetAheadBehind(branch)
+	snap.aheadBehind = formatAheadBehind(a, b, up)
+	snap.behindOrigin = b
+	main := git.ResolveMainSync(branch)
+	snap.behindMain = main.Behind
+	snap.mainName = main.Name
+	snap.mainRef = main.Ref
+	snap.branchCount = len(git.GetAllBranches())
+	snap.hasAnyCommit = git.HasAnyCommit()
+	if withStatus {
+		if files, err := git.GetStatus(); err == nil {
+			snap.files = files
+			snap.filesOK = true
+		}
+	}
+	return snap
+}
+
+// applyDashboard copies a snapshot onto the model. Pure assignment — this is
+// the only thing the refresh does inside Update.
+//
+// The working-tree half is applied only while the dashboard is the visible
+// step. A late snapshot landing after the user has walked into the file
+// selector would otherwise reset their cursor and drop their selections; the
+// wizard re-reads status for itself on the way in (see updateMenu's "Commit").
+func (m *Model) applyDashboard(s dashboardSnapshot) {
+	m.localGraph = s.graph
+	m.aheadBehind = s.aheadBehind
+	m.behindOrigin = s.behindOrigin
+	m.behindMain = s.behindMain
+	m.mainName = s.mainName
+	m.mainRef = s.mainRef
+	m.branchCount = s.branchCount
+	m.hasAnyCommit = s.hasAnyCommit
+	if s.filesOK && m.step == stepMenu {
+		m.files = s.files
+		m.cursor = 0
+		m.fileScroll = 0
+	}
+}
+
+// RefreshGraphs reads the dashboard synchronously. It is the startup path only
+// — NewModel and NewBranchModel run before the first frame, where there is no
+// UI to block. Everything inside the Update loop goes through
+// requestDashboardRefresh instead.
 func (m *Model) RefreshGraphs() {
-	m.localGraph = git.GetUnifiedGraph(15)
-	a, b, up := git.GetAheadBehind(m.branch)
-	m.aheadBehind = formatAheadBehind(a, b, up)
-	m.behindOrigin = b
-	m.behindMain = git.GetBehindMain(m.branch)
-	m.branchCount = len(git.GetAllBranches())
-	m.hasAnyCommit = git.HasAnyCommit()
+	m.applyDashboard(readDashboard(m.branch, false))
+}
+
+// requestDashboardRefresh returns the command that recomputes the dashboard off
+// the UI thread. It replaces the synchronous RefreshGraphs+refreshFiles pair
+// that every result handler used to call: those forked up to nine git processes
+// inside Update, and on a large repository `rev-list --count` walks history, so
+// every return to the menu froze input for the sum of their latencies.
+//
+// Coalescing rule: at most one refresh runs at a time. A request made while one
+// is in flight sets refreshPending and returns nil; the handler re-dispatches
+// when the in-flight result lands. The screen therefore keeps rendering the
+// previous snapshot instead of blocking, and the final state is always the
+// freshest one without ever stacking two fleets of git processes.
+func (m *Model) requestDashboardRefresh() tea.Cmd {
+	if m.refreshing {
+		m.refreshPending = true
+		return nil
+	}
+	m.refreshing = true
+	branch := m.branch
+	return func() tea.Msg {
+		return dashboardRefreshMsg{snap: readDashboard(branch, true)}
+	}
+}
+
+// editAreaWidth/editAreaHeight size the file editor's textarea to the terminal.
+// The WindowSizeMsg handler applies them on every resize; step_files.go's edit
+// entry uses the same numbers.
+func editAreaWidth(termWidth int) int {
+	w := termWidth - 10
+	if w < 40 {
+		w = 40
+	}
+	return w
+}
+
+func editAreaHeight(termHeight int) int {
+	h := termHeight - 10
+	if h < 5 {
+		h = 5
+	}
+	return h
 }
 
 // resetWizard clears every field the commit/amend wizard writes, so the next
@@ -522,15 +660,86 @@ func (m *Model) refreshFiles() {
 }
 
 // returnToMenu is the single way back to the main menu: it abandons any wizard
-// state, re-reads the working tree, and refreshes the graph/counters. Every
-// transition to stepMenu goes through here so no path can skip one of the
+// state and asks for a fresh reading of the working tree and the graph/counters.
+// Every transition to stepMenu goes through here so no path can skip one of the
 // three (the esc-from-Files path used to skip all of them).
+//
+// The reading is asynchronous: the menu draws immediately from the previous
+// snapshot and updates a moment later. Returning to the dashboard used to mean
+// waiting for git status plus the whole graph pass before the first keystroke
+// was even read.
 func (m *Model) returnToMenu() tea.Cmd {
 	m.resetWizard()
-	m.refreshFiles()
 	m.step = stepMenu
-	m.RefreshGraphs()
-	return m.maybeFetch()
+	return tea.Batch(m.requestDashboardRefresh(), m.maybeFetch())
+}
+
+// setStatusNote records the one-shot "what just happened" line. Notes replace
+// each other: only the newest operation is worth reporting.
+func (m *Model) setStatusNote(format string, args ...any) {
+	m.statusNote = fmt.Sprintf(format, args...)
+}
+
+// rendersStatusNote reports whether the current step actually draws
+// m.statusNote. Notes are only cleared on steps that showed them — an
+// operation finishing on a screen with nowhere to render it (the .gitignore
+// apply, which lands back in the file selector) keeps its note until the
+// dashboard can say what happened.
+func (m Model) rendersStatusNote() bool {
+	return m.step == stepMenu || m.step == stepBranch
+}
+
+// isNavKey reports whether a keypress only moves a cursor. Status notes
+// survive those: scrolling a list is not an acknowledgement, and clearing on
+// literally any key made a merge result unreadable past the first frame.
+func isNavKey(k string) bool {
+	switch k {
+	case "up", "down", "left", "right", "j", "k", "h", "l",
+		"tab", "shift+tab", "pgup", "pgdown", "home", "end":
+		return true
+	}
+	return false
+}
+
+// plural renders a count with the right noun: "1 commit", "3 commits".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// describeGitignoreChange summarizes an applied .gitignore edit: patterns
+// added, patterns removed, and tracked files that had to be un-tracked for the
+// new rules to bite. Read from the toggles the file list still carries, before
+// the handler replaces it with a fresh git status.
+func describeGitignoreChange(files []types.FileEntry, remove map[string]bool, cached []string) string {
+	added := 0
+	for _, f := range files {
+		if f.Gitignored {
+			added++
+		}
+	}
+	removed := 0
+	for _, drop := range remove {
+		if drop {
+			removed++
+		}
+	}
+	var parts []string
+	if added > 0 {
+		parts = append(parts, plural(added, "entry", "entries")+" added")
+	}
+	if removed > 0 {
+		parts = append(parts, plural(removed, "entry", "entries")+" removed")
+	}
+	if len(cached) > 0 {
+		parts = append(parts, plural(len(cached), "file", "files")+" untracked")
+	}
+	if len(parts) == 0 {
+		return "no entries changed"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // opInFlight reports whether a mutating operation is currently running as a
@@ -539,15 +748,19 @@ func (m *Model) returnToMenu() tea.Cmd {
 // `git stash pop`, a merge left with MERGE_HEAD, a commit killed mid-write —
 // so ctrl+c asks for confirmation while any of these are set.
 //
-// Background fetch is deliberately excluded: it is read-only and safe to
-// abandon, and it runs often enough that guarding it would make ctrl+c feel
-// broken.
+// The background fetch and the dashboard refresh are deliberately excluded:
+// both only read, they are safe to abandon, and they run often enough that
+// guarding them would make ctrl+c feel broken.
 func (m Model) opInFlight() bool {
 	return m.committing ||
 		m.pushing ||
 		m.saving ||
 		m.branchSwitching ||
 		m.branchMerging ||
+		m.branchCreating ||
+		m.branchDeleting ||
+		m.undoing ||
+		m.gitignoring ||
 		m.pulling ||
 		m.initWorking
 }
@@ -561,6 +774,21 @@ func (m *Model) clearForceQuitPrompt() {
 		m.forceQuitArmed = false
 		m.err = nil
 	}
+}
+
+// startResult is the prologue of every mutating operation's result handler.
+// Both the force-quit warning and the previous operation's status note belong
+// to the operation that just finished, so both are stale the instant a new
+// result lands — without this, "Undid the last commit" could still be sitting
+// on the dashboard after the commit that followed it. Handlers with something
+// to report set a fresh note afterwards.
+//
+// The background fetch deliberately does NOT call this: it is not an operation
+// the user performed, and clearing on it would erase a pull's own note a
+// second after the pull produced it.
+func (m *Model) startResult() {
+	m.clearForceQuitPrompt()
+	m.statusNote = ""
 }
 
 // commitPrefix builds the conventional commit prefix: type(scope)!
@@ -601,13 +829,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filterInput.Width = min(inputWidth, 60)
 		m.branchCreateInput.Width = min(inputWidth, 50)
 		m.configEditInput.Width = min(inputWidth, 50)
+		// The init inputs used to keep the fixed width setupInitModel gave them,
+		// so on a narrow terminal the URL field ran past the box border.
+		m.initURLInput.Width = min(inputWidth, 60)
+		m.initNameInput.Width = min(inputWidth, 50)
+		// The file editor is sized once, on entry, from the dimensions of that
+		// moment. Resizing mid-edit left it at the old size: shrunk, styledBox
+		// clipped its bottom rows (help bar, sometimes the cursor's own line);
+		// grown, it stayed small with dead space beside it. Same numbers the
+		// entry path in step_files.go computes.
+		m.editArea.SetWidth(editAreaWidth(m.width))
+		m.editArea.SetHeight(editAreaHeight(m.height))
+		return m, nil
+
+	case dashboardRefreshMsg:
+		m.refreshing = false
+		// A snapshot taken for a branch we have since left describes the wrong
+		// repository state; drop it and take a fresh reading instead.
+		stale := msg.snap.branch != m.branch
+		if !stale {
+			m.applyDashboard(msg.snap)
+		}
+		if m.refreshPending || stale {
+			m.refreshPending = false
+			return m, m.requestDashboardRefresh()
+		}
 		return m, nil
 
 	case undoResultMsg:
 		m.confirmUndo = false
 		m.undoing = false
 		m.undoPushed = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -619,14 +872,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.files = msg.files
 		m.cursor = 0
 		m.fileScroll = 0
+		m.setStatusNote("Undid the last commit — its changes are back in your working tree")
 		// Without this the menu graph still shows the undone commit, which
 		// reads as "undo failed" and invites a second, destructive undo.
-		m.RefreshGraphs()
-		return m, nil
+		return m, m.requestDashboardRefresh()
 
 	case saveResultMsg:
 		m.saving = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -668,11 +921,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case gitignoreResultMsg:
 		m.gitignoreMode = false
 		m.gitignoring = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
+		// Say what landed in .gitignore. Counted before the file list is
+		// replaced below, which is what carries the toggles.
+		m.setStatusNote("Updated .gitignore — %s", describeGitignoreChange(m.files, m.removeIgnored, m.gitignoreCached))
 		// Remember which files were commit-selected
 		prevSelected := make(map[string]bool)
 		for _, f := range m.files {
@@ -699,19 +955,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case commitResultMsg:
 		m.committing = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
-		m.RefreshGraphs()
+		refresh := m.requestDashboardRefresh()
 		// Amends route straight to Done — auto-routing to push after an
 		// amend would either fail (non-FF on pushed commits) or surprise
 		// the user by force-pushing. The Confirm step already warned
 		// about --force-with-lease; the user pushes manually afterward.
 		if m.amendMode {
 			m.step = stepDone
-			return m, nil
+			return m, refresh
 		}
 		if m.hasRemote {
 			m.branches = git.GetBranches(m.branch)
@@ -727,23 +983,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.step = stepDone
 		}
-		return m, nil
+		return m, refresh
 
 	case pushResultMsg:
 		m.pushing = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
 		m.pushed = true
-		m.RefreshGraphs()
 		m.step = stepDone
-		return m, nil
+		return m, m.requestDashboardRefresh()
 
 	case branchSwitchResultMsg:
 		m.branchSwitching = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			if m.branchMergePending != "" {
@@ -756,11 +1011,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// The change count the user was looking at when they pressed enter —
+		// read before the post-switch refresh replaces the list.
+		carried := len(m.files)
 		m.branch = msg.newBranch
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
-		m.RefreshGraphs()
+		refresh := m.requestDashboardRefresh()
 		if msg.stashConflict {
 			pendingNote := ""
 			if m.branchMergePending != "" {
@@ -772,20 +1030,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// markers to resolve anywhere. The changes only exist in the stash.
 			m.err = recoveryError{fmt.Errorf("switched to %s, but your stashed changes did not apply here — the working tree was reset clean and nothing was lost.%s Your changes are in stash %s; recover with: git stash apply %s",
 				msg.newBranch, pendingNote, msg.stashRef, msg.stashRef)}
-			return m, nil
+			return m, refresh
+		}
+		// A switch on a dirty tree stashes, checks out and pops — silently, so
+		// far as the screen was concerned. Uncommitted work following the user
+		// onto another branch is exactly the thing a beginner needs told.
+		if msg.stashRef != "" {
+			if carried > 0 {
+				m.setStatusNote("Switched to %s — %s stashed and restored", msg.newBranch, plural(carried, "changed file", "changed files"))
+			} else {
+				m.setStatusNote("Switched to %s — your uncommitted changes were stashed and restored", msg.newBranch)
+			}
+		} else {
+			m.setStatusNote("Switched to %s", msg.newBranch)
 		}
 		// If a merge was pending (target picker flow), start it now
 		if m.branchMergePending != "" {
 			source := m.branchMergePending
 			m.branchMergePending = ""
 			m.branchMerging = true
-			return m, tea.Batch(doMergeBranch(source), m.spinner.Tick)
+			return m, tea.Batch(doMergeBranch(source), m.spinner.Tick, refresh)
 		}
-		return m, nil
+		return m, refresh
 
 	case branchCreateResultMsg:
 		m.branchCreating = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			// Create mode stays on so the name can be fixed in place.
 			m.err = msg.err
@@ -798,12 +1068,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchCreateMode = false
 		m.branchCreateInput.Reset()
 		m.branchCreatedHint = msg.newBranch
-		return m, nil
+		// Creating a branch also checks it out, so the ahead/behind chip, the
+		// branch count and the graph decorations are all stale now.
+		return m, m.requestDashboardRefresh()
 
 	case branchDeleteResultMsg:
 		m.branchDeleteMode = false
 		m.branchDeleting = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			// `git branch -d` refusing to drop commits no other branch holds
 			// is the one delete failure with an answer inside the TUI: ask
@@ -821,35 +1093,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.branchCursor = max(0, len(m.branchEntries)-1)
 		}
 		if msg.forced {
-			m.branchOpNote = fmt.Sprintf("Force-deleted %s — its unmerged commits are only in `git reflog` now", msg.name)
+			m.setStatusNote("Force-deleted %s — its unmerged commits are only in `git reflog` now", msg.name)
+		} else {
+			m.setStatusNote("Deleted branch %s", msg.name)
 		}
-		m.RefreshGraphs()
-		return m, nil
+		return m, m.requestDashboardRefresh()
 
 	case fetchResultMsg:
 		m.fetching = false
-		m.lastFetch = time.Now()
 		m.clearForceQuitPrompt()
-		// Errors are intentionally swallowed — this is a background op the
-		// user didn't ask for, so failures (offline, auth, etc.) must not
-		// surface as alarming banners. Stale ahead/behind numbers are the
-		// only observable consequence.
-		m.RefreshGraphs()
+		// Failures stay quiet — this is a background op the user didn't ask
+		// for, so offline/auth errors must not surface as alarming banners.
+		// Two things do have to happen, though: the debounce clock only starts
+		// on a SUCCESSFUL fetch (stamping it on failure suppressed for 30s
+		// exactly the retry that would have recovered), and the menu says the
+		// numbers it is showing may be stale rather than presenting refs from
+		// the last successful fetch as current.
+		if msg.err != nil {
+			m.fetchStale = true
+		} else {
+			m.lastFetch = time.Now()
+			m.fetchStale = false
+		}
+		refresh := m.requestDashboardRefresh()
 		// Auto-show the sync dialog once per session on the first successful
 		// fetch, if we're on the menu (startup) and something is out of sync.
 		// Later fetches (on return to menu) silently update indicators only.
-		if !m.syncDialogShown && m.step == stepMenu && msg.err == nil {
+		//
+		// Never while an operation is running: the startup fetch routinely
+		// lands after the user has already pressed "s", and opening the dialog
+		// on top of an in-flight merge let them start a pull against a repo
+		// mid-merge (index.lock contention, a stash opened inside a merge)
+		// behind a screen that showed neither operation's spinner.
+		if !m.syncDialogShown && m.step == stepMenu && msg.err == nil && !m.opInFlight() {
 			m.syncDialogShown = true
 			if m.populateSyncDialog() {
 				m.syncReturnStep = stepMenu
 				m.step = stepSync
 			}
 		}
-		return m, nil
+		return m, refresh
 
 	case pullResultMsg:
 		m.pulling = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil {
 			verb := "pull"
 			if msg.kind == pullKindMain {
@@ -858,8 +1145,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(msg.conflictFiles) > 0 {
 				// Abort first: that puts the tree back on the stash's base
 				// commit, which is exactly where the stash applies cleanly.
+				// State the file count the way the branch-manager merge does —
+				// it is the only measure of how much work a manual retry is.
 				git.MergeAbort()
-				m.err = fmt.Errorf("%s conflict — the merge was aborted, nothing changed", verb)
+				m.err = fmt.Errorf("%s conflict — %s, so the merge was aborted and nothing changed",
+					verb, plural(len(msg.conflictFiles), "conflicting file", "conflicting files"))
 			} else {
 				m.err = msg.err
 			}
@@ -877,13 +1167,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.exitSyncDialog()
 		}
-		m.RefreshGraphs()
-		return m.exitSyncDialog()
+		// Success used to be completely silent: the dialog vanished and the
+		// menu came back looking exactly as it had. Say what arrived, using the
+		// counts the dialog was already showing — exitSyncDialog clears them,
+		// so build the note first.
+		switch {
+		case msg.kind == pullKindMain && m.syncMainTotal > 0:
+			m.setStatusNote("Merged %s from origin/%s into %s",
+				plural(m.syncMainTotal, "commit", "commits"), m.syncMainBranchName, m.branch)
+		case msg.kind == pullKindMain:
+			m.setStatusNote("Synced %s with origin/%s", m.branch, m.syncMainBranchName)
+		case m.syncCurrTotal > 0:
+			m.setStatusNote("Pulled %s from origin/%s",
+				plural(m.syncCurrTotal, "commit", "commits"), m.branch)
+		default:
+			m.setStatusNote("Pulled origin/%s", m.branch)
+		}
+		// exitSyncDialog only refreshes when it lands back on the menu; the
+		// pre-push check returns to the push step, where the graph is just as
+		// stale.
+		refresh := m.requestDashboardRefresh()
+		next, cmd := m.exitSyncDialog()
+		return next, tea.Batch(refresh, cmd)
 
 	case branchMergeResultMsg:
 		m.branchMerging = false
 		m.branchMergeMode = false
-		m.clearForceQuitPrompt()
+		m.startResult()
 		if msg.err != nil && !msg.merged {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
@@ -913,27 +1223,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.branchEntries = git.GetAllBranches()
-		m.RefreshGraphs()
+		refresh := m.requestDashboardRefresh()
 		if msg.err != nil {
 			// The merge landed; only restoring the auto-stash afterwards
 			// failed. The command already reported where the changes are.
 			m.err = msg.err
-			return m, nil
+			return m, refresh
 		}
+		// One note, rendered the same way wherever the merge was started from.
+		// The menu's sync shortcut used to have nowhere to say this and smuggled
+		// the stash disclosure out through m.err instead.
 		note := fmt.Sprintf("Merged %s into %s", msg.source, m.branch)
 		if msg.stashRestored {
 			note += " — your uncommitted changes were stashed and restored"
 		}
-		if m.step == stepBranch {
-			m.branchOpNote = note
-		} else if msg.stashRestored {
-			// The menu's sync shortcut merges without a note line to render
-			// into, and a note left on the model would resurface, stale, the
-			// next time the branch manager opened. The stash round-trip still
-			// has to be stated: symWarn marks it advisory, not an error.
-			m.err = fmt.Errorf("%s %s", symWarn, note)
-		}
-		return m, nil
+		m.statusNote = note
+		return m, refresh
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -973,6 +1278,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the menu by pressing any key.
 		if m.step == stepMenu {
 			m.initSuccessMsg = ""
+		}
+		// The status note is one-shot too, but it survives cursor movement:
+		// "Merged feature into main" is unreadable if arrowing down the branch
+		// list wipes it. It also survives steps that don't render it, so the
+		// .gitignore result — which lands back in the file selector — still gets
+		// said on the dashboard.
+		if m.statusNote != "" && m.rendersStatusNote() && !isNavKey(msg.String()) {
+			m.statusNote = ""
 		}
 	}
 

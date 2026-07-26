@@ -11,18 +11,31 @@ import (
 
 // ── Update ──────────────────────────────────────────────
 
-// enterConfirm routes into the confirm step, caching the index-vs-HEAD file
-// list on the way in. `git commit --amend` commits the WHOLE index, so
+// enterConfirm routes into the confirm step, reading everything the screen
+// needs out of git once, here.
+//
+// The index-vs-HEAD file list: `git commit --amend` commits the WHOLE index, so
 // anything staged outside the wizard (from another terminal, or a `git add`
 // before launching git-assist) rides along in the rewritten commit and has to
-// be disclosed. Read once here — never from a View func, which runs on every
-// keypress and every resize.
+// be disclosed.
+//
+// The commit's short SHA and whether it is already on a remote: viewConfirm
+// used to call GetLastCommitHash and IsLastCommitPushed itself, and a View func
+// runs on every keypress, every resize — and on every spinner tick, which is
+// ten times a second for the whole of "Committing...". `git branch -r
+// --contains HEAD` is not a cheap question to ask 10x/sec. Neither answer can
+// change while the screen is up: the commit is only rewritten when the user
+// confirms, and that leaves the step.
 func (m *Model) enterConfirm() {
 	m.amendStaged = nil
+	m.amendSHA = ""
+	m.amendPushed = false
 	if m.amendMode {
 		if staged, err := git.GetStagedFiles(); err == nil {
 			m.amendStaged = staged
 		}
+		m.amendSHA = git.GetLastCommitHash()
+		m.amendPushed = git.IsLastCommitPushed()
 	}
 	m.step = stepConfirm
 }
@@ -108,8 +121,8 @@ func (m Model) viewConfirm() string {
 	b.WriteString(renderProgress(m.step))
 	b.WriteString("\n")
 	if m.amendMode {
-		shortSHA := git.GetLastCommitHash()
-		b.WriteString(stepStyle.Render("  Amend " + shortSHA))
+		// Both of these are cached by enterConfirm — see the note there.
+		b.WriteString(stepStyle.Render("  Amend " + m.amendSHA))
 	} else {
 		b.WriteString(stepStyle.Render("  Review before committing"))
 	}
@@ -118,7 +131,7 @@ func (m Model) viewConfirm() string {
 	// Warn before amending a commit that's already on a remote — the
 	// next push will need --force-with-lease to update upstream, and
 	// surfacing that here avoids the "why is my push rejected" loop.
-	if m.amendMode && git.IsLastCommitPushed() {
+	if m.amendMode && m.amendPushed {
 		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin. Amending will require:") + "\n")
 		b.WriteString("  " + modifiedStyle.Render("    git push --force-with-lease") + "\n\n")
 	}
