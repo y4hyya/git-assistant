@@ -19,6 +19,7 @@ var (
 	symArrows     = "↑↓"
 	symSkip       = "⊘"
 	symDirty      = "●"
+	symWarn       = "⚠"
 )
 
 func init() {
@@ -33,6 +34,7 @@ func init() {
 		symArrows = "^v"
 		symSkip = "-"
 		symDirty = "*"
+		symWarn = "!"
 	}
 }
 

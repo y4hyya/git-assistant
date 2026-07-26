@@ -719,6 +719,14 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 	}
 }
 
+// IsBinaryContent reports whether content looks like binary data (contains a
+// NUL byte). Exported so callers can re-check content they read themselves —
+// e.g. before handing a file to a text editor, where round-tripping binary
+// bytes through a UTF-8 string would destroy the file.
+func IsBinaryContent(content string) bool {
+	return isBinary([]byte(content))
+}
+
 // ReadFileContent reads the raw content of a file in the working tree.
 func ReadFileContent(path string) (string, error) {
 	content, err := os.ReadFile(path)

@@ -124,9 +124,17 @@ func (m Model) startAmend() Model {
 	m.bodyFocused = false
 
 	m.amendMode = true
-	m.step = stepFiles
 	m.cursor = 0
 	m.fileScroll = 0
+	if len(m.files) == 0 {
+		// Clean tree — the flagship amend case. There is nothing to stage,
+		// so the file selector would be an empty list whose keys index into
+		// a zero-length slice. Go straight to the type picker: a
+		// message-only amend.
+		m.step = stepType
+		return m
+	}
+	m.step = stepFiles
 	return m
 }
 

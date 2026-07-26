@@ -94,6 +94,7 @@ func (m Model) updateInit(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg := msg.(type) {
 		case initResultMsg:
 			m.initWorking = false
+			m.clearForceQuitPrompt()
 			if msg.err != nil {
 				m.err = msg.err
 				m.initPhase = initPhasePickOption
@@ -112,6 +113,7 @@ func (m Model) updateInit(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.maybeFetch()
 		case ghAuthResultMsg:
 			m.initWorking = false
+			m.clearForceQuitPrompt()
 			if msg.err != nil {
 				m.err = fmt.Errorf("gh auth failed: %v", msg.err)
 			}
@@ -489,7 +491,10 @@ func (m Model) viewInit() string {
 		b.WriteString(m.viewInitWorking())
 	}
 
-	if m.err != nil && m.initPhase != initPhaseWorking {
+	// Errors stay hidden while work is in flight — the working screen owns
+	// that frame — except the force-quit warning, which is only ever raised
+	// during an in-flight operation and must be visible exactly then.
+	if m.err != nil && (m.initPhase != initPhaseWorking || m.forceQuitArmed) {
 		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 

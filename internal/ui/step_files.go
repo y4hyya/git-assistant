@@ -34,6 +34,20 @@ func fileStatusStyle(s types.FileStatus) lipgloss.Style {
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// While undo or the .gitignore apply is in flight, block key input so a
+	// second press can't dispatch the same command twice (two soft resets
+	// move HEAD back two commits; a second `git rm --cached` fails on paths
+	// the first pass already removed). Spinner ticks are non-key messages
+	// and are forwarded so the animation keeps running.
+	if m.undoing || m.gitignoring {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+	}
+
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return m, nil
@@ -43,7 +57,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.confirmUndo {
 		switch keyMsg.String() {
 		case "y":
-			return m, doUndo()
+			m.confirmUndo = false
+			m.undoing = true
+			return m, tea.Batch(doUndo(), m.spinner.Tick)
 		default:
 			m.confirmUndo = false
 			return m, nil
@@ -64,6 +80,12 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 		case " ":
+			if m.cursor >= totalItems {
+				// Nothing to toggle — no changed files and an empty (or
+				// missing) .gitignore, or a stale cursor. Both branches
+				// below would index past the end of a slice.
+				return m, nil
+			}
 			if m.cursor < len(m.files) {
 				// Toggle new file for gitignore
 				m.files[m.cursor].Gitignored = !m.files[m.cursor].Gitignored
@@ -105,7 +127,8 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.gitignoreCached = cachedPaths
-			return m, doGitignore(addPaths, cachedPaths, removePaths)
+			m.gitignoring = true
+			return m, tea.Batch(doGitignore(addPaths, cachedPaths, removePaths), m.spinner.Tick)
 		case "g", "esc":
 			for i := range m.files {
 				m.files[i].Gitignored = false
@@ -113,6 +136,15 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.removeIgnored = nil
 			m.existingIgnored = nil
 			m.gitignoreMode = false
+			// The cursor may be parked in the existing-ignored zone, which
+			// doesn't exist back in commit mode — space/d there would index
+			// past the end of m.files. Mirror the confirm path's reset.
+			if m.cursor >= len(m.files) {
+				m.cursor = max(0, len(m.files)-1)
+			}
+			if m.fileScroll > m.cursor {
+				m.fileScroll = m.cursor
+			}
 		case "q":
 			m.quitting = true
 			return m, tea.Quit
@@ -233,7 +265,19 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.diffScroll++
 			}
 		case "e":
+			// An empty diff is the binary sentinel (GetFileDiff returns
+			// ErrBinaryFile, and the "d" handler stores ""). The editor
+			// would round-trip the bytes through a UTF-8 string, replacing
+			// every invalid byte with U+FFFD, and ctrl+s would write that
+			// back over the real file — unrecoverable for untracked files.
+			if m.diffContent == "" {
+				m.err = errors.New("binary file — cannot edit")
+				return m, nil
+			}
 			// Block edit for deleted files and files not on disk
+			if m.cursor >= len(m.files) {
+				return m, nil
+			}
 			currentFile := m.files[m.cursor]
 			if currentFile.Status == types.StatusDeleted {
 				return m, nil
@@ -244,6 +288,14 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			content, err := git.ReadFileContent(m.diffFile)
 			if err != nil {
 				m.err = err
+				return m, nil
+			}
+			// Defense in depth: the sentinel above covers files git reports
+			// as binary, but re-check what we actually read — the file may
+			// have changed since the diff was taken, and anything with a NUL
+			// byte must never reach the textarea.
+			if git.IsBinaryContent(content) {
+				m.err = errors.New("binary file — cannot edit")
 				return m, nil
 			}
 			m.editArea.SetValue(content)
@@ -286,8 +338,16 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case " ":
+		// The list can legitimately be empty (everything ignored, or a
+		// clean tree) — indexing it would kill the TUI.
+		if m.cursor >= len(m.files) {
+			return m, nil
+		}
 		m.files[m.cursor].Selected = !m.files[m.cursor].Selected
 	case "d":
+		if m.cursor >= len(m.files) {
+			return m, nil
+		}
 		f := m.files[m.cursor]
 		diff, err := git.GetFileDiff(f.Path, f.Status)
 		if err != nil {
@@ -578,8 +638,18 @@ func (m Model) viewFiles() string {
 				modifiedStyle.Render("!"),
 				modifiedStyle.Render(fmt.Sprintf("%d tracked file(s) will be removed from the index (git rm --cached)", trackedAdds))))
 		}
+	} else if len(m.files) == 0 {
+		b.WriteString("\n  " + dimStyle.Render("Working tree clean — nothing to select") + "\n")
 	} else {
 		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
+	}
+
+	// Async op spinners
+	if m.undoing {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Undoing last commit...") + "\n")
+	}
+	if m.gitignoring {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Updating .gitignore...") + "\n")
 	}
 
 	// Undo confirmation
@@ -686,9 +756,12 @@ func (m Model) viewDiff() string {
 
 	// Help bar
 	b.WriteString("\n")
-	currentFile := m.files[m.cursor]
+	deleted := true // no entry to check → treat as non-editable
+	if m.cursor < len(m.files) {
+		deleted = m.files[m.cursor].Status == types.StatusDeleted
+	}
 	_, fileExists := os.Stat(m.diffFile)
-	if currentFile.Status == types.StatusDeleted || fileExists != nil {
+	if deleted || fileExists != nil {
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "scroll"},
 			{"esc", "back"},
@@ -760,6 +833,10 @@ func (m Model) viewEdit() string {
 		b.WriteString(m.editArea.View())
 		b.WriteString("\n\n")
 		b.WriteString("  " + dimStyle.Render("Saving...") + "\n")
+		// Only the force-quit warning can appear while a save is in flight.
+		if m.err != nil {
+			b.WriteString("\n  " + formatError(m.err) + "\n")
+		}
 		return m.styledBox(b.String())
 	}
 
@@ -801,6 +878,12 @@ func renderHelp(entries []helpEntry) string {
 func formatError(err error) string {
 	msg := err.Error()
 	hint := ""
+
+	// Advisory warnings (prefixed with symWarn) ride the same status line as
+	// errors but aren't failures — render them without the "Error:" prefix.
+	if strings.HasPrefix(msg, symWarn) {
+		return modifiedStyle.Render(msg)
+	}
 
 	switch {
 	case strings.Contains(msg, "nothing to commit"):

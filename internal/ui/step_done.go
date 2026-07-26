@@ -26,6 +26,7 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.bodyFocused = false
 			m.pushed = false
 			m.pushBranch = ""
+			m.branchIdx = 0
 			m.gitignoreCached = nil
 			m.committing = false
 			m.pushing = false

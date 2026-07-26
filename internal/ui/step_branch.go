@@ -160,6 +160,12 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mergeTargetCursor++
 			}
 		case "enter":
+			if len(m.mergeTargets) == 0 {
+				// Detached HEAD or a single-branch repo leaves nothing to
+				// merge into — the picker renders an empty-state line and
+				// enter must not index the empty slice.
+				return m, nil
+			}
 			target := m.mergeTargets[m.mergeTargetCursor]
 			m.mergeTarget = target.Name
 			m.mergeTargetMode = false
@@ -361,6 +367,9 @@ func (m Model) viewBranch() string {
 	// ── Merge target picker ─────────────────────────────
 	if m.mergeTargetMode {
 		b.WriteString("  Merge " + branchStyle.Render(m.mergeSource) + " into:\n\n")
+		if len(m.mergeTargets) == 0 {
+			b.WriteString("  " + dimStyle.Render("no other branch to merge into") + "\n")
+		}
 		for i, entry := range m.mergeTargets {
 			cursor := "  "
 			if i == m.mergeTargetCursor {

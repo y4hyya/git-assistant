@@ -605,6 +605,27 @@ func TestRepoToplevelOutsideRepo(t *testing.T) {
 	}
 }
 
+func TestIsBinaryContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"plain text", "package main\n", false},
+		{"utf-8 text", "héllo — wörld\n", false},
+		{"empty", "", false},
+		{"nul byte", "\x89PNG\r\n\x1a\n\x00\x00", true},
+		{"trailing nul", "text\x00", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsBinaryContent(tc.content); got != tc.want {
+				t.Errorf("IsBinaryContent(%q) = %v, want %v", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
 func keys(m map[string]types.FileEntry) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

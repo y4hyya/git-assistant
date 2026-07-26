@@ -42,6 +42,14 @@ func (m Model) updateType(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scopeInput.Focus()
 		return m, nil
 	case "esc":
+		// A message-only amend (clean tree) never passed through the file
+		// selector — "back" there would land on an empty list, so return to
+		// the menu instead.
+		if m.amendMode && len(m.files) == 0 {
+			m.amendMode = false
+			m.step = stepMenu
+			return m, nil
+		}
 		m.step = stepFiles
 		m.cursor = 0
 		return m, nil

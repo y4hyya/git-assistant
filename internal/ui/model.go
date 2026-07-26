@@ -89,6 +89,7 @@ type Model struct {
 	fileScroll      int
 	branch          string
 	gitignoreMode   bool
+	gitignoring     bool // .gitignore apply in flight (blocks re-dispatch)
 	existingIgnored []string
 	removeIgnored   map[string]bool
 
@@ -162,6 +163,7 @@ type Model struct {
 
 	// Undo confirmation
 	confirmUndo bool
+	undoing     bool // soft reset in flight (blocks a second confirmation)
 
 	// Step 4 — push
 	branches   []string
@@ -220,6 +222,12 @@ type Model struct {
 	width    int
 	height   int
 	quitting bool
+
+	// Set when ctrl+c was pressed while a mutating operation was in flight.
+	// The keypress is swallowed and a warning shown; a second ctrl+c while
+	// the flag is set force-quits. Cleared by any other keypress and by
+	// every async result handler.
+	forceQuitArmed bool
 
 	// Init flow (first-run setup when cwd is not a git repo)
 	initPhase            initPhase
@@ -375,6 +383,36 @@ func (m *Model) RefreshGraphs() {
 	m.hasAnyCommit = git.HasAnyCommit()
 }
 
+// opInFlight reports whether a mutating operation is currently running as a
+// detached Bubble Tea command. Quitting mid-sequence can leave the repo in a
+// half-finished state — an auto-stash orphaned between `git stash` and
+// `git stash pop`, a merge left with MERGE_HEAD, a commit killed mid-write —
+// so ctrl+c asks for confirmation while any of these are set.
+//
+// Background fetch is deliberately excluded: it is read-only and safe to
+// abandon, and it runs often enough that guarding it would make ctrl+c feel
+// broken.
+func (m Model) opInFlight() bool {
+	return m.committing ||
+		m.pushing ||
+		m.saving ||
+		m.branchSwitching ||
+		m.branchMerging ||
+		m.pulling ||
+		m.initWorking
+}
+
+// clearForceQuitPrompt disarms the force-quit confirmation and drops its
+// warning banner. Called from every async result handler: once the operation
+// the warning referred to has finished, both are stale. Real errors set by
+// those handlers land after this call and are unaffected.
+func (m *Model) clearForceQuitPrompt() {
+	if m.forceQuitArmed {
+		m.forceQuitArmed = false
+		m.err = nil
+	}
+}
+
 // commitPrefix builds the conventional commit prefix: type(scope)!
 func (m Model) commitPrefix() string {
 	prefix := m.commitType
@@ -417,16 +455,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case undoResultMsg:
 		m.confirmUndo = false
+		m.undoing = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
 		m.files = msg.files
 		m.cursor = 0
+		m.fileScroll = 0
 		return m, nil
 
 	case saveResultMsg:
 		m.saving = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -444,6 +486,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.files = msg.files
+		// Saving a file back to its HEAD content drops it from git status,
+		// so the fresh list can be shorter than the cursor (or empty). The
+		// next frame renders the diff view, which indexes files[cursor].
+		if m.cursor >= len(m.files) {
+			m.cursor = max(0, len(m.files)-1)
+		}
+		if m.fileScroll > m.cursor {
+			m.fileScroll = m.cursor
+		}
+		if len(m.files) == 0 {
+			// Nothing left to show a diff for — fall back to the file list.
+			m.showDiff = false
+			m.diffFile = ""
+			m.diffScroll = 0
+			m.fileScroll = 0
+		}
 		m.diffContent = msg.diff
 		m.editDirty = false
 		m.editMode = false
@@ -451,6 +509,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case gitignoreResultMsg:
 		m.gitignoreMode = false
+		m.gitignoring = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -476,10 +536,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.files = freshFiles
 		m.cursor = 0
+		m.fileScroll = 0
 		return m, nil
 
 	case commitResultMsg:
 		m.committing = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -495,6 +557,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.hasRemote {
 			m.branches = git.GetBranches(m.branch)
+			// The picker selection is per-wizard-run: a stale index from an
+			// earlier run would preselect (and push to) the wrong branch, or
+			// point past the end of a list that shrank after a prune.
+			// GetBranches puts the current branch first.
+			m.branchIdx = 0
 			m.step = stepPush
 		} else {
 			m.step = stepDone
@@ -503,6 +570,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pushResultMsg:
 		m.pushing = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -514,6 +582,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case branchSwitchResultMsg:
 		m.branchSwitching = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.branchMergePending = ""
 			m.err = msg.err
@@ -543,6 +612,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case branchCreateResultMsg:
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -558,6 +628,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case branchDeleteResultMsg:
 		m.branchDeleteMode = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
@@ -571,6 +642,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case fetchResultMsg:
 		m.fetching = false
 		m.lastFetch = time.Now()
+		m.clearForceQuitPrompt()
 		// Errors are intentionally swallowed — this is a background op the
 		// user didn't ask for, so failures (offline, auth, etc.) must not
 		// surface as alarming banners. Stale ahead/behind numbers are the
@@ -590,6 +662,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pullResultMsg:
 		m.pulling = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			// Conflict → abort cleanly, route user to Branch Manager.
 			if len(msg.conflictFiles) > 0 {
@@ -610,6 +683,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case branchMergeResultMsg:
 		m.branchMerging = false
 		m.branchMergeMode = false
+		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
@@ -631,9 +705,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			// Quitting between the exec steps of a mutating sequence can
+			// orphan work (see opInFlight). Swallow the first ctrl+c and
+			// warn; a second one force-quits for users who really are stuck.
+			if m.opInFlight() && !m.forceQuitArmed {
+				m.forceQuitArmed = true
+				m.err = fmt.Errorf("%s operation in progress — ctrl+c again to force quit", symWarn)
+				return m, nil
+			}
 			m.quitting = true
 			return m, tea.Quit
 		}
+		// Any other keypress disarms the force-quit prompt.
+		m.forceQuitArmed = false
 		// Clear error on any keypress
 		m.err = nil
 		// Clear the one-shot init success banner after the user acknowledges

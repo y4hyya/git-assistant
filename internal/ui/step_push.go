@@ -23,6 +23,13 @@ func (m Model) updatePush(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// The branch list can shrink between wizard runs (`git fetch --prune`
+	// drops remote branches), and the up/down guards below never repair an
+	// index that is already past the end. Clamp before any indexing.
+	if m.branchIdx >= len(m.branches) {
+		m.branchIdx = 0
+	}
+
 	switch keyMsg.String() {
 	case "up", "k":
 		if m.branchIdx > 0 {
@@ -33,6 +40,9 @@ func (m Model) updatePush(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.branchIdx++
 		}
 	case "enter":
+		if len(m.branches) == 0 {
+			return m, nil
+		}
 		branch := m.branches[m.branchIdx]
 		m.pushBranch = branch
 		// Pre-push sync check — if the current local branch is behind its

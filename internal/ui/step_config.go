@@ -67,6 +67,13 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.configPickCursor++
 			}
 		case "enter":
+			if len(m.configPickItems) == 0 {
+				// Zero-commit repo: `git branch` lists nothing, so there is
+				// nothing to pick. Close the picker instead of indexing an
+				// empty slice.
+				m.configPickMode = false
+				return m, nil
+			}
 			selected := m.configPickItems[m.configPickCursor]
 			item := m.configItems[m.configCursor]
 			if err := git.SetConfigValue(item.key, selected, m.configGlobal); err != nil {
@@ -236,6 +243,10 @@ func (m Model) viewConfig() string {
 		if m.configPickMode && i == m.configCursor {
 			// Show inline branch picker
 			b.WriteString(fmt.Sprintf("%s%s\n", cursor, label))
+			if len(m.configPickItems) == 0 {
+				b.WriteString("     " + dimStyle.Render("(no branches yet)") + "\n")
+				continue
+			}
 			for pi, name := range m.configPickItems {
 				pickCursor := "     "
 				nameStyle := dimStyle.Render(name)
