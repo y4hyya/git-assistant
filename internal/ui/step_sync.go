@@ -8,6 +8,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// syncCommitSample caps how many incoming commit subjects the dialog lists.
+// The true count is read separately so the header never understates it.
+const syncCommitSample = 10
+
 // ── Async commands ─────────────────────────────────────
 
 // doPullCurrent merges origin/<branch> into the current branch, allowing
@@ -148,6 +152,10 @@ func (m Model) exitSyncDialog() (Model, tea.Cmd) {
 	m.syncSyncMain = false
 	m.syncIncomingCurr = nil
 	m.syncIncomingMain = nil
+	m.syncCurrTotal = 0
+	m.syncMainTotal = 0
+	m.syncAhead = 0
+	m.syncDiverged = false
 	if m.syncReturnStep == stepMenu {
 		// Back to the dashboard through the one shared door: a pull moves
 		// HEAD and can restore a stash, so status and graphs must be re-read.
@@ -174,7 +182,9 @@ func (m Model) viewSync() string {
 	b.WriteString("\n\n")
 
 	// Heading
-	if m.syncPullCurrent && m.syncSyncMain {
+	if m.syncDiverged {
+		b.WriteString("  " + highlightStyle.Render("Your branch and origin/"+m.branch+" have diverged") + "\n\n")
+	} else if m.syncPullCurrent && m.syncSyncMain {
 		b.WriteString("  " + highlightStyle.Render("Your branch is out of sync") + "\n\n")
 	} else if m.syncPullCurrent {
 		b.WriteString("  " + highlightStyle.Render("origin/"+m.branch+" has new commits") + "\n\n")
@@ -182,24 +192,23 @@ func (m Model) viewSync() string {
 		b.WriteString("  " + highlightStyle.Render(m.syncMainBranchName+" has new commits") + "\n\n")
 	}
 
+	// Diverged — pulling would undo a history rewrite
+	if m.syncDiverged {
+		b.WriteString("  " + modifiedStyle.Render(fmt.Sprintf("%s diverged from origin (%d ahead / %d behind)",
+			symWarn, m.syncAhead, m.syncCurrTotal)) + "\n")
+		b.WriteString("  " + dimStyle.Render("Pulling will merge the old commits back in. If you rewrote history") + "\n")
+		b.WriteString("  " + dimStyle.Render("(amend or undo), you want a force-push instead:") + "\n")
+		b.WriteString("  " + helpKeyStyle.Render("git push --force-with-lease") + "\n\n")
+	}
+
 	// Pull current — commit list
 	if m.syncPullCurrent && len(m.syncIncomingCurr) > 0 {
-		b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%s origin/%s (%d new):",
-			symArrowDown, m.branch, len(m.syncIncomingCurr))) + "\n")
-		for _, subj := range m.syncIncomingCurr {
-			b.WriteString("    " + dimStyle.Render("•") + " " + subj + "\n")
-		}
-		b.WriteString("\n")
+		renderIncoming(&b, "origin/"+m.branch, m.syncIncomingCurr, m.syncCurrTotal)
 	}
 
 	// Sync main — commit list
 	if m.syncSyncMain && len(m.syncIncomingMain) > 0 {
-		b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%s %s (%d new):",
-			symArrowDown, m.syncMainBranchName, len(m.syncIncomingMain))) + "\n")
-		for _, subj := range m.syncIncomingMain {
-			b.WriteString("    " + dimStyle.Render("•") + " " + subj + "\n")
-		}
-		b.WriteString("\n")
+		renderIncoming(&b, m.syncMainBranchName, m.syncIncomingMain, m.syncMainTotal)
 	}
 
 	// Spinner while operation is in flight
@@ -220,7 +229,11 @@ func (m Model) viewSync() string {
 	b.WriteString("\n")
 	entries := []helpEntry{}
 	if m.syncPullCurrent {
-		entries = append(entries, helpEntry{"p", "pull"})
+		label := "pull"
+		if m.syncDiverged {
+			label = "pull anyway"
+		}
+		entries = append(entries, helpEntry{"p", label})
 	}
 	if m.syncSyncMain {
 		entries = append(entries, helpEntry{"s", "sync with " + m.syncMainBranchName})
@@ -246,21 +259,21 @@ func (m *Model) populateSyncDialog() bool {
 	// Pull current: current branch is behind its upstream. A branch with no
 	// upstream has nothing to pull.
 	ahead, behind, hasUpstream := git.GetAheadBehind(m.branch)
-	_ = ahead
 	pullCurrent := hasUpstream && behind > 0
 	var incomingCurr []string
 	if pullCurrent {
-		incomingCurr = git.GetIncomingCommits(m.branch, "origin/"+m.branch, 10)
+		incomingCurr = git.GetIncomingCommits(m.branch, "origin/"+m.branch, syncCommitSample)
 	}
 
 	// Sync main: only meaningful when current branch is not main itself.
 	syncMain := false
+	mainTotal := 0
 	var incomingMain []string
 	if m.branch != main {
-		mainBehind := git.GetIncomingCommits(m.branch, "origin/"+main, 10)
-		if len(mainBehind) > 0 {
-			syncMain = true
-			incomingMain = mainBehind
+		mainTotal = git.CountIncomingCommits(m.branch, "origin/"+main)
+		if mainTotal > 0 {
+			incomingMain = git.GetIncomingCommits(m.branch, "origin/"+main, syncCommitSample)
+			syncMain = len(incomingMain) > 0
 		}
 	}
 
@@ -268,6 +281,32 @@ func (m *Model) populateSyncDialog() bool {
 	m.syncSyncMain = syncMain
 	m.syncIncomingCurr = incomingCurr
 	m.syncIncomingMain = incomingMain
+	m.syncCurrTotal = behind
+	m.syncMainTotal = mainTotal
+	m.syncAhead = ahead
+	// Ahead AND behind at once: the branch forked from its upstream, or its
+	// history was rewritten under it (amend/undo of a pushed commit). Pulling
+	// merges the pre-rewrite commits back in — the exact thing the rewrite
+	// was undoing — so the offer needs a warning attached.
+	m.syncDiverged = hasUpstream && ahead > 0 && behind > 0
 
 	return pullCurrent || syncMain
+}
+
+// renderIncoming writes one "↓ <ref> (N new):" section with up to
+// syncCommitSample subjects and an explicit "... and N more" when the sample
+// is short of the real count. Reading the header off len(sample) alone used to
+// render a 25-commit backlog as "(10 new)" with no hint that it was truncated.
+func renderIncoming(b *strings.Builder, label string, subjects []string, total int) {
+	if total < len(subjects) {
+		total = len(subjects)
+	}
+	b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%s %s (%d new):", symArrowDown, label, total)) + "\n")
+	for _, subj := range subjects {
+		b.WriteString("    " + dimStyle.Render(symBullet) + " " + subj + "\n")
+	}
+	if total > len(subjects) {
+		b.WriteString("    " + dimStyle.Render(fmt.Sprintf("... and %d more", total-len(subjects))) + "\n")
+	}
+	b.WriteString("\n")
 }

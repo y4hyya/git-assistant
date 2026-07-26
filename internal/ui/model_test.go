@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -748,3 +749,584 @@ var errTest = &testError{}
 type testError struct{}
 
 func (e *testError) Error() string { return "test" }
+
+// ── Branch manager: merge routing ──────────────────────
+
+// mergeModel parks a model on the branch list with a fixed set of branches:
+// feat (current), main, release, and a remote-only "hotfix".
+func mergeModel(current string) Model {
+	entries := []types.BranchEntry{
+		{Name: "feat", IsCurrent: current == "feat"},
+		{Name: "main", IsCurrent: current == "main"},
+		{Name: "release", IsCurrent: current == "release"},
+		{Name: "hotfix", IsRemote: true},
+	}
+	return Model{
+		step:          stepBranch,
+		branch:        current,
+		branchEntries: entries,
+		width:         140,
+		height:        60,
+	}
+}
+
+func branchIndex(t *testing.T, m Model, name string) int {
+	t.Helper()
+	for i, e := range m.branchEntries {
+		if e.Name == name {
+			return i
+		}
+	}
+	t.Fatalf("branch %q missing from the fixture", name)
+	return -1
+}
+
+// "merge my feature into main" is the most common merge there is, and it used
+// to be rejected outright with "cannot merge a branch into itself".
+func TestMergeFromCurrentBranchOpensTargetPicker(t *testing.T) {
+	m := mergeModel("feat")
+	m.branchCursor = branchIndex(t, m, "feat")
+
+	m, _ = key(t, m, "m")
+	if m.err != nil {
+		t.Fatalf("pressing m on the current branch errored: %v", m.err)
+	}
+	if !m.mergeTargetMode {
+		t.Fatal("target picker did not open")
+	}
+	if m.mergeSource != "feat" {
+		t.Fatalf("mergeSource = %q, want feat", m.mergeSource)
+	}
+	for _, tgt := range m.mergeTargets {
+		if tgt.Name == "feat" {
+			t.Error("the source was offered as its own merge target")
+		}
+		if tgt.IsRemote {
+			t.Errorf("remote-only branch %q offered as a merge target", tgt.Name)
+		}
+	}
+	// With the source excluded there is no "current" entry left, so the
+	// picker should land on main.
+	if got := m.mergeTargets[m.mergeTargetCursor].Name; got != "main" {
+		t.Errorf("preselected target = %q, want main", got)
+	}
+}
+
+// Source == current: confirming must switch to the target first, then merge.
+func TestMergeIntoOtherBranchSwitchesFirst(t *testing.T) {
+	m := mergeModel("feat")
+	m.branchCursor = branchIndex(t, m, "feat")
+	m, _ = key(t, m, "m")
+	m, _ = key(t, m, "enter") // pick main
+
+	if !m.branchMergeMode || m.mergeTarget != "main" {
+		t.Fatalf("mergeMode = %v, target = %q; want true / main", m.branchMergeMode, m.mergeTarget)
+	}
+
+	m, cmd := key(t, m, "y")
+	if cmd == nil {
+		t.Fatal("confirming the merge dispatched nothing")
+	}
+	if !m.branchSwitching {
+		t.Fatal("the switch leg did not start")
+	}
+	if m.branchMergePending != "feat" {
+		t.Fatalf("branchMergePending = %q, want feat", m.branchMergePending)
+	}
+	if m.branchMerging {
+		t.Fatal("merge started before the switch completed")
+	}
+}
+
+// Source != current, target == current: merge directly, no switch.
+func TestMergeIntoCurrentBranchMergesDirectly(t *testing.T) {
+	m := mergeModel("main")
+	m.branchCursor = branchIndex(t, m, "feat")
+	m, _ = key(t, m, "m")
+
+	if got := m.mergeTargets[m.mergeTargetCursor].Name; got != "main" {
+		t.Fatalf("preselected target = %q, want the current branch (main)", got)
+	}
+	m, _ = key(t, m, "enter")
+	m, cmd := key(t, m, "y")
+	if cmd == nil {
+		t.Fatal("confirming the merge dispatched nothing")
+	}
+	if !m.branchMerging {
+		t.Fatal("merge did not start")
+	}
+	if m.branchSwitching || m.branchMergePending != "" {
+		t.Fatalf("merging into the branch we're on took the switch path (switching=%v pending=%q)",
+			m.branchSwitching, m.branchMergePending)
+	}
+}
+
+func TestMergeConfirmDisclosesTheSwitch(t *testing.T) {
+	m := mergeModel("feat")
+	m.branchMergeMode = true
+	m.mergeSource = "feat"
+	m.mergeTarget = "main"
+
+	out := m.viewBranch()
+	if !strings.Contains(out, "switch to main and merge feat into it") {
+		t.Errorf("merge confirmation hides the branch switch:\n%s", out)
+	}
+
+	// Merging into the branch you're already on must not claim a switch.
+	m.mergeTarget = "feat"
+	if out := m.viewBranch(); strings.Contains(out, "switch to") {
+		t.Errorf("same-branch merge claimed a switch:\n%s", out)
+	}
+}
+
+// ── Branch manager: force delete ───────────────────────
+
+func TestForceDeleteConfirmationStateMachine(t *testing.T) {
+	m := mergeModel("main")
+	m.branchCursor = branchIndex(t, m, "feat")
+	m.branchDeleting = true
+
+	notMerged := fmt.Errorf("%w: error: the branch 'feat' is not fully merged", git.ErrBranchNotMerged)
+	next, _ := m.Update(branchDeleteResultMsg{err: notMerged, name: "feat"})
+	m = next.(Model)
+
+	if !m.branchForceDeleteMode || m.branchForceDeleteName != "feat" {
+		t.Fatalf("force prompt = %v (%q); want true / feat", m.branchForceDeleteMode, m.branchForceDeleteName)
+	}
+	if m.err != nil {
+		t.Errorf("raw git output surfaced instead of the confirmation: %v", m.err)
+	}
+	if m.branchDeleting {
+		t.Error("in-flight flag survived the result message")
+	}
+	if out := m.viewBranch(); !strings.Contains(out, "not merged into any other branch") {
+		t.Errorf("force-delete screen does not explain itself:\n%s", out)
+	}
+
+	// Anything other than y cancels without deleting.
+	cancelled, cmd := key(t, m, "n")
+	if cancelled.branchForceDeleteMode || cmd != nil {
+		t.Fatalf("n did not cancel the force delete (mode=%v cmd=%v)", cancelled.branchForceDeleteMode, cmd != nil)
+	}
+
+	forced, cmd := key(t, m, "y")
+	if cmd == nil || !forced.branchDeleting {
+		t.Fatal("y did not dispatch the force delete")
+	}
+	if forced.branchForceDeleteMode || forced.branchForceDeleteName != "" {
+		t.Error("force-delete prompt state survived the confirmation")
+	}
+}
+
+func TestOtherDeleteFailuresStillSurface(t *testing.T) {
+	m := mergeModel("main")
+	next, _ := m.Update(branchDeleteResultMsg{err: errors.New("branch 'x' not found"), name: "x"})
+	got := next.(Model)
+	if got.branchForceDeleteMode {
+		t.Fatal("an unrelated delete failure opened the force-delete prompt")
+	}
+	if got.err == nil {
+		t.Fatal("the delete error was swallowed")
+	}
+}
+
+// ── Branch manager: single-shot create / delete ────────
+
+func TestBranchCreateValidatesNameAndIsSingleShot(t *testing.T) {
+	tempRepo(t, "chore: seed", "") // CheckRefFormatBranch shells out to git
+	m := wizardModel(t, stepBranch)
+	m.branchCreateMode = true
+	m.branchCreateInput.SetValue("my new feature")
+
+	m, cmd := key(t, m, "enter")
+	if cmd != nil {
+		t.Fatal("an invalid branch name was sent to git anyway")
+	}
+	if m.err == nil {
+		t.Fatal("no inline error for an invalid branch name")
+	}
+	if !strings.Contains(m.err.Error(), "can't contain spaces") {
+		t.Errorf("error = %q, want the beginner-readable line first", m.err)
+	}
+	if !strings.Contains(m.err.Error(), "not a valid branch name") {
+		t.Errorf("error = %q, want git's own text kept as a second line", m.err)
+	}
+	if !m.branchCreateMode {
+		t.Fatal("a rejected name kicked the user out of create mode")
+	}
+	if out := m.viewBranch(); !strings.Contains(out, "can't contain spaces") {
+		t.Errorf("create screen does not render the validation error:\n%s", out)
+	}
+
+	m.branchCreateInput.SetValue("feat/ok")
+	m, cmd = key(t, m, "enter")
+	if cmd == nil || !m.branchCreating {
+		t.Fatalf("a valid name did not dispatch a create (cmd=%v creating=%v)", cmd != nil, m.branchCreating)
+	}
+
+	m, cmd = key(t, m, "enter")
+	if cmd != nil {
+		t.Fatal("a second enter fired a second create")
+	}
+
+	next, _ := m.Update(branchCreateResultMsg{err: errTest})
+	if next.(Model).branchCreating {
+		t.Fatal("branchCreating not cleared by branchCreateResultMsg")
+	}
+}
+
+func TestBranchDeleteIsSingleShot(t *testing.T) {
+	m := mergeModel("main")
+	m.branchCursor = branchIndex(t, m, "feat")
+	m.branchDeleteMode = true
+
+	m, cmd := key(t, m, "y")
+	if cmd == nil || !m.branchDeleting {
+		t.Fatalf("delete was not dispatched (cmd=%v deleting=%v)", cmd != nil, m.branchDeleting)
+	}
+	if m.branchDeleteMode {
+		t.Error("delete confirmation stayed open")
+	}
+
+	// The list stays on screen while the delete runs, so enter on the dying
+	// branch used to race a checkout against `git branch -d`.
+	m, cmd = key(t, m, "enter")
+	if cmd != nil {
+		t.Fatal("input was live during an in-flight delete")
+	}
+
+	next, _ := m.Update(branchDeleteResultMsg{err: errTest, name: "feat"})
+	if next.(Model).branchDeleting {
+		t.Fatal("branchDeleting not cleared by branchDeleteResultMsg")
+	}
+}
+
+// ── Branch manager: auto-stash around merges ───────────
+
+func TestMergeAutoStashesAndRestoresADirtyTree(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitRun(t, "checkout", "-q", "-b", "feat")
+	writeFile(t, "feature.txt", "feature\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: work")
+	gitRun(t, "checkout", "-q", "main")
+
+	// Uncommitted work that has nothing to do with the merge.
+	writeFile(t, "seed.txt", "dirty\n")
+
+	msg, ok := doMergeBranch("feat")().(branchMergeResultMsg)
+	if !ok {
+		t.Fatal("doMergeBranch returned the wrong message type")
+	}
+	if msg.err != nil {
+		t.Fatalf("merge on a dirty tree failed: %v", msg.err)
+	}
+	if !msg.merged || !msg.stashRestored {
+		t.Fatalf("merged=%v stashRestored=%v; want both true", msg.merged, msg.stashRestored)
+	}
+	if got := readFile(t, "seed.txt"); got != "dirty\n" {
+		t.Errorf("uncommitted change lost: seed.txt = %q", got)
+	}
+	if _, err := os.Stat("feature.txt"); err != nil {
+		t.Errorf("the merge did not land: %v", err)
+	}
+	if n := stashDepth(t); n != 0 {
+		t.Errorf("%d stash entr(ies) left behind", n)
+	}
+
+	// The success note has to state what happened to the changes.
+	m := wizardModel(t, stepBranch)
+	next, _ := m.Update(msg)
+	if note := next.(Model).branchOpNote; !strings.Contains(note, "stashed and restored") {
+		t.Errorf("result note = %q, want the stash disclosed", note)
+	}
+}
+
+// The menu's sync shortcut merges from outside the branch manager, where
+// there is no note line — the stash round-trip still has to be stated, and
+// nothing may be parked on the model to resurface later.
+func TestMergeStashNoteReachesTheMenuToo(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepMenu)
+	next, _ := m.Update(branchMergeResultMsg{source: "origin/main", merged: true, stashRestored: true})
+	got := next.(Model)
+	if got.branchOpNote != "" {
+		t.Errorf("a stale branch-manager note was parked on the model: %q", got.branchOpNote)
+	}
+	if got.err == nil || !strings.Contains(got.err.Error(), "stashed and restored") {
+		t.Fatalf("the stash round-trip was not stated on the menu: %v", got.err)
+	}
+	if !strings.HasPrefix(got.err.Error(), symWarn) {
+		t.Errorf("advisory note = %q, want the symWarn prefix so it renders as a note", got.err)
+	}
+}
+
+func TestMergeConflictOnADirtyTreeRestoresTheStash(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	writeFile(t, "shared.txt", "base\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "add shared")
+
+	gitRun(t, "checkout", "-q", "-b", "feat")
+	writeFile(t, "shared.txt", "from feat\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: change shared")
+
+	gitRun(t, "checkout", "-q", "main")
+	writeFile(t, "shared.txt", "from main\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "chore: change shared")
+
+	// Unrelated uncommitted work that must survive the failed merge.
+	writeFile(t, "notes.txt", "in progress\n")
+
+	msg := doMergeBranch("feat")().(branchMergeResultMsg)
+	if msg.err == nil {
+		t.Fatal("the conflicting merge succeeded")
+	}
+	if !msg.stashed {
+		t.Fatal("the dirty tree was not stashed before merging")
+	}
+
+	m := wizardModel(t, stepBranch)
+	next, _ := m.Update(msg)
+	got := next.(Model)
+	if got.err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if !strings.Contains(got.err.Error(), "restored") {
+		t.Errorf("error = %q, want it to state what happened to the stash", got.err)
+	}
+	if content := readFile(t, "notes.txt"); content != "in progress\n" {
+		t.Errorf("uncommitted work not restored: notes.txt = %q", content)
+	}
+	if n := stashDepth(t); n != 0 {
+		t.Errorf("%d stash entr(ies) left behind after recovery", n)
+	}
+}
+
+// A checkout that fails after the auto-stash used to drop both the pop error
+// and the stash ref, leaving the user's work in an unmentioned stash.
+func TestSwitchFailureRestoresAndReportsTheStash(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	writeFile(t, "seed.txt", "dirty\n")
+
+	msg := doSwitchBranch("no-such-branch", false)().(branchSwitchResultMsg)
+	if msg.err == nil {
+		t.Fatal("switching to a nonexistent branch succeeded")
+	}
+	if !strings.Contains(msg.err.Error(), "stashed and restored") {
+		t.Errorf("error = %q, want the stash round-trip stated", msg.err)
+	}
+	if got := readFile(t, "seed.txt"); got != "dirty\n" {
+		t.Errorf("uncommitted change lost: seed.txt = %q", got)
+	}
+	if n := stashDepth(t); n != 0 {
+		t.Errorf("%d stash entr(ies) left behind", n)
+	}
+}
+
+func TestFailedSwitchCancelsThePendingMerge(t *testing.T) {
+	m := mergeModel("feat")
+	m.branchSwitching = true
+	m.branchMergePending = "feat"
+
+	next, _ := m.Update(branchSwitchResultMsg{err: errors.New("checkout blew up")})
+	got := next.(Model)
+	if got.branchMergePending != "" {
+		t.Error("pending merge survived a failed switch")
+	}
+	if got.err == nil || !strings.Contains(got.err.Error(), "cancelled") {
+		t.Errorf("error = %v, want the cancelled merge stated", got.err)
+	}
+}
+
+// ── Sync dialog honesty ────────────────────────────────
+
+func TestSyncDialogFlagsADivergedBranch(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	remote := t.TempDir()
+	gitRun(t, "init", "-q", "--bare", remote)
+	gitRun(t, "remote", "add", "origin", remote)
+	gitRun(t, "push", "-q", "-u", "origin", "main")
+	// Rewriting a pushed commit leaves the branch 1 ahead and 1 behind.
+	gitRun(t, "commit", "-q", "--amend", "-m", "chore: seed (amended)")
+
+	m := wizardModel(t, stepSync)
+	m.branch = "main"
+	m.hasRemote = true
+	if !m.populateSyncDialog() {
+		t.Fatal("the dialog did not fire on a diverged branch")
+	}
+	if !m.syncDiverged {
+		t.Fatalf("syncDiverged = false (ahead %d / behind %d)", m.syncAhead, m.syncCurrTotal)
+	}
+	if m.syncAhead != 1 || m.syncCurrTotal != 1 {
+		t.Fatalf("ahead/behind = %d/%d, want 1/1", m.syncAhead, m.syncCurrTotal)
+	}
+	if !m.syncPullCurrent {
+		t.Error("pull was removed instead of being warned about")
+	}
+
+	out := m.viewSync()
+	if !strings.Contains(out, "diverged from origin (1 ahead / 1 behind)") {
+		t.Errorf("the dialog does not disclose the divergence:\n%s", out)
+	}
+	if !strings.Contains(out, "force-with-lease") {
+		t.Errorf("the dialog does not point at force-push:\n%s", out)
+	}
+	if !strings.Contains(out, "pull anyway") {
+		t.Errorf("the pull offer is not qualified:\n%s", out)
+	}
+}
+
+func TestSyncDialogDoesNotWarnOnAPlainBehindBranch(t *testing.T) {
+	m := Model{
+		step: stepSync, width: 140, height: 60, branch: "main",
+		syncPullCurrent:  true,
+		syncIncomingCurr: []string{"one", "two"},
+		syncCurrTotal:    2,
+	}
+	out := m.viewSync()
+	if strings.Contains(out, "diverged") {
+		t.Errorf("a behind-only branch got the divergence warning:\n%s", out)
+	}
+	if !strings.Contains(out, "(2 new)") {
+		t.Errorf("count missing:\n%s", out)
+	}
+	if strings.Contains(out, "and 0 more") {
+		t.Errorf("spurious truncation marker:\n%s", out)
+	}
+}
+
+func TestSyncDialogReportsCommitsBeyondTheSample(t *testing.T) {
+	m := Model{
+		step: stepSync, width: 140, height: 60, branch: "main",
+		syncPullCurrent:  true,
+		syncIncomingCurr: []string{"one", "two", "three"},
+		syncCurrTotal:    25,
+	}
+	out := m.viewSync()
+	if !strings.Contains(out, "(25 new)") {
+		t.Errorf("header understates the backlog:\n%s", out)
+	}
+	if !strings.Contains(out, "and 22 more") {
+		t.Errorf("no marker for the commits it isn't listing:\n%s", out)
+	}
+}
+
+// ── Init flow ──────────────────────────────────────────
+
+func TestInitPickersQuitOnQ(t *testing.T) {
+	for _, phase := range []initPhase{initPhasePickTemplate, initPhasePickVisibility} {
+		m := Model{step: stepInit, initPhase: phase, width: 140, height: 60}
+		m.initTemplateOptions = git.GitignoreTemplates()
+		m, cmd := key(t, m, "q")
+		if !m.quitting || cmd == nil {
+			t.Errorf("q on init phase %d did nothing", phase)
+		}
+	}
+}
+
+func TestIsValidGitURL(t *testing.T) {
+	cases := []struct {
+		url string
+		ok  bool
+	}{
+		{"https://github.com/u/r.git", true},
+		{"http://example.com/r", true},
+		{"ssh://git@example.com:22/u/r.git", true},
+		{"git://example.com/r.git", true},
+		{"git+ssh://example.com/r.git", true},
+		{"file:///srv/git/r.git", true},
+		{"git@github.com:u/r.git", true},
+		{"github.com:u/r.git", true}, // scp-form without user@
+		{"gh:u/r", true},             // ssh config alias
+		{"/srv/git/r.git", true},
+		{"./r.git", true},
+		{"../other-repo", true},
+		{"", false},
+		{"origin", false},
+		{"repo.git", false},
+		{"https://", false},
+		{"https://x y z", false},
+		{"git@github.com:u/r .git", false},
+		{`C:\repos\r`, false},
+		{"C:/repos/r", false},
+	}
+	for _, c := range cases {
+		if got := isValidGitURL(c.url); got != c.ok {
+			t.Errorf("isValidGitURL(%q) = %v, want %v", c.url, got, c.ok)
+		}
+	}
+}
+
+func TestInitWarningIsStickyOnTheMenu(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepInit)
+	m.initPhase = initPhaseWorking
+	m.initWorking = true
+
+	next, _ := m.Update(initResultMsg{
+		branch:  "main",
+		message: "Connected to git@example.com:u/r.git — commit then push from the menu.",
+		warning: "this repository and origin/main have unrelated histories — pushing and pulling will be rejected.",
+	})
+	got := next.(Model)
+	if got.step != stepMenu {
+		t.Fatalf("step = %v, want stepMenu (the remote was still configured)", got.step)
+	}
+	if got.err == nil || !strings.Contains(got.err.Error(), "unrelated histories") {
+		t.Fatalf("warning not surfaced: %v", got.err)
+	}
+	if !isRecoveryError(got.err) {
+		t.Error("the warning is not sticky — an arrow key would wipe it")
+	}
+	// An ordinary keypress must not clear it; esc must.
+	after, _ := key(t, got, "j")
+	if after.err == nil {
+		t.Error("a navigation key cleared the warning")
+	}
+	dismissed, _ := key(t, after, "esc")
+	if dismissed.err != nil {
+		t.Error("esc did not dismiss the warning")
+	}
+}
+
+// ── Small helpers ──────────────────────────────────────
+
+func gitRun(t *testing.T, args ...string) {
+	t.Helper()
+	if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func stashDepth(t *testing.T) int {
+	t.Helper()
+	out, err := exec.Command("git", "stash", "list").Output()
+	if err != nil {
+		t.Fatalf("git stash list: %v", err)
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return 0
+	}
+	return len(strings.Split(trimmed, "\n"))
+}

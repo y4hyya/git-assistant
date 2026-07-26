@@ -21,6 +21,18 @@ var (
 	symSkip       = "⊘"
 	symDirty      = "●"
 	symWarn       = "⚠"
+	symEllipsis   = "…"
+	symHRule      = "─"
+	symMidDot     = "·"
+	symBullet     = "•"
+
+	// Commit-graph glyphs. git emits `*`, `|`, `/`, `\`, `_`, `-` and `.`;
+	// these are the display forms. `-` and `.` only ever show up on octopus
+	// merge rows (`*-----.`), where they draw the horizontal reach out to the
+	// extra parents and the corner where the last one turns down.
+	symGraphVert   = "│"
+	symGraphDash   = "─"
+	symGraphCorner = "╮"
 )
 
 func init() {
@@ -37,38 +49,73 @@ func init() {
 		symSkip = "-"
 		symDirty = "*"
 		symWarn = "!"
+		symEllipsis = "..."
+		symHRule = "-"
+		symMidDot = "-"
+		symBullet = "*"
+		symGraphVert = "|"
+		symGraphDash = "-"
+		symGraphCorner = "."
 	}
 }
 
+// isUnicodeSupported decides between the Unicode and ASCII symbol sets.
+//
+// The rule, in order:
+//  1. TERM=dumb — no rendering guarantees at all, so ASCII.
+//  2. An explicitly set locale wins over everything: the first of
+//     LC_ALL / LC_CTYPE / LANG that is non-empty decides, and it has to say
+//     UTF-8 or the terminal genuinely cannot render multi-byte glyphs
+//     (LANG=C used to slip through the old TERM fallback and print mojibake).
+//  3. Nothing set at all — the modern default. Terminals that ship without a
+//     locale (macOS Terminal over ssh, most container shells) are UTF-8 in
+//     practice, and downgrading them to ASCII punished the common case.
 func isUnicodeSupported() bool {
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
 	for _, env := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
 		val := os.Getenv(env)
-		if strings.Contains(strings.ToLower(val), "utf") {
-			return true
+		if val == "" {
+			continue
 		}
+		lower := strings.ToLower(val)
+		return strings.Contains(lower, "utf-8") || strings.Contains(lower, "utf8")
 	}
-	term := os.Getenv("TERM")
-	return term != "" && term != "dumb"
+	return true
 }
 
 var (
-	// Colors
-	purple    = lipgloss.Color("#7C3AED")
-	green     = lipgloss.Color("#10B981")
-	yellow    = lipgloss.Color("#F59E0B")
-	red       = lipgloss.Color("#EF4444")
-	blue      = lipgloss.Color("#3B82F6")
-	gray      = lipgloss.Color("#6B7280")
-	lightGray = lipgloss.Color("#9CA3AF")
-	white     = lipgloss.Color("#E5E7EB")
-	dimColor  = lipgloss.Color("#4B5563")
-	cyan      = lipgloss.Color("#06B6D4")
+	// Colors. Every foreground that lands on the terminal's own background is
+	// an AdaptiveColor: the Dark value is the original palette, the Light one
+	// is the readable counterpart for white-background terminals, where the
+	// old near-white text was invisible. The names still describe the dark
+	// value (that is what a reader of `white` expects to see on a dark term).
+	// NO_COLOR is unaffected — lipgloss drops all of this when it is set.
+	purple    = lipgloss.AdaptiveColor{Light: "#6D28D9", Dark: "#A78BFA"}
+	green     = lipgloss.AdaptiveColor{Light: "#047857", Dark: "#34D399"}
+	yellow    = lipgloss.AdaptiveColor{Light: "#B45309", Dark: "#FBBF24"}
+	red       = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#F87171"}
+	blue      = lipgloss.AdaptiveColor{Light: "#1D4ED8", Dark: "#60A5FA"}
+	gray      = lipgloss.AdaptiveColor{Light: "#4B5563", Dark: "#9CA3AF"}
+	lightGray = lipgloss.AdaptiveColor{Light: "#374151", Dark: "#D1D5DB"}
+	white     = lipgloss.AdaptiveColor{Light: "#111827", Dark: "#E5E7EB"}
+	dimColor  = lipgloss.AdaptiveColor{Light: "#9CA3AF", Dark: "#4B5563"}
+	cyan      = lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#22D3EE"}
+	amber     = lipgloss.AdaptiveColor{Light: "#B45309", Dark: "#FBBF24"}
+	violet    = lipgloss.AdaptiveColor{Light: "#6D28D9", Dark: "#C4B5FD"}
+
+	// Brand badge. A solid background carries its own contrast, so this pair
+	// stays fixed in both themes — it is the one place the identity purple is
+	// pinned rather than adapted.
+	brandPurple = lipgloss.Color("#7C3AED")
+	brandText   = lipgloss.Color("#FFFFFF")
 
 	// Header
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(purple).
+			Foreground(brandText).
+			Background(brandPurple).
 			Padding(0, 1)
 
 	branchStyle = lipgloss.NewStyle().
@@ -84,7 +131,7 @@ var (
 	addedStyle     = lipgloss.NewStyle().Foreground(green).Bold(true)
 	deletedStyle   = lipgloss.NewStyle().Foreground(red).Bold(true)
 	untrackedStyle = lipgloss.NewStyle().Foreground(blue).Bold(true)
-	renamedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B5CF6")).Bold(true)
+	renamedStyle   = lipgloss.NewStyle().Foreground(violet).Bold(true)
 
 	// List items
 	cursorStyle     = lipgloss.NewStyle().Foreground(purple).Bold(true)
@@ -93,7 +140,7 @@ var (
 	dimmedCheck     = lipgloss.NewStyle().Foreground(dimColor).Bold(true)
 	unselectedCheck = lipgloss.NewStyle().Foreground(dimColor)
 	filePathStyle   = lipgloss.NewStyle().Foreground(white)
-	highlightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+	highlightStyle  = lipgloss.NewStyle().Foreground(white).Bold(true)
 
 	// Radio list
 	activeStyle   = lipgloss.NewStyle().Foreground(purple).Bold(true)
@@ -126,5 +173,12 @@ var (
 	// Graph panels
 	graphTitleStyle = lipgloss.NewStyle().
 			Foreground(cyan).
+			Bold(true)
+
+	// Tag refs in the commit graph. Deliberately not branchStyle: a tag marks
+	// a release, it is not somewhere you can check out and commit onto, and
+	// amber is what every terminal tool uses to say "release" without words.
+	tagStyle = lipgloss.NewStyle().
+			Foreground(amber).
 			Bold(true)
 )

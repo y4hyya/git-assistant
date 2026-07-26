@@ -1,17 +1,93 @@
 package git
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"git-assist/internal/types"
 )
 
 // ErrBinaryFile is returned when a file is detected as binary.
 var ErrBinaryFile = errors.New("binary file")
+
+// ── Remote operations: timeout and cancellation ────────
+
+// networkTimeout bounds every command that talks to a remote. Without it a
+// stalled fetch/push (dead network, ssh waiting on a passphrase it can't
+// prompt for) locks the TUI spinner forever, and the user can only force-quit
+// without ever learning whether the operation finished.
+const networkTimeout = 60 * time.Second
+
+var (
+	// ErrNetworkTimeout is returned when a remote operation outlived
+	// networkTimeout. Identified with errors.Is by callers that want to skip
+	// the usual "here is git's output" formatting — there isn't any.
+	ErrNetworkTimeout = errors.New("network operation timed out after 60s — check your connection")
+
+	// ErrNetworkCancelled is returned when CancelNetworkOps killed the
+	// command mid-flight.
+	ErrNetworkCancelled = errors.New("network operation cancelled")
+)
+
+// netCtx parents every remote command. Cancelling it kills the child process
+// too (that is what exec.CommandContext buys us), which matters most for
+// `gh repo create`: on a plain process exit the orphaned child kept running
+// and created the repository the user had just tried to cancel.
+var netCtx, netCancel = context.WithCancel(context.Background())
+
+// CancelNetworkOps aborts every in-flight remote operation. Wired into the
+// force-quit path — after it runs, further remote calls fail fast with
+// ErrNetworkCancelled, which is correct for a process on its way out.
+func CancelNetworkOps() { netCancel() }
+
+// runNetworkTimeout runs a remote-touching command under an explicit deadline.
+// Local-only git commands deliberately get no timeout: a large merge or
+// checkout can legitimately take minutes and killing it mid-write is worse
+// than waiting.
+func runNetworkTimeout(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	return runNetworkCtx(netCtx, timeout, name, args...)
+}
+
+// runNetworkCtx is runNetworkTimeout with the parent context spelled out, so
+// the cancellation path is reachable from a test without cancelling the
+// package-level netCtx for the rest of the process.
+func runNetworkCtx(parent context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return out, ErrNetworkTimeout
+		case errors.Is(ctx.Err(), context.Canceled):
+			return out, ErrNetworkCancelled
+		}
+	}
+	return out, err
+}
+
+func runNetwork(name string, args ...string) ([]byte, error) {
+	return runNetworkTimeout(networkTimeout, name, args...)
+}
+
+// netFail turns a runNetwork failure into the error callers surface. A timeout
+// or cancellation already explains itself and has no meaningful output;
+// anything else carries git's own text under the given prefix.
+func netFail(prefix string, out []byte, err error) error {
+	if errors.Is(err, ErrNetworkTimeout) || errors.Is(err, ErrNetworkCancelled) {
+		return err
+	}
+	msg := strings.TrimSpace(string(out))
+	if prefix != "" {
+		return fmt.Errorf("%s: %s", prefix, msg)
+	}
+	return fmt.Errorf("%s", msg)
+}
 
 // IsGitRepo checks if the current directory is inside a git repository.
 func IsGitRepo() bool {
@@ -119,9 +195,9 @@ func GHCreateRepo(name string, private bool, push bool) error {
 	if push {
 		args = append(args, "--push")
 	}
-	out, err := exec.Command("gh", args...).CombinedOutput()
+	out, err := runNetwork("gh", args...)
 	if err != nil {
-		return fmt.Errorf("gh repo create failed: %s", strings.TrimSpace(string(out)))
+		return netFail("gh repo create failed", out, err)
 	}
 	return nil
 }
@@ -134,9 +210,9 @@ func HasAnyCommit() bool {
 // PushInitial pushes the current branch to origin and sets upstream tracking.
 // Used after InitRepo + AddOriginRemote when connecting to an existing remote.
 func PushInitial(branch string) error {
-	out, err := exec.Command("git", "push", "-u", "origin", branch).CombinedOutput()
+	out, err := runNetwork("git", "push", "-u", "origin", branch)
 	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+		return netFail("", out, err)
 	}
 	return nil
 }
@@ -268,9 +344,9 @@ func HasRemote() bool {
 // Fetch updates all remote-tracking refs. Non-destructive: never touches the
 // working tree, index, or local branches — only refs under refs/remotes/*.
 func Fetch() error {
-	out, err := exec.Command("git", "fetch", "--all", "--prune", "--quiet").CombinedOutput()
+	out, err := runNetwork("git", "fetch", "--all", "--prune", "--quiet")
 	if err != nil {
-		return fmt.Errorf("fetch: %s", strings.TrimSpace(string(out)))
+		return netFail("fetch", out, err)
 	}
 	return nil
 }
@@ -463,9 +539,9 @@ func Push(currentBranch, targetBranch string) error {
 		args = []string{"push", "origin", "HEAD:" + targetBranch}
 	}
 
-	out, err := exec.Command("git", args...).CombinedOutput()
+	out, err := runNetwork("git", args...)
 	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+		return netFail("", out, err)
 	}
 	return nil
 }
@@ -852,9 +928,16 @@ func GetRemoteURL() string {
 
 // GetUnifiedGraph returns the git log graph for all branches (local + remote).
 // Uses %d to include branch name decorations on relevant commits.
+//
+// %x1f (ASCII unit separator) is emitted between the subject and the
+// decorations so the renderer can tell them apart. With a bare "%s%d" the two
+// are only separated by " (", which is also legal inside a subject — a commit
+// titled "fix: handle (edge case)" then rendered "(edge case)" as if it were a
+// branch. git strips control characters from header lines, so 0x1f cannot
+// occur inside a subject and the split is unambiguous.
 func GetUnifiedGraph(limit int) string {
 	out, err := exec.Command("git", "log", "--graph",
-		"--format=%s%d", "--all",
+		"--format=%s%x1f%d", "--all",
 		fmt.Sprintf("-%d", limit)).Output()
 	if err != nil {
 		return ""
@@ -983,13 +1066,54 @@ func CreateBranch(name string) error {
 	return nil
 }
 
-// DeleteBranch deletes a local branch (safe delete, -d).
-func DeleteBranch(name string) error {
-	out, err := exec.Command("git", "branch", "-d", name).CombinedOutput()
+// ErrBranchNotMerged marks the one `git branch -d` refusal that has an answer
+// inside the TUI: the branch holds commits no other branch contains. Callers
+// match it with errors.Is and offer a force delete instead of dead-ending on
+// git's raw multi-line output.
+var ErrBranchNotMerged = errors.New("branch is not fully merged")
+
+// DeleteBranch deletes a local branch. force picks `git branch -D` (drops
+// unmerged commits, recoverable only through the reflog) over the safe `-d`.
+// A safe delete git refuses as unmerged comes back wrapped in
+// ErrBranchNotMerged, with git's own text preserved for display.
+func DeleteBranch(name string, force bool) error {
+	flag := "-d"
+	if force {
+		flag = "-D"
+	}
+	out, err := exec.Command("git", "branch", flag, name).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		if !force && strings.Contains(msg, "not fully merged") {
+			return fmt.Errorf("%w: %s", ErrBranchNotMerged, msg)
+		}
+		return fmt.Errorf("%s", msg)
 	}
 	return nil
+}
+
+// CheckRefFormatBranch asks git whether name can be a branch name. git is the
+// authority on ref-name rules (control characters, "..", "@{", trailing "/",
+// leading "-", reserved sequences) and reimplementing them here would drift;
+// `git check-ref-format --branch` needs no repository and no network.
+// Returns nil when the name is usable; otherwise git's own one-line fatal.
+func CheckRefFormatBranch(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("branch name is empty")
+	}
+	out, err := exec.Command("git", "check-ref-format", "--branch", name).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(string(out))
+	// git appends hint lines to some refusals; the fatal is the useful line.
+	if i := strings.IndexByte(msg, '\n'); i > 0 {
+		msg = msg[:i]
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("fatal: '%s' is not a valid branch name", name)
+	}
+	return errors.New(msg)
 }
 
 // MergeBranch merges the given branch into the current branch.
@@ -1011,9 +1135,9 @@ func MergeFromOrigin(branch string, noFF bool) error {
 		args = append(args, "--no-ff")
 	}
 	args = append(args, "origin/"+branch)
-	out, err := exec.Command("git", args...).CombinedOutput()
+	out, err := runNetwork("git", args...)
 	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+		return netFail("", out, err)
 	}
 	return nil
 }
@@ -1036,6 +1160,77 @@ func GetIncomingCommits(from, to string, limit int) []string {
 		}
 	}
 	return commits
+}
+
+// CountIncomingCommits returns how many commits are reachable from `to` but not
+// from `from` — the true size of the set GetIncomingCommits only samples. The
+// sync dialog needs both: the sample to show, the count to be honest about
+// what it isn't showing. Returns 0 when either ref is missing.
+func CountIncomingCommits(from, to string) int {
+	out, err := exec.Command("git", "rev-list", "--count", from+".."+to).Output()
+	if err != nil {
+		return 0
+	}
+	var count int
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count)
+	return count
+}
+
+// RemoteDefaultBranch returns the remote-tracking ref that best represents
+// origin's default branch: origin/HEAD's target when that symref exists, then
+// origin/main, origin/master, then the first origin/* ref. Empty when origin
+// has no branches at all (a freshly created, empty GitHub repo). Reads local
+// refs only — Fetch first if freshness matters.
+func RemoteDefaultBranch() string {
+	if out, err := exec.Command("git", "symbolic-ref", "--short", "-q",
+		"refs/remotes/origin/HEAD").Output(); err == nil {
+		if ref := strings.TrimSpace(string(out)); ref != "" {
+			return ref
+		}
+	}
+	for _, ref := range []string{"origin/main", "origin/master"} {
+		if exec.Command("git", "show-ref", "--verify", "--quiet", "refs/remotes/"+ref).Run() == nil {
+			return ref
+		}
+	}
+	out, err := exec.Command("git", "branch", "-r", "--format=%(refname:short)").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "->") || !strings.HasPrefix(line, "origin/") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+// UnrelatedHistories reports whether this repository is already set up for
+// git's "refusing to merge unrelated histories" dead end against origin, and
+// names the remote ref it compared against. Two shapes land there:
+//
+//   - local HEAD exists and shares no merge-base with the remote branch — every
+//     later push and pull is rejected outright;
+//   - local HEAD is unborn while origin already has commits — the first local
+//     commit becomes a second root and produces the same rejection later.
+//
+// Reads local refs only; callers fetch first.
+func UnrelatedHistories() (remoteRef string, unrelated bool) {
+	ref := RemoteDefaultBranch()
+	if ref == "" {
+		return "", false
+	}
+	if !HasAnyCommit() {
+		// Nothing local to compare yet, but the collision is already fixed:
+		// whatever the user commits here will not descend from the remote.
+		return ref, true
+	}
+	if exec.Command("git", "merge-base", "HEAD", ref).Run() == nil {
+		return ref, false
+	}
+	return ref, true
 }
 
 // ResolveMainBranch returns "main" or "master" depending on which exists as a

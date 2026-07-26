@@ -58,10 +58,28 @@ type branchCreateResultMsg struct {
 	err       error
 	newBranch string
 }
-type branchDeleteResultMsg struct{ err error }
+type branchDeleteResultMsg struct {
+	err error
+	// name/forced describe the attempt, so the handler can offer a force
+	// delete for the one failure that has an in-TUI answer without having to
+	// re-read the (already mutated) branch list to find out which branch it was.
+	name   string
+	forced bool
+}
 type branchMergeResultMsg struct {
 	err           error
 	conflictFiles []string
+	source        string // branch that was merged in, for the result note
+	// merged distinguishes "the merge itself failed" from "the merge landed
+	// but restoring the auto-stash afterwards did not" — the second still
+	// needs the graph refreshed.
+	merged bool
+	// stashed/stashRef carry the auto-stash the merge took before starting.
+	// On failure the handler owns recovery (it aborts the merge first); on
+	// success the command has already popped and reports via stashRestored.
+	stashed       bool
+	stashRef      string
+	stashRestored bool
 }
 type fetchResultMsg struct{ err error }
 type pullResultMsg struct {
@@ -166,19 +184,27 @@ type Model struct {
 	filterCursor  int
 
 	// Branch manager
-	branchEntries      []types.BranchEntry
-	branchCursor       int
-	branchScroll       int
-	branchCreateMode   bool
-	branchCreateInput  textinput.Model
-	branchDeleteMode   bool
-	branchMergeMode    bool
-	branchConflict     bool
-	branchConflFiles   []string
-	branchStandalone   bool
-	branchSwitching    bool
-	branchMerging      bool
+	branchEntries     []types.BranchEntry
+	branchCursor      int
+	branchScroll      int
+	branchCreateMode  bool
+	branchCreateInput textinput.Model
+	branchDeleteMode  bool
+	branchMergeMode   bool
+	// branchForceDelete* drive the second confirmation shown when a safe
+	// `git branch -d` came back with ErrBranchNotMerged.
+	branchForceDeleteMode bool
+	branchForceDeleteName string
+	branchStandalone      bool
+	branchSwitching       bool
+	branchMerging         bool
+	// branchCreating/branchDeleting block input while those ops are in
+	// flight. Without them a double-enter fired two creates (the loser
+	// reporting "already exists") and left the dying branch interactive.
+	branchCreating     bool
+	branchDeleting     bool
 	branchCreatedHint  string
+	branchOpNote       string // transient success note (merge result, stash disclosure)
 	branchMergePending string
 	mergeSource        string
 	mergeTarget        string
@@ -270,6 +296,16 @@ type Model struct {
 	pulling            bool     // pull in progress (blocks dialog input)
 	pullingKind        pullKind // which operation is running
 	syncMainBranchName string   // resolved main branch name (main or master)
+	// True incoming counts. The dialog only ever lists a sample, and reading
+	// the header off len(sample) silently understated "25 new" as "10 new".
+	syncCurrTotal int
+	syncMainTotal int
+	// syncAhead/syncDiverged: a branch that is ahead AND behind has either
+	// genuinely forked or had its history rewritten (amend/undo of a pushed
+	// commit). Pulling there merges the pre-rewrite commits straight back in,
+	// so the dialog has to say so before offering it.
+	syncAhead    int
+	syncDiverged bool
 
 	// Terminal dimensions
 	width    int
@@ -709,8 +745,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchSwitching = false
 		m.clearForceQuitPrompt()
 		if msg.err != nil {
-			m.branchMergePending = ""
 			m.err = msg.err
+			if m.branchMergePending != "" {
+				// The picker flow's switch leg failed, so the merge it was
+				// setting up never runs — say so instead of leaving the user
+				// to infer it from a checkout error.
+				m.err = annotateErr(msg.err,
+					fmt.Sprintf("— the pending merge of %s was cancelled", m.branchMergePending))
+				m.branchMergePending = ""
+			}
 			return m, nil
 		}
 		m.branch = msg.newBranch
@@ -741,8 +784,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case branchCreateResultMsg:
+		m.branchCreating = false
 		m.clearForceQuitPrompt()
 		if msg.err != nil {
+			// Create mode stays on so the name can be fixed in place.
 			m.err = msg.err
 			return m, nil
 		}
@@ -757,8 +802,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case branchDeleteResultMsg:
 		m.branchDeleteMode = false
+		m.branchDeleting = false
 		m.clearForceQuitPrompt()
 		if msg.err != nil {
+			// `git branch -d` refusing to drop commits no other branch holds
+			// is the one delete failure with an answer inside the TUI: ask
+			// once more, then run -D. Everything else surfaces as an error.
+			if errors.Is(msg.err, git.ErrBranchNotMerged) && msg.name != "" {
+				m.branchForceDeleteMode = true
+				m.branchForceDeleteName = msg.name
+				return m, nil
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -766,6 +820,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.branchCursor >= len(m.branchEntries) {
 			m.branchCursor = max(0, len(m.branchEntries)-1)
 		}
+		if msg.forced {
+			m.branchOpNote = fmt.Sprintf("Force-deleted %s — its unmerged commits are only in `git reflog` now", msg.name)
+		}
+		m.RefreshGraphs()
 		return m, nil
 
 	case fetchResultMsg:
@@ -826,7 +884,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchMerging = false
 		m.branchMergeMode = false
 		m.clearForceQuitPrompt()
-		if msg.err != nil {
+		if msg.err != nil && !msg.merged {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
 				// Always auto-abort merge conflicts — there's no in-TUI
@@ -839,10 +897,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.err = msg.err
 			}
+			// The merge auto-stashed a dirty tree before starting. Whatever
+			// failed above, those changes have to come back — the abort put
+			// the tree back on the stash's base commit, which is exactly
+			// where it applies cleanly.
+			if msg.stashed {
+				if popErr := git.StashPop(); popErr != nil {
+					git.CleanupFailedStashPop()
+					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean — they are safe in stash %s; recover with: git stash apply %s",
+						m.err, msg.stashRef, msg.stashRef)}
+				} else {
+					m.err = fmt.Errorf("%v. Your uncommitted changes were stashed and restored", m.err)
+				}
+			}
 			return m, nil
 		}
 		m.branchEntries = git.GetAllBranches()
 		m.RefreshGraphs()
+		if msg.err != nil {
+			// The merge landed; only restoring the auto-stash afterwards
+			// failed. The command already reported where the changes are.
+			m.err = msg.err
+			return m, nil
+		}
+		note := fmt.Sprintf("Merged %s into %s", msg.source, m.branch)
+		if msg.stashRestored {
+			note += " — your uncommitted changes were stashed and restored"
+		}
+		if m.step == stepBranch {
+			m.branchOpNote = note
+		} else if msg.stashRestored {
+			// The menu's sync shortcut merges without a note line to render
+			// into, and a note left on the model would resurface, stale, the
+			// next time the branch manager opened. The stash round-trip still
+			// has to be stated: symWarn marks it advisory, not an error.
+			m.err = fmt.Errorf("%s %s", symWarn, note)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -855,6 +945,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = fmt.Errorf("%s operation in progress — ctrl+c again to force quit", symWarn)
 				return m, nil
 			}
+			// Take any in-flight remote command down with us. A plain exit
+			// left `gh repo create` orphaned, and it went on to create the
+			// repository the user had just cancelled — discovered only on
+			// github.com or at the next launch.
+			git.CancelNetworkOps()
 			m.quitting = true
 			return m, tea.Quit
 		}

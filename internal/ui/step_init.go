@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -53,6 +54,11 @@ type initResultMsg struct {
 	err     error
 	branch  string
 	message string // success banner shown on menu
+	// warning describes a setup that succeeded but is headed somewhere bad
+	// (an unrelated-histories remote). Rendered sticky, unlike message, which
+	// any keypress clears — this is the one explanation for why the next push
+	// will fail, and it must survive a stray arrow key.
+	warning string
 }
 
 type ghAuthResultMsg struct{ err error }
@@ -107,6 +113,9 @@ func (m Model) updateInit(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ghReuseMode = false
 			cmd := m.returnToMenu()
 			m.initSuccessMsg = msg.message
+			if msg.warning != "" {
+				m.err = recoveryError{errors.New(msg.warning)}
+			}
 			return m, cmd
 		case ghAuthResultMsg:
 			m.initWorking = false
@@ -220,6 +229,11 @@ func (m Model) updateInitPickTemplate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.initTemplateCursor < len(m.initTemplateOptions)-1 {
 			m.initTemplateCursor++
 		}
+	case "q":
+		// This is a picker, not a text input — q quits here exactly like it
+		// does on the option list one screen back.
+		m.quitting = true
+		return m, tea.Quit
 	case "esc":
 		m.initPhase = initPhasePickOption
 	case "enter":
@@ -252,7 +266,7 @@ func (m Model) updateInitInputURL(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !isValidGitURL(url) {
-			m.err = fmt.Errorf("invalid URL — expected https://, git@host:path, ssh://, or file://")
+			m.err = fmt.Errorf("invalid URL — expected https://…, [user@]host:path, ssh://…, file://…, or a local path")
 			return m, nil
 		}
 		m.initRemoteURL = url
@@ -298,22 +312,43 @@ func (m Model) updateInitInputRepoName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// isValidGitURL accepts the URL forms `git remote add` understands. We're not
-// trying to be exhaustive — just catch the common typos (pasting a repo name,
-// a Windows drive path, a stray "origin") before shelling out and getting a
-// noisier error back from git.
+// isValidGitURL accepts the URL forms `git remote add` understands. Accepted:
+//
+//   - scheme URLs — https://, http://, ssh://, git://, git+ssh://, ftp://,
+//     ftps://, file:// — with at least one character of host/path after the
+//     scheme ("https://" alone is a typo, not a remote)
+//   - scp-style [user@]host:path. The user@ part is optional: git's syntax
+//     doesn't require it, and on a self-hosted host where the ssh user
+//     already matches, "host:path" is the normal way to write it
+//   - local paths: absolute (/srv/repo.git) and explicitly relative
+//     (./repo.git, ../other-repo) — both valid remotes
+//
+// Rejected: anything containing whitespace, a bare word with neither scheme,
+// ':' nor path prefix ("origin", "repo.git"), a scheme with nothing after it,
+// and Windows drive paths ("C:\repo"), which only look like scp-style.
 func isValidGitURL(url string) bool {
-	prefixes := []string{"https://", "http://", "ssh://", "git://", "file://", "/"}
-	for _, p := range prefixes {
+	if url == "" || strings.ContainsAny(url, " \t\n\r") {
+		return false
+	}
+	for _, p := range []string{"https://", "http://", "ssh://", "git://", "git+ssh://", "ftp://", "ftps://", "file://"} {
 		if strings.HasPrefix(url, p) {
-			return true
+			return len(url) > len(p)
 		}
 	}
-	// scp-like form: user@host:path
-	if i := strings.Index(url, "@"); i > 0 {
-		if j := strings.Index(url[i+1:], ":"); j > 0 {
-			return true
+	if strings.HasPrefix(url, "/") || strings.HasPrefix(url, "./") || strings.HasPrefix(url, "../") {
+		return len(url) > 1
+	}
+	// scp-style: everything before the first ':' is [user@]host.
+	if i := strings.Index(url, ":"); i > 0 {
+		host, path := url[:i], url[i+1:]
+		if at := strings.Index(host, "@"); at >= 0 {
+			host = host[at+1:]
 		}
+		// A one-letter "host" followed by a path separator is a drive letter.
+		if len(host) == 1 && (strings.HasPrefix(path, `\`) || strings.HasPrefix(path, "/")) {
+			return false
+		}
+		return host != "" && path != ""
 	}
 	return false
 }
@@ -360,6 +395,9 @@ func (m Model) updateInitPickVisibility(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.initVisibilityCursor < len(initVisibilityLabels)-1 {
 			m.initVisibilityCursor++
 		}
+	case "q":
+		m.quitting = true
+		return m, tea.Quit
 	case "esc":
 		m.initPhase = initPhaseInputRepoName
 		m.initNameInput.Focus()
@@ -459,9 +497,30 @@ func runInitFlow(choice initChoice, tpl git.GitignoreTemplate, url, repoName str
 		if err := git.AddOriginRemote(url); err != nil {
 			return initResultMsg{err: err}
 		}
+		// A remote that already has commits is a guaranteed dead end for this
+		// flow: the first local commit becomes a second root, and every later
+		// push and pull is rejected with "refusing to merge unrelated
+		// histories" — a message no screen in this app can act on. Fetch once
+		// and say so now, while the user can still pick a different remote.
+		// The remote stays configured either way; they may know better.
+		warning := ""
+		if fetchErr := git.Fetch(); fetchErr == nil {
+			// Wording note: no "rejected" / "non-fast-forward" in this text.
+			// formatError pattern-matches those and appends "Remote has newer
+			// changes. Run git pull first." — the exact doomed advice this
+			// warning exists to head off.
+			if ref, unrelated := git.UnrelatedHistories(); unrelated {
+				if git.HasAnyCommit() {
+					warning = fmt.Sprintf("this repository and %s have unrelated histories — git will refuse every push and pull between them. Connect an empty remote, or clone the remote instead.", ref)
+				} else {
+					warning = fmt.Sprintf("%s already has commits and this repository has none — your first commit here would start an unrelated history that git refuses to push or pull. Clone the remote instead, or connect an empty one.", ref)
+				}
+			}
+		}
 		return initResultMsg{
 			branch:  branch,
 			message: fmt.Sprintf("Connected to %s — commit then push from the menu.", url),
+			warning: warning,
 		}
 
 	case initChoiceGHCreate:
@@ -569,6 +628,7 @@ func (m Model) viewInitPickTemplate() string {
 		{symArrows, "navigate"},
 		{"enter", "continue"},
 		{"esc", "back"},
+		{"q", "quit"},
 	}))
 	return b.String()
 }
@@ -621,6 +681,7 @@ func (m Model) viewInitPickVisibility() string {
 		{symArrows, "navigate"},
 		{"enter", "create"},
 		{"esc", "back"},
+		{"q", "quit"},
 	}))
 	return b.String()
 }

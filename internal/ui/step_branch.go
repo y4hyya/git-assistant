@@ -28,11 +28,24 @@ func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 			stashRef = ref
 		}
 		if err := git.SwitchBranch(name, isRemote); err != nil {
-			// Try to restore stash if switch failed
-			if stashed {
-				git.StashPop()
+			if !stashed {
+				return branchSwitchResultMsg{err: err}
 			}
-			return branchSwitchResultMsg{err: err}
+			// The stash was taken for a checkout that never happened, so the
+			// changes belong right back where they were. If even that fails,
+			// say where they went — dropping the ref here used to leave the
+			// user's work in an unmentioned stash behind an unrelated error.
+			if popErr := git.StashPop(); popErr != nil {
+				git.CleanupFailedStashPop()
+				return branchSwitchResultMsg{
+					stashRef: stashRef,
+					err: recoveryError{fmt.Errorf(
+						"could not switch to %s (%v), and restoring your uncommitted changes also failed — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s",
+						name, err, stashRef, stashRef)},
+				}
+			}
+			return branchSwitchResultMsg{err: fmt.Errorf(
+				"%v. You are still on the same branch; your uncommitted changes were stashed and restored", err)}
 		}
 		stashConflict := false
 		if stashed {
@@ -59,21 +72,74 @@ func doCreateBranch(name string) tea.Cmd {
 	}
 }
 
-func doDeleteBranch(name string) tea.Cmd {
+func doDeleteBranch(name string, force bool) tea.Cmd {
 	return func() tea.Msg {
-		err := git.DeleteBranch(name)
-		return branchDeleteResultMsg{err: err}
+		err := git.DeleteBranch(name, force)
+		return branchDeleteResultMsg{err: err, name: name, forced: force}
 	}
 }
 
+// doMergeBranch merges name into the current branch, auto-stashing a dirty
+// working tree first. Without the stash git either refuses outright ("your
+// local changes would be overwritten by merge") — which the target-picker flow
+// hit *after* switching, stranding the user on the target with their edits
+// relocated and no merge performed — or merges over a tree the user never
+// meant to involve.
+//
+// Failure hands the stash back to the handler (it has to `git merge --abort`
+// first, and only then does the tree sit where the stash applies cleanly);
+// success restores it here.
 func doMergeBranch(name string) tea.Cmd {
 	return func() tea.Msg {
-		if err := git.MergeBranch(name); err != nil {
-			conflicts := git.GetConflictFiles()
-			return branchMergeResultMsg{err: err, conflictFiles: conflicts}
+		stashed := false
+		stashRef := ""
+		dirty, err := git.HasUncommittedChanges()
+		if err != nil {
+			return branchMergeResultMsg{err: err, source: name}
 		}
-		return branchMergeResultMsg{}
+		if dirty {
+			ref, stashErr := git.StashChanges()
+			if stashErr != nil {
+				return branchMergeResultMsg{err: stashErr, source: name}
+			}
+			stashed = true
+			stashRef = ref
+		}
+		if err := git.MergeBranch(name); err != nil {
+			return branchMergeResultMsg{
+				err:           err,
+				conflictFiles: git.GetConflictFiles(),
+				source:        name,
+				stashed:       stashed,
+				stashRef:      stashRef,
+			}
+		}
+		if stashed {
+			if popErr := git.StashPop(); popErr != nil {
+				git.CleanupFailedStashPop()
+				return branchMergeResultMsg{
+					source: name,
+					merged: true,
+					err: recoveryError{fmt.Errorf(
+						"merged %s, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s",
+						name, stashRef, stashRef)},
+				}
+			}
+			return branchMergeResultMsg{source: name, merged: true, stashRestored: true}
+		}
+		return branchMergeResultMsg{source: name, merged: true}
 	}
+}
+
+// annotateErr appends a note to err while preserving whether it carries
+// recovery instructions — a plain fmt.Errorf wrap would strip the marker and
+// let the next arrow key wipe a stash SHA off the screen.
+func annotateErr(err error, note string) error {
+	wrapped := fmt.Errorf("%v %s", err, note)
+	if isRecoveryError(err) {
+		return recoveryError{wrapped}
+	}
+	return wrapped
 }
 
 // ── Update ─────────────────────────────────────────────
@@ -83,7 +149,7 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// outer Update still handles ctrl+c before we get here, so quitting
 	// remains possible). Spinner ticks are non-key messages and are
 	// forwarded so the animation keeps running.
-	if m.branchSwitching || m.branchMerging {
+	if m.branchSwitching || m.branchMerging || m.branchCreating || m.branchDeleting {
 		if _, ok := msg.(tea.KeyMsg); ok {
 			return m, nil
 		}
@@ -97,33 +163,28 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Clear post-creation hint on any keypress
+	// Clear transient post-operation notes on any keypress
 	m.branchCreatedHint = ""
-
-	// ── Conflict view ──────────────────────────────────
-	if m.branchConflict {
-		switch keyMsg.String() {
-		case "a":
-			git.MergeAbort()
-			m.branchConflict = false
-			m.branchConflFiles = nil
-			m.branchEntries = git.GetAllBranches()
-		case "q":
-			m.branchConflict = false
-			m.branchConflFiles = nil
-		}
-		return m, nil
-	}
+	m.branchOpNote = ""
 
 	// ── Create mode ────────────────────────────────────
 	if m.branchCreateMode {
 		switch keyMsg.String() {
 		case "enter":
 			name := strings.TrimSpace(m.branchCreateInput.Value())
-			if name != "" {
-				return m, doCreateBranch(name)
+			if name == "" {
+				return m, nil
 			}
-			return m, nil
+			// git owns the ref-name rules; ask it instead of guessing, then
+			// lead with something a beginner can act on. Without this the
+			// user saw a bare "fatal: 'my new feature' is not a valid branch
+			// name" — formatError's hint for exactly this case never matched.
+			if err := git.CheckRefFormatBranch(name); err != nil {
+				m.err = fmt.Errorf("branch names can't contain spaces, ':', '..', or end with '/'\n  %v", err)
+				return m, nil
+			}
+			m.branchCreating = true
+			return m, tea.Batch(doCreateBranch(name), m.spinner.Tick)
 		case "esc":
 			m.branchCreateMode = false
 			m.branchCreateInput.Reset()
@@ -139,11 +200,34 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.branchDeleteMode {
 		switch keyMsg.String() {
 		case "y":
-			entry := m.branchEntries[m.branchCursor]
 			m.branchDeleteMode = false
-			return m, doDeleteBranch(entry.Name)
+			if m.branchCursor >= len(m.branchEntries) {
+				return m, nil
+			}
+			entry := m.branchEntries[m.branchCursor]
+			m.branchDeleting = true
+			return m, tea.Batch(doDeleteBranch(entry.Name, false), m.spinner.Tick)
 		default:
 			m.branchDeleteMode = false
+			return m, nil
+		}
+	}
+
+	// ── Force-delete confirmation ──────────────────────
+	// Reached only when the safe delete came back with ErrBranchNotMerged:
+	// the branch holds commits nothing else contains. Any other delete
+	// failure surfaces as an error, as before.
+	if m.branchForceDeleteMode {
+		switch keyMsg.String() {
+		case "y":
+			name := m.branchForceDeleteName
+			m.branchForceDeleteMode = false
+			m.branchForceDeleteName = ""
+			m.branchDeleting = true
+			return m, tea.Batch(doDeleteBranch(name, true), m.spinner.Tick)
+		default:
+			m.branchForceDeleteMode = false
+			m.branchForceDeleteName = ""
 			return m, nil
 		}
 	}
@@ -186,17 +270,13 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.branchMerging = true
 				return m, tea.Batch(doMergeBranch(m.mergeSource), m.spinner.Tick)
 			}
-			// Switch to target first, then merge will trigger via branchMergePending
+			// Switch to target first, then merge will trigger via
+			// branchMergePending. Targets are always local branches (see the
+			// "m" handler), so the remote-tracking checkout form never
+			// applies here — passing true would create a stray local branch.
 			m.branchMergePending = m.mergeSource
 			m.branchSwitching = true
-			isRemote := false
-			for _, e := range m.branchEntries {
-				if e.Name == m.mergeTarget && e.IsRemote {
-					isRemote = true
-					break
-				}
-			}
-			return m, tea.Batch(doSwitchBranch(m.mergeTarget, isRemote), m.spinner.Tick)
+			return m, tea.Batch(doSwitchBranch(m.mergeTarget, false), m.spinner.Tick)
 		default:
 			m.branchMergeMode = false
 			return m, nil
@@ -252,11 +332,11 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		entry := m.branchEntries[m.branchCursor]
-		if entry.IsCurrent {
-			m.err = fmt.Errorf("cannot merge a branch into itself")
-			return m, nil
-		}
-		// Enter target picker: choose which branch to merge INTO.
+		// "m" picks the merge SOURCE only — including the branch you are
+		// standing on, which is the most common merge there is ("merge my
+		// feature into main"). Self-merge is structurally impossible: the
+		// target list below excludes the source by name.
+		//
 		// For remote-only sources, store the full "origin/<name>" ref so
 		// the eventual `git merge` resolves the right commit; otherwise a
 		// bare name collides with any local branch sharing that name.
@@ -265,15 +345,29 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.mergeSource = entry.Name
 		}
+		// Targets are LOCAL branches only. Picking a remote-only branch used
+		// to run `git checkout -b <n> origin/<n>` behind the user's back and
+		// merge into that brand-new local branch, leaving origin untouched —
+		// nothing like the "merge into the remote branch" it looked like.
 		m.mergeTargets = nil
-		defaultIdx := 0
+		defaultIdx := -1
+		mainIdx := -1
 		for _, e := range m.branchEntries {
-			if e.Name != entry.Name {
-				if e.IsCurrent {
-					defaultIdx = len(m.mergeTargets)
-				}
-				m.mergeTargets = append(m.mergeTargets, e)
+			if e.IsRemote || e.Name == entry.Name {
+				continue
 			}
+			if e.IsCurrent {
+				defaultIdx = len(m.mergeTargets)
+			}
+			if mainIdx < 0 && (e.Name == "main" || e.Name == "master") {
+				mainIdx = len(m.mergeTargets)
+			}
+			m.mergeTargets = append(m.mergeTargets, e)
+		}
+		// Preselect the branch you're on — except when it IS the source, in
+		// which case "merge this into main" is the overwhelmingly likely intent.
+		if defaultIdx < 0 {
+			defaultIdx = max(mainIdx, 0)
 		}
 		m.mergeTargetCursor = defaultIdx
 		m.mergeTargetMode = true
@@ -321,25 +415,18 @@ func (m Model) viewBranch() string {
 	b.WriteString(stepStyle.Render("  Branch Manager"))
 	b.WriteString("\n\n")
 
-	// ── Conflict view ──────────────────────────────────
-	if m.branchConflict {
-		b.WriteString("  " + errorStyle.Render("Merge conflicts detected") + "\n\n")
-		for _, f := range m.branchConflFiles {
-			b.WriteString("    " + errorStyle.Render("U") + "  " + filePathStyle.Render(f) + "\n")
-		}
-		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d conflicting file(s)", len(m.branchConflFiles)))))
-		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"a", "abort merge"},
-			{"q", "close"},
-		}))
-		return m.styledBox(b.String())
-	}
-
 	// ── Create mode ────────────────────────────────────
 	if m.branchCreateMode {
 		b.WriteString("  Create new branch from " + branchStyle.Render(m.branch) + "\n\n")
 		b.WriteString("  " + m.branchCreateInput.View() + "\n")
+		if m.branchCreating {
+			b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Creating...") + "\n")
+		}
+		// Name validation lands here, so the error has to render on this
+		// screen — the list below is never reached while create mode is on.
+		if m.err != nil {
+			b.WriteString("\n  " + formatError(m.err) + "\n")
+		}
 		b.WriteString("\n")
 		b.WriteString(renderHelp([]helpEntry{
 			{"enter", "create"},
@@ -360,6 +447,21 @@ func (m Model) viewBranch() string {
 		return m.styledBox(b.String())
 	}
 
+	// ── Force-delete confirmation ──────────────────────
+	if m.branchForceDeleteMode {
+		b.WriteString("  " + modifiedStyle.Render(symWarn+" "+m.branchForceDeleteName+
+			" has commits not merged into any other branch") + "\n\n")
+		b.WriteString("  " + highlightStyle.Render("Force delete?") + " " +
+			dimStyle.Render("(y/N)") + "\n")
+		b.WriteString("  " + dimStyle.Render("Those commits become unreachable — only `git reflog` can find them.") + "\n")
+		b.WriteString("\n")
+		b.WriteString(renderHelp([]helpEntry{
+			{"y", "force delete"},
+			{"any", "cancel"},
+		}))
+		return m.styledBox(b.String())
+	}
+
 	// ── Merge target picker ─────────────────────────────
 	if m.mergeTargetMode {
 		b.WriteString("  Merge " + branchStyle.Render(m.mergeSource) + " into:\n\n")
@@ -375,11 +477,10 @@ func (m Model) viewBranch() string {
 			if i == m.mergeTargetCursor {
 				name = highlightStyle.Render(entry.Name)
 			}
+			// No "(remote)" case: the picker only ever holds local branches.
 			label := ""
 			if entry.IsCurrent {
 				label = dimStyle.Render(" (current)")
-			} else if entry.IsRemote {
-				label = dimStyle.Render(" (remote)")
 			}
 			b.WriteString(fmt.Sprintf("%s%s%s\n", cursor, name, label))
 		}
@@ -395,8 +496,18 @@ func (m Model) viewBranch() string {
 	// ── Merge confirmation ─────────────────────────────
 	if m.branchMergeMode {
 		b.WriteString("  " + branchStyle.Render(m.mergeSource) + " " + dimStyle.Render(symArrowRight) + " " + branchStyle.Render(m.mergeTarget) + "\n\n")
-		b.WriteString("  " + dimStyle.Render("This will bring all changes from") + "\n")
-		b.WriteString("  " + dimStyle.Render("'"+m.mergeSource+"' into '"+m.mergeTarget+"'") + "\n")
+		if m.mergeTarget != m.branch {
+			// Confirming does not just merge: it checks the target out first
+			// and leaves you there. Saying so beats discovering it when the
+			// next commit lands on a branch you didn't choose.
+			b.WriteString("  " + modifiedStyle.Render(symWarn) + " " +
+				highlightStyle.Render("switch to "+m.mergeTarget+" and merge "+m.mergeSource+" into it") + "\n")
+			b.WriteString("  " + dimStyle.Render("You are on '"+m.branch+"' now and will stay on '"+m.mergeTarget+"' afterwards.") + "\n")
+		} else {
+			b.WriteString("  " + dimStyle.Render("This will bring all changes from") + "\n")
+			b.WriteString("  " + dimStyle.Render("'"+m.mergeSource+"' into '"+m.mergeTarget+"'") + "\n")
+		}
+		b.WriteString("  " + dimStyle.Render("Creates a merge commit (--no-ff). Uncommitted changes are stashed and restored.") + "\n")
 		b.WriteString("\n")
 		b.WriteString(renderHelp([]helpEntry{
 			{"y", "confirm"},
@@ -487,11 +598,19 @@ func (m Model) viewBranch() string {
 	if m.branchMerging {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Merging...") + "\n")
 	}
+	if m.branchDeleting {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Deleting...") + "\n")
+	}
 
 	// Post-creation hint
 	if m.branchCreatedHint != "" {
 		b.WriteString("\n  " + successStyle.Render(symDone) + " Created & switched to " + branchStyle.Render(m.branchCreatedHint) + "\n")
 		b.WriteString("  " + dimStyle.Render("Make changes and commit here, then merge back when ready.") + "\n")
+	}
+
+	// Post-operation note (merge result, stash disclosure)
+	if m.branchOpNote != "" {
+		b.WriteString("\n  " + successStyle.Render(symDone) + " " + m.branchOpNote + "\n")
 	}
 
 	// Error

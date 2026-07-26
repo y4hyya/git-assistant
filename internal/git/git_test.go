@@ -1,11 +1,14 @@
 package git
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"git-assist/internal/types"
 )
@@ -632,4 +635,287 @@ func keys(m map[string]types.FileEntry) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// ── Branch deletion ────────────────────────────────────
+
+// branchExists reports whether a local branch is still present.
+func branchExists(t *testing.T, name string) bool {
+	t.Helper()
+	return exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+name).Run() == nil
+}
+
+func TestDeleteBranchForceSentinel(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "init")
+
+	// A branch holding a commit no other branch contains: `-d` must refuse,
+	// and the refusal has to be recognizable so the TUI can offer `-D`.
+	runGit(t, "checkout", "-q", "-b", "feat")
+	write(t, "b.txt", "b\n")
+	commitAll(t, "feature work")
+	runGit(t, "checkout", "-q", "main")
+
+	err := DeleteBranch("feat", false)
+	if err == nil {
+		t.Fatal("DeleteBranch(feat, force=false) succeeded on an unmerged branch")
+	}
+	if !errors.Is(err, ErrBranchNotMerged) {
+		t.Fatalf("err = %v; want it to wrap ErrBranchNotMerged", err)
+	}
+	if !strings.Contains(err.Error(), "not fully merged") {
+		t.Errorf("err = %q; want git's own text preserved for display", err)
+	}
+	if !branchExists(t, "feat") {
+		t.Fatal("the safe delete removed the branch anyway")
+	}
+
+	if err := DeleteBranch("feat", true); err != nil {
+		t.Fatalf("DeleteBranch(feat, force=true): %v", err)
+	}
+	if branchExists(t, "feat") {
+		t.Error("force delete left the branch behind")
+	}
+
+	// Any other failure must NOT be mistaken for "not fully merged" — that
+	// would open the force-delete prompt for a branch that never existed.
+	err = DeleteBranch("no-such-branch", false)
+	if err == nil {
+		t.Fatal("deleting a missing branch succeeded")
+	}
+	if errors.Is(err, ErrBranchNotMerged) {
+		t.Errorf("unrelated failure classified as unmerged: %v", err)
+	}
+
+	// A merged branch still deletes safely, without force.
+	runGit(t, "checkout", "-q", "-b", "merged-branch")
+	runGit(t, "checkout", "-q", "main")
+	if err := DeleteBranch("merged-branch", false); err != nil {
+		t.Errorf("safe delete of a merged branch failed: %v", err)
+	}
+}
+
+// ── Branch name validation ─────────────────────────────
+
+func TestCheckRefFormatBranch(t *testing.T) {
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{"feature", true},
+		{"feat/login", true},
+		{"release-1.2.0", true},
+		{"my new feature", false},
+		{"bad:name", false},
+		{"a..b", false},
+		{"trailing/", false},
+		{"-leading-dash", false},
+		{".dotfile", false},
+		{"has@{brace}", false},
+		{"", false},
+		{"   ", false},
+	}
+	for _, c := range cases {
+		err := CheckRefFormatBranch(c.name)
+		if c.ok && err != nil {
+			t.Errorf("CheckRefFormatBranch(%q) = %v, want nil", c.name, err)
+		}
+		if !c.ok {
+			if err == nil {
+				t.Errorf("CheckRefFormatBranch(%q) = nil, want a rejection", c.name)
+				continue
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("CheckRefFormatBranch(%q) leaked git's hint lines: %q", c.name, err)
+			}
+		}
+	}
+}
+
+// ── Network timeouts ───────────────────────────────────
+
+func TestRunNetworkTimeoutKillsAndReportsFriendly(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+	start := time.Now()
+	out, err := runNetworkTimeout(100*time.Millisecond, "sleep", "30")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrNetworkTimeout) {
+		t.Fatalf("err = %v (output %q), want ErrNetworkTimeout", err, out)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %s — the deadline did not kill the child process", elapsed)
+	}
+	if !strings.Contains(err.Error(), "check your connection") {
+		t.Errorf("timeout error = %q, want actionable text", err)
+	}
+}
+
+// The force-quit path cancels the shared context; an in-flight `gh repo
+// create` has to die with it instead of going on to create the repository.
+func TestCancellationKillsAnInFlightNetworkCommand(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runNetworkCtx(ctx, time.Minute, "sleep", "30")
+		done <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNetworkCancelled) {
+			t.Fatalf("err = %v, want ErrNetworkCancelled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelling the context did not kill the child process")
+	}
+}
+
+func TestNetFailPassesSentinelsThroughAndPrefixesTheRest(t *testing.T) {
+	if got := netFail("fetch", []byte("noise"), ErrNetworkTimeout); !errors.Is(got, ErrNetworkTimeout) {
+		t.Errorf("netFail wrapped the timeout sentinel: %v", got)
+	}
+	if got := netFail("fetch", nil, ErrNetworkCancelled); !errors.Is(got, ErrNetworkCancelled) {
+		t.Errorf("netFail wrapped the cancel sentinel: %v", got)
+	}
+	got := netFail("fetch", []byte("  fatal: bad remote\n"), errors.New("exit status 128"))
+	if got.Error() != "fetch: fatal: bad remote" {
+		t.Errorf("netFail(...) = %q, want %q", got, "fetch: fatal: bad remote")
+	}
+}
+
+// Fetch has to be plumbed through runNetwork/netFail: a fast, ordinary
+// failure must still surface git's own text rather than a timeout.
+func TestFetchSurfacesOrdinaryFailures(t *testing.T) {
+	scratchRepo(t)
+	runGit(t, "remote", "add", "origin", filepath.Join(t.TempDir(), "definitely-not-a-repo"))
+	err := Fetch()
+	if err == nil {
+		t.Fatal("Fetch() against a nonexistent remote succeeded")
+	}
+	if errors.Is(err, ErrNetworkTimeout) {
+		t.Fatalf("an immediate failure was reported as a timeout: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "fetch:") {
+		t.Errorf("Fetch() error = %q, want the 'fetch:' prefix", err)
+	}
+}
+
+// ── Incoming commits ───────────────────────────────────
+
+func TestCountIncomingCommits(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "init")
+	runGit(t, "checkout", "-q", "-b", "ahead")
+	for _, s := range []string{"one", "two", "three"} {
+		write(t, s+".txt", s+"\n")
+		commitAll(t, s)
+	}
+	runGit(t, "checkout", "-q", "main")
+
+	if got := CountIncomingCommits("main", "ahead"); got != 3 {
+		t.Errorf("CountIncomingCommits(main, ahead) = %d, want 3", got)
+	}
+	if got := CountIncomingCommits("ahead", "main"); got != 0 {
+		t.Errorf("CountIncomingCommits(ahead, main) = %d, want 0", got)
+	}
+	if got := CountIncomingCommits("main", "no-such-ref"); got != 0 {
+		t.Errorf("CountIncomingCommits with a missing ref = %d, want 0", got)
+	}
+	// The count is the whole set; GetIncomingCommits only samples it.
+	if sample := GetIncomingCommits("main", "ahead", 2); len(sample) != 2 {
+		t.Errorf("GetIncomingCommits(limit 2) returned %d subjects", len(sample))
+	}
+}
+
+// ── Unrelated histories ────────────────────────────────
+
+// seedRemote builds a bare repo with one root commit on the named branch and
+// returns its path. Everything stays on local disk — no network.
+func seedRemote(t *testing.T, branch string) string {
+	t.Helper()
+	remote := t.TempDir()
+	runGit(t, "init", "-q", "--bare", remote)
+
+	work := t.TempDir()
+	runGit(t, "init", "-q", "-b", branch, work)
+	runGit(t, "-C", work, "config", "user.name", "git-assist test")
+	runGit(t, "-C", work, "config", "user.email", "test@example.invalid")
+	runGit(t, "-C", work, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("remote\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "-C", work, "add", "-A")
+	runGit(t, "-C", work, "commit", "-q", "-m", "Initial commit")
+	runGit(t, "-C", work, "push", "-q", remote, branch+":"+branch)
+	return remote
+}
+
+func TestUnrelatedHistoriesDetectsBothShapes(t *testing.T) {
+	scratchRepo(t)
+	remote := seedRemote(t, "main")
+	runGit(t, "remote", "add", "origin", remote)
+	if err := Fetch(); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	// Shape 1: local HEAD unborn, remote already has commits. The first
+	// local commit will become a second root.
+	ref, unrelated := UnrelatedHistories()
+	if ref != "origin/main" {
+		t.Fatalf("compared against %q, want origin/main", ref)
+	}
+	if !unrelated {
+		t.Error("an unborn local HEAD against a non-empty remote was not flagged")
+	}
+
+	// Shape 2: that root commit now exists and shares nothing with origin.
+	write(t, "local.txt", "local\n")
+	commitAll(t, "local root")
+	if _, unrelated = UnrelatedHistories(); !unrelated {
+		t.Error("two unrelated roots were not flagged")
+	}
+
+	// Related histories must not be flagged.
+	runGit(t, "reset", "-q", "--hard", "origin/main")
+	write(t, "local.txt", "local\n")
+	commitAll(t, "descends from origin")
+	if _, unrelated = UnrelatedHistories(); unrelated {
+		t.Error("a branch descending from origin/main was flagged as unrelated")
+	}
+}
+
+func TestUnrelatedHistoriesIgnoresAnEmptyRemote(t *testing.T) {
+	scratchRepo(t)
+	empty := t.TempDir()
+	runGit(t, "init", "-q", "--bare", empty)
+	runGit(t, "remote", "add", "origin", empty)
+	if err := Fetch(); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	write(t, "a.txt", "a\n")
+	commitAll(t, "init")
+
+	if ref, unrelated := UnrelatedHistories(); unrelated {
+		t.Errorf("an empty remote was flagged as unrelated (ref %q)", ref)
+	}
+}
+
+func TestRemoteDefaultBranchFallsBackToAnyOriginRef(t *testing.T) {
+	scratchRepo(t)
+	runGit(t, "remote", "add", "origin", seedRemote(t, "trunk"))
+	if err := Fetch(); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if got := RemoteDefaultBranch(); got != "origin/trunk" {
+		t.Errorf("RemoteDefaultBranch() = %q, want origin/trunk", got)
+	}
 }
