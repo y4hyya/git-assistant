@@ -13,32 +13,13 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
 		case "enter", "esc":
-			// Reset wizard state and return to menu
-			m.step = stepMenu
 			m.menuCursor = 0
-			m.typeIdx = 0
-			m.commitType = ""
-			m.breaking = false
-			m.scope = ""
-			m.msgInput.Reset()
-			m.bodyInput.Reset()
-			m.showBody = false
-			m.bodyFocused = false
-			m.pushed = false
-			m.pushBranch = ""
-			m.branchIdx = 0
-			m.gitignoreCached = nil
 			m.committing = false
 			m.pushing = false
-			m.amendMode = false
-			m.scopeInput.Reset()
-			// Refresh files and graphs
-			files, _ := git.GetStatus()
-			m.files = files
-			m.cursor = 0
-			m.fileScroll = 0
-			m.RefreshGraphs()
-			return m, m.maybeFetch()
+			// Wizard reset, fresh file list, and graph refresh all live in
+			// returnToMenu so no exit path can skip one of them.
+			cmd := m.returnToMenu()
+			return m, cmd
 		case "q":
 			m.quitting = true
 			return m, tea.Quit
@@ -60,7 +41,7 @@ func (m Model) viewDone() string {
 	b.WriteString("\n\n")
 
 	// Commit / amend summary
-	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
+	msg := m.subjectLine(strings.TrimSpace(m.msgInput.Value()))
 	verb := "Committed"
 	if m.amendMode {
 		verb = "Amended"

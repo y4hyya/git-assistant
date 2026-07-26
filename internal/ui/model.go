@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -69,6 +70,12 @@ type pullResultMsg struct {
 	// kind distinguishes which operation produced this message, so the
 	// handler can craft a specific error ("pull conflict" vs "sync conflict").
 	kind pullKind
+	// stashed/stashRef carry the auto-stash the pull took before merging.
+	// The handler owns the recovery (it aborts the merge first), so it needs
+	// to know whether uncommitted work is parked in the stash and under
+	// which ref — otherwise those changes vanish silently.
+	stashed  bool
+	stashRef string
 }
 
 type pullKind int
@@ -77,6 +84,34 @@ const (
 	pullKindCurrent pullKind = iota // pulled origin/<current> into current
 	pullKindMain                    // merged origin/main into current
 )
+
+// Input limits for the commit message editors. The amend flow raises both to
+// unlimited while pre-filling (SetValue truncates silently past the limit,
+// which would rewrite the user's commit with a chopped body) and resetWizard
+// puts them back.
+const (
+	msgCharLimit  = 200
+	bodyCharLimit = 500
+)
+
+// recoveryError marks an error whose text the user must act on — a stash SHA,
+// a `git stash apply` command. The blanket "clear m.err on the next keypress"
+// rule would wipe those mid-copy, so Update keeps them on screen until esc or
+// enter dismisses them explicitly.
+type recoveryError struct{ err error }
+
+func (e recoveryError) Error() string { return e.err.Error() }
+func (e recoveryError) Unwrap() error { return e.err }
+
+// isRecoveryError reports whether err carries recovery instructions and must
+// therefore survive ordinary keypresses.
+func isRecoveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var re recoveryError
+	return errors.As(err, &re)
+}
 
 // Model is the main Bubble Tea model.
 type Model struct {
@@ -164,12 +199,20 @@ type Model struct {
 	// Undo confirmation
 	confirmUndo bool
 	undoing     bool // soft reset in flight (blocks a second confirmation)
+	// undoPushed caches git.IsLastCommitPushed() from the moment the prompt
+	// opened. Undoing a pushed commit makes the branch diverge from origin,
+	// which is worth warning about — but never from a View func.
+	undoPushed bool
 
 	// Step 4 — push
 	branches   []string
 	branchIdx  int
 	hasRemote  bool
 	pushBranch string
+	// pushCheckDone marks the pre-push behind-origin check as already run for
+	// this visit to the push step. Without it the check re-fires on every
+	// enter and declining the offered pull makes pushing unreachable.
+	pushCheckDone bool
 
 	// Gitignore — paths that need git rm --cached during commit
 	gitignoreCached []string
@@ -179,6 +222,16 @@ type Model struct {
 	pushing    bool
 	pushed     bool
 	amendMode  bool // when true, the commit wizard ends with `git commit --amend`
+	// amendRaw is set when the amended commit's subject isn't conventional
+	// ("Initial commit", "Merge branch ..."). The type/scope/breaking
+	// machinery is skipped entirely and the message is written back verbatim
+	// — forcing a "type: " prefix onto those commits rewrites history the
+	// user never asked to change.
+	amendRaw bool
+	// amendStaged is the index-vs-HEAD file list, read once on entering the
+	// confirm step. `git commit --amend` commits the WHOLE index, so anything
+	// staged outside the wizard rides along and has to be disclosed.
+	amendStaged []string
 
 	// Cached: whether the repo has at least one commit. Refreshed by
 	// RefreshGraphs so menuItems doesn't fork git per keypress.
@@ -249,7 +302,7 @@ type Model struct {
 func NewModel(files []types.FileEntry, branch string) Model {
 	mi := textinput.New()
 	mi.Placeholder = "Describe your changes..."
-	mi.CharLimit = 200
+	mi.CharLimit = msgCharLimit
 	mi.Width = 50
 
 	ci := textinput.New()
@@ -266,7 +319,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	bi.Placeholder = "Optional detailed description..."
 	bi.SetWidth(50)
 	bi.SetHeight(4)
-	bi.CharLimit = 500
+	bi.CharLimit = bodyCharLimit
 
 	ei := textarea.New()
 	ei.Placeholder = ""
@@ -383,6 +436,67 @@ func (m *Model) RefreshGraphs() {
 	m.hasAnyCommit = git.HasAnyCommit()
 }
 
+// resetWizard clears every field the commit/amend wizard writes, so the next
+// run starts blank. It exists because the amend prefill (type, scope, subject,
+// body, breaking flag) used to survive an abandoned amend and reappear in the
+// next ordinary commit — enter-through would then ship the old commit's
+// message. Call it from EVERY path that abandons or completes the wizard.
+func (m *Model) resetWizard() {
+	m.amendMode = false
+	m.amendRaw = false
+	m.amendStaged = nil
+	m.typeIdx = 0
+	m.commitType = ""
+	m.scope = ""
+	m.breaking = false
+	m.showBody = false
+	m.bodyFocused = false
+	m.pushed = false
+	m.pushBranch = ""
+	m.branchIdx = 0
+	m.pushCheckDone = false
+	m.gitignoreCached = nil
+
+	m.msgInput.Reset()
+	m.msgInput.Blur()
+	// Restore the everyday limits: the amend prefill lifts them so a long
+	// commit body round-trips intact.
+	m.msgInput.CharLimit = msgCharLimit
+	m.bodyInput.Reset()
+	m.bodyInput.Blur()
+	m.bodyInput.CharLimit = bodyCharLimit
+	m.scopeInput.Reset()
+	m.scopeInput.Blur()
+	m.customInput.Reset()
+	m.customInput.Blur()
+}
+
+// refreshFiles re-reads git status into m.files, dropping selections (a new
+// wizard run always starts fresh). The always-on dashboard would otherwise
+// gate "Commit" on a snapshot taken at startup: files changed from an editor
+// or another terminal stay invisible, and Commit answers "working tree clean".
+func (m *Model) refreshFiles() {
+	files, err := git.GetStatus()
+	if err != nil {
+		return
+	}
+	m.files = files
+	m.cursor = 0
+	m.fileScroll = 0
+}
+
+// returnToMenu is the single way back to the main menu: it abandons any wizard
+// state, re-reads the working tree, and refreshes the graph/counters. Every
+// transition to stepMenu goes through here so no path can skip one of the
+// three (the esc-from-Files path used to skip all of them).
+func (m *Model) returnToMenu() tea.Cmd {
+	m.resetWizard()
+	m.refreshFiles()
+	m.step = stepMenu
+	m.RefreshGraphs()
+	return m.maybeFetch()
+}
+
 // opInFlight reports whether a mutating operation is currently running as a
 // detached Bubble Tea command. Quitting mid-sequence can leave the repo in a
 // half-finished state — an auto-stash orphaned between `git stash` and
@@ -456,14 +570,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case undoResultMsg:
 		m.confirmUndo = false
 		m.undoing = false
+		m.undoPushed = false
 		m.clearForceQuitPrompt()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
+		// The commit the wizard was pointed at no longer exists. Staying
+		// latched in amendMode would make the next confirm rewrite the
+		// PREVIOUS commit with the undone commit's message.
+		m.resetWizard()
 		m.files = msg.files
 		m.cursor = 0
 		m.fileScroll = 0
+		// Without this the menu graph still shows the undone commit, which
+		// reads as "undo failed" and invites a second, destructive undo.
+		m.RefreshGraphs()
 		return m, nil
 
 	case saveResultMsg:
@@ -562,6 +684,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// point past the end of a list that shrank after a prune.
 			// GetBranches puts the current branch first.
 			m.branchIdx = 0
+			// Fresh visit to the push step: the behind-origin check gets one
+			// shot, so declining the offered pull still leaves push reachable.
+			m.pushCheckDone = false
 			m.step = stepPush
 		} else {
 			m.step = stepDone
@@ -596,10 +721,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.stashConflict {
 			pendingNote := ""
 			if m.branchMergePending != "" {
-				pendingNote = fmt.Sprintf(" Pending merge of %s was cancelled — re-initiate after resolving.", m.branchMergePending)
+				pendingNote = fmt.Sprintf(" Pending merge of %s was cancelled.", m.branchMergePending)
 			}
 			m.branchMergePending = ""
-			m.err = fmt.Errorf("switched to %s — your changes are saved in stash %s.%s After resolving conflicts, run: git stash apply %s", msg.newBranch, msg.stashRef, pendingNote, msg.stashRef)
+			// Describe the state CleanupFailedStashPop actually leaves behind:
+			// the working tree was reset clean, so there are no conflict
+			// markers to resolve anywhere. The changes only exist in the stash.
+			m.err = recoveryError{fmt.Errorf("switched to %s, but your stashed changes did not apply here — the working tree was reset clean and nothing was lost.%s Your changes are in stash %s; recover with: git stash apply %s",
+				msg.newBranch, pendingNote, msg.stashRef, msg.stashRef)}
 			return m, nil
 		}
 		// If a merge was pending (target picker flow), start it now
@@ -664,21 +793,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pulling = false
 		m.clearForceQuitPrompt()
 		if msg.err != nil {
-			// Conflict → abort cleanly, route user to Branch Manager.
+			verb := "pull"
+			if msg.kind == pullKindMain {
+				verb = "sync with " + m.syncMainBranchName
+			}
 			if len(msg.conflictFiles) > 0 {
+				// Abort first: that puts the tree back on the stash's base
+				// commit, which is exactly where the stash applies cleanly.
 				git.MergeAbort()
-				verb := "pull"
-				if msg.kind == pullKindMain {
-					verb = "sync with " + m.syncMainBranchName
-				}
-				m.err = fmt.Errorf("%s conflict — resolve in Branch Manager", verb)
+				m.err = fmt.Errorf("%s conflict — the merge was aborted, nothing changed", verb)
 			} else {
 				m.err = msg.err
 			}
-			return m.exitSyncDialog(), nil
+			// The pull auto-stashed a dirty tree before merging. Whatever
+			// went wrong above, those changes must come back — or the user
+			// must be told exactly where they are.
+			if msg.stashed {
+				if popErr := git.StashPop(); popErr != nil {
+					git.CleanupFailedStashPop()
+					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean — they are safe in stash %s; recover with: git stash apply %s",
+						m.err, msg.stashRef, msg.stashRef)}
+				} else {
+					m.err = fmt.Errorf("%v. Your uncommitted changes were restored", m.err)
+				}
+			}
+			return m.exitSyncDialog()
 		}
 		m.RefreshGraphs()
-		return m.exitSyncDialog(), nil
+		return m.exitSyncDialog()
 
 	case branchMergeResultMsg:
 		m.branchMerging = false
@@ -718,8 +860,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Any other keypress disarms the force-quit prompt.
 		m.forceQuitArmed = false
-		// Clear error on any keypress
-		m.err = nil
+		// Clear error on any keypress — except recovery errors, which carry a
+		// stash SHA the user still has to copy. An arrow key used to be enough
+		// to destroy the only in-app record of it. Those are dismissed
+		// deliberately with esc/enter, and that keypress is consumed so the
+		// dismissal doesn't also navigate.
+		if isRecoveryError(m.err) {
+			switch msg.String() {
+			case "esc", "enter":
+				m.err = nil
+				return m, nil
+			}
+		} else {
+			m.err = nil
+		}
 		// Clear the one-shot init success banner after the user acknowledges
 		// the menu by pressing any key.
 		if m.step == stepMenu {

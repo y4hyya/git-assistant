@@ -46,9 +46,8 @@ func (m Model) updateType(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// selector — "back" there would land on an empty list, so return to
 		// the menu instead.
 		if m.amendMode && len(m.files) == 0 {
-			m.amendMode = false
-			m.step = stepMenu
-			return m, nil
+			cmd := m.returnToMenu()
+			return m, cmd
 		}
 		m.step = stepFiles
 		m.cursor = 0

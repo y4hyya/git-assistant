@@ -283,15 +283,11 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		// Return to menu, refresh files + branch + graph
-		m.step = stepMenu
+		// The branch may have changed under us — resolve it first, since the
+		// shared return path reads status and graphs against it.
 		m.branch, _ = git.GetCurrentBranch()
-		freshFiles, _ := git.GetStatus()
-		m.files = freshFiles
-		m.cursor = 0
-		m.fileScroll = 0
-		m.RefreshGraphs()
-		return m, m.maybeFetch()
+		cmd := m.returnToMenu()
+		return m, cmd
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -398,7 +394,7 @@ func (m Model) viewBranch() string {
 
 	// ── Merge confirmation ─────────────────────────────
 	if m.branchMergeMode {
-		b.WriteString("  " + branchStyle.Render(m.mergeSource) + " " + dimStyle.Render("→") + " " + branchStyle.Render(m.mergeTarget) + "\n\n")
+		b.WriteString("  " + branchStyle.Render(m.mergeSource) + " " + dimStyle.Render(symArrowRight) + " " + branchStyle.Render(m.mergeTarget) + "\n\n")
 		b.WriteString("  " + dimStyle.Render("This will bring all changes from") + "\n")
 		b.WriteString("  " + dimStyle.Render("'"+m.mergeSource+"' into '"+m.mergeTarget+"'") + "\n")
 		b.WriteString("\n")

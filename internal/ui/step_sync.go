@@ -31,18 +31,23 @@ func doPullCurrent(branch string) tea.Cmd {
 			stashRef = ref
 		}
 		if err := git.MergeFromOrigin(branch, false); err != nil {
-			conflicts := git.GetConflictFiles()
-			// If merge failed cleanly (no conflicts), try to restore stash
-			if len(conflicts) == 0 && stashed {
-				git.StashPop()
+			// Restoring the stash is the handler's job: on a conflict it has
+			// to abort the merge first, and only then does the tree sit at
+			// the commit the stash applies cleanly onto.
+			return pullResultMsg{
+				err:           err,
+				conflictFiles: git.GetConflictFiles(),
+				kind:          pullKindCurrent,
+				stashed:       stashed,
+				stashRef:      stashRef,
 			}
-			return pullResultMsg{err: err, conflictFiles: conflicts, kind: pullKindCurrent}
 		}
 		if stashed {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err:  fmt.Errorf("pulled, but stash-pop conflicted — your changes are saved in stash %s. Resolve, then run: git stash apply %s", stashRef, stashRef),
+					err: recoveryError{fmt.Errorf("pulled, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s", stashRef, stashRef)},
+					// Already handled here — don't let the handler pop twice.
 					kind: pullKindCurrent,
 				}
 			}
@@ -70,17 +75,21 @@ func doSyncMain(mainBranch string) tea.Cmd {
 			stashRef = ref
 		}
 		if err := git.MergeFromOrigin(mainBranch, true); err != nil {
-			conflicts := git.GetConflictFiles()
-			if len(conflicts) == 0 && stashed {
-				git.StashPop()
+			// See doPullCurrent: the handler owns stash recovery because it
+			// aborts the merge first.
+			return pullResultMsg{
+				err:           err,
+				conflictFiles: git.GetConflictFiles(),
+				kind:          pullKindMain,
+				stashed:       stashed,
+				stashRef:      stashRef,
 			}
-			return pullResultMsg{err: err, conflictFiles: conflicts, kind: pullKindMain}
 		}
 		if stashed {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err:  fmt.Errorf("merged, but stash-pop conflicted — your changes are saved in stash %s. Resolve, then run: git stash apply %s", stashRef, stashRef),
+					err:  recoveryError{fmt.Errorf("merged, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s", stashRef, stashRef)},
 					kind: pullKindMain,
 				}
 			}
@@ -121,7 +130,7 @@ func (m Model) updateSync(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(doSyncMain(m.syncMainBranchName), m.spinner.Tick)
 	case "enter", "esc", "n":
 		// Skip — return to caller without action.
-		return m.exitSyncDialog(), nil
+		return m.exitSyncDialog()
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -134,13 +143,21 @@ func (m Model) updateSync(msg tea.Msg) (tea.Model, tea.Cmd) {
 // it. Centralizes the cleanup so success, skip, and error paths stay in sync.
 // The zero value of syncReturnStep is stepMenu, which is the correct default
 // when the dialog was fired without an explicit return context.
-func (m Model) exitSyncDialog() Model {
-	m.step = m.syncReturnStep
+func (m Model) exitSyncDialog() (Model, tea.Cmd) {
 	m.syncPullCurrent = false
 	m.syncSyncMain = false
 	m.syncIncomingCurr = nil
 	m.syncIncomingMain = nil
-	return m
+	if m.syncReturnStep == stepMenu {
+		// Back to the dashboard through the one shared door: a pull moves
+		// HEAD and can restore a stash, so status and graphs must be re-read.
+		// (The dialog only ever returns to the menu from outside the wizard,
+		// so the reset returnToMenu performs has nothing to discard.)
+		cmd := m.returnToMenu()
+		return m, cmd
+	}
+	m.step = m.syncReturnStep
+	return m, nil
 }
 
 // ── View ───────────────────────────────────────────────

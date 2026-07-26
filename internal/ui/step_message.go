@@ -24,10 +24,26 @@ func (m Model) messageFocus() focus {
 	if m.bodyFocused {
 		return focusBody
 	}
-	if m.scopeInput.Focused() {
+	// A raw amend has no scope field: the subject is written back verbatim,
+	// so there is nothing to assemble a "type(scope): " prefix from.
+	if !m.amendRaw && m.scopeInput.Focused() {
 		return focusScope
 	}
 	return focusSubject
+}
+
+// leaveMessageStep backs out of the message step. Raw amends skip the type
+// picker, so "back" there means the file selector — or the menu, when a
+// message-only amend never had one.
+func (m Model) leaveMessageStep() (tea.Model, tea.Cmd) {
+	m.msgInput.Blur()
+	if len(m.files) == 0 {
+		cmd := m.returnToMenu()
+		return m, cmd
+	}
+	m.step = stepFiles
+	m.cursor = 0
+	return m, nil
 }
 
 func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -52,10 +68,14 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.bodyInput.Focus()
 				m.bodyFocused = true
 			case focusBody:
-				// Body → Scope
+				// Body → Scope (→ Subject when there is no scope field)
 				m.bodyInput.Blur()
 				m.bodyFocused = false
-				m.scopeInput.Focus()
+				if m.amendRaw {
+					m.msgInput.Focus()
+				} else {
+					m.scopeInput.Focus()
+				}
 			}
 			return m, nil
 
@@ -77,7 +97,7 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.scope = strings.TrimSpace(m.scopeInput.Value())
-			m.step = stepConfirm
+			m.enterConfirm()
 			return m, nil
 
 		case "ctrl+d":
@@ -87,12 +107,15 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.scope = strings.TrimSpace(m.scopeInput.Value())
-			m.step = stepConfirm
+			m.enterConfirm()
 			return m, nil
 
 		case "up":
 			switch f {
 			case focusSubject:
+				if m.amendRaw {
+					return m, nil
+				}
 				m.msgInput.Blur()
 				m.scopeInput.Focus()
 			}
@@ -120,6 +143,9 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.bodyFocused = false
 				m.msgInput.Focus()
 			case focusSubject:
+				if m.amendRaw {
+					return m.leaveMessageStep()
+				}
 				m.msgInput.Blur()
 				m.scopeInput.Focus()
 			case focusScope:
@@ -145,9 +171,20 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// subjectLine renders the commit subject exactly as it will be written: the
+// conventional prefix plus the typed text, or — in raw amend mode — the
+// subject alone. Every preview goes through here so the screen can never
+// promise a prefix the commit won't carry (or hide one it will).
+func (m Model) subjectLine(subject string) string {
+	if m.amendRaw {
+		return subject
+	}
+	return m.commitPrefix() + ": " + subject
+}
+
 // buildCommitMessage constructs the full commit message with optional body.
 func (m Model) buildCommitMessage(subject string) string {
-	msg := m.commitPrefix() + ": " + subject
+	msg := m.subjectLine(subject)
 	if m.showBody {
 		body := strings.TrimSpace(m.bodyInput.Value())
 		if body != "" {
@@ -197,19 +234,23 @@ func (m Model) viewMessage() string {
 			count++
 		}
 	}
-	prefix := m.commitPrefix()
-	b.WriteString(fmt.Sprintf("  Type:  %s\n", activeStyle.Render(prefix)))
+	if m.amendRaw {
+		b.WriteString(fmt.Sprintf("  Type:  %s\n", dimStyle.Render("(keeping original format)")))
+	} else {
+		b.WriteString(fmt.Sprintf("  Type:  %s\n", activeStyle.Render(m.commitPrefix())))
+	}
 	b.WriteString(fmt.Sprintf("  Files: %s\n\n", dimStyle.Render(fmt.Sprintf("%d selected", count))))
 
-	// Scope input (inline, optional)
-	scopeLabel := "  Scope " + dimStyle.Render("(optional)")
-	if f == focusScope {
-		scopeLabel = highlightStyle.Render("  Scope") + " " + dimStyle.Render("(optional)")
-	} else {
-		scopeLabel = dimStyle.Render("  Scope (optional)")
+	// Scope input (inline, optional). Hidden for raw amends — the subject is
+	// written back verbatim, so there is no prefix to put a scope into.
+	if !m.amendRaw {
+		scopeLabel := dimStyle.Render("  Scope (optional)")
+		if f == focusScope {
+			scopeLabel = highlightStyle.Render("  Scope") + " " + dimStyle.Render("(optional)")
+		}
+		b.WriteString(scopeLabel + "\n")
+		b.WriteString("  " + m.scopeInput.View() + "\n\n")
 	}
-	b.WriteString(scopeLabel + "\n")
-	b.WriteString("  " + m.scopeInput.View() + "\n\n")
 
 	// Subject input
 	subjectLabel := "  Subject"
@@ -237,17 +278,23 @@ func (m Model) viewMessage() string {
 	// Live preview
 	val := m.msgInput.Value()
 	if val != "" {
-		// Build preview with current scope input
-		scopeVal := m.scopeInput.Value()
-		previewPrefix := m.commitType
-		if scopeVal != "" {
-			previewPrefix += "(" + scopeVal + ")"
+		preview := val
+		if !m.amendRaw {
+			// Build preview with current scope input
+			scopeVal := m.scopeInput.Value()
+			previewPrefix := m.commitType
+			if scopeVal != "" {
+				previewPrefix += "(" + scopeVal + ")"
+			}
+			if m.breaking {
+				previewPrefix += "!"
+			}
+			preview = previewPrefix + ": " + val
 		}
-		if m.breaking {
-			previewPrefix += "!"
+		b.WriteString("\n  " + previewStyle.Render(symArrowRight+" "+preview) + "\n")
+		if m.amendRaw {
+			b.WriteString("  " + dimStyle.Render("(keeping original format)") + "\n")
 		}
-		preview := previewPrefix + ": " + val
-		b.WriteString("\n  " + previewStyle.Render("→ "+preview) + "\n")
 	}
 
 	// Error
@@ -265,27 +312,31 @@ func (m Model) viewMessage() string {
 			{"esc", "back"},
 		}))
 	case focusBody:
+		tabTarget := "scope"
+		if m.amendRaw {
+			tabTarget = "subject"
+		}
 		b.WriteString(renderHelp([]helpEntry{
 			{"ctrl+d", "next"},
-			{"tab", "scope"},
+			{"tab", tabTarget},
 			{"esc", "subject"},
 		}))
 	default:
-		if m.showBody {
-			b.WriteString(renderHelp([]helpEntry{
-				{symArrows, "navigate"},
-				{"enter", "next"},
-				{"tab", "body"},
-				{"esc", "scope"},
-			}))
-		} else {
-			b.WriteString(renderHelp([]helpEntry{
-				{symArrows, "navigate"},
-				{"enter", "next"},
-				{"tab", "add body"},
-				{"esc", "scope"},
-			}))
+		// Raw amends have no scope field, so esc leaves the step entirely.
+		escTarget := "scope"
+		if m.amendRaw {
+			escTarget = "back"
 		}
+		tabTarget := "add body"
+		if m.showBody {
+			tabTarget = "body"
+		}
+		b.WriteString(renderHelp([]helpEntry{
+			{symArrows, "navigate"},
+			{"enter", "next"},
+			{"tab", tabTarget},
+			{"esc", escTarget},
+		}))
 	}
 
 	return m.styledBox(b.String())

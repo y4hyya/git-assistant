@@ -62,6 +62,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(doUndo(), m.spinner.Tick)
 		default:
 			m.confirmUndo = false
+			m.undoPushed = false
 			return m, nil
 		}
 	}
@@ -393,6 +394,10 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "u":
 		m.confirmUndo = true
+		// Checked once, here — never from a View func. Undoing a commit that
+		// is already on origin makes the branch diverge, which is worth
+		// saying out loud before the soft reset.
+		m.undoPushed = git.IsLastCommitPushed()
 	case "enter":
 		hasSelected := false
 		for _, f := range m.files {
@@ -406,11 +411,22 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !hasSelected && !m.amendMode {
 			return m, nil
 		}
-		m.step = stepType
+		if m.amendMode {
+			m.step = m.firstAmendStep()
+			if m.step == stepMessage {
+				m.msgInput.Focus()
+				m.msgInput.CursorEnd()
+			}
+		} else {
+			m.step = stepType
+		}
 		m.cursor = 0
 	case "esc":
-		m.step = stepMenu
-		return m, nil
+		// Abandoning the wizard: drop every field it filled in (an abandoned
+		// amend used to leave the old commit's message pre-loaded for the
+		// next ordinary commit) and re-read the tree on the way out.
+		cmd := m.returnToMenu()
+		return m, cmd
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
@@ -659,6 +675,9 @@ func (m Model) viewFiles() string {
 			b.WriteString("\n  " + dimStyle.Render("Last: "+lastMsg))
 		}
 		b.WriteString("\n  " + modifiedStyle.Render("Undo last commit? Changes will be kept.") + "\n")
+		if m.undoPushed {
+			b.WriteString("  " + modifiedStyle.Render(symWarn+" already pushed to origin — undoing will make your branch diverge") + "\n")
+		}
 		b.WriteString("\n")
 		b.WriteString(renderHelp([]helpEntry{
 			{"y", "confirm"},
@@ -902,15 +921,21 @@ func formatError(err error) string {
 		hint = "Nothing was committed. Refresh the file list (esc, then enter) and try again."
 	case strings.Contains(msg, "nothing to undo"):
 		hint = "Use Amend from the menu to change the first commit instead."
-	case strings.Contains(msg, "saved in stash"):
-		hint = "Your changes are safe. Switch back to the original branch and run: git stash pop"
 	case strings.Contains(msg, "invalid branch name"):
 		hint = "Branch names cannot contain spaces or special characters like ~, ^, :, ?, *, ["
 	}
+	// No "saved in stash" hint here on purpose: every stash message now
+	// carries its own exact recovery command, and the generic hint used to
+	// contradict it ("git stash pop" on a branch where the entry conflicts).
 
 	result := errorStyle.Render("Error: " + msg)
 	if hint != "" {
 		result += "\n  " + dimStyle.Render("Hint: "+hint)
+	}
+	// Recovery errors survive ordinary keypresses (see Update) — say so, or
+	// the banner looks stuck.
+	if isRecoveryError(err) {
+		result += "\n  " + helpKeyStyle.Render("esc") + " " + helpStyle.Render("dismiss")
 	}
 	return result
 }

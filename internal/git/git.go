@@ -395,6 +395,33 @@ func IsLastCommitPushed() bool {
 	return strings.TrimSpace(string(out)) != ""
 }
 
+// GetStagedFiles returns the paths that currently differ between the index and
+// HEAD — everything `git commit` (or `git commit --amend`) would sweep into the
+// next commit, whether the wizard selected it or not. The amend confirm screen
+// uses this to disclose work staged outside git-assist instead of silently
+// folding it into the rewritten commit.
+//
+// NUL-separated like GetStatus: in -z mode git never quotes or C-escapes paths,
+// so filenames with spaces or non-ASCII characters come through verbatim.
+// A repo with no commits has no HEAD to diff against — report an empty set
+// rather than an error, since amend is unreachable there anyway.
+func GetStagedFiles() ([]string, error) {
+	if !HasAnyCommit() {
+		return nil, nil
+	}
+	out, err := exec.Command("git", "diff", "--cached", "--name-only", "-z").Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff --cached: %w", err)
+	}
+	var paths []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
 // Amend stages any newly-selected files on top of the existing index and
 // re-runs the last commit with the given message. Unlike Commit, we don't
 // `git reset` first — the whole point of amend is to keep what's already

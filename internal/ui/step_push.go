@@ -47,16 +47,23 @@ func (m Model) updatePush(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushBranch = branch
 		// Pre-push sync check — if the current local branch is behind its
 		// origin tracking ref, suggest pulling first (prevents non-ff push
-		// errors, which are confusing for beginners). Just a suggestion —
-		// user can skip and still push.
-		if m.populateSyncDialog() && m.syncPullCurrent {
-			m.syncReturnStep = stepPush
-			m.step = stepSync
-			return m, nil
+		// errors, which are confusing for beginners). Strictly a suggestion,
+		// so it fires once per visit: re-running it on every enter meant
+		// declining the pull bounced the user back here forever, with no
+		// reachable push at all.
+		if !m.pushCheckDone {
+			m.pushCheckDone = true
+			if m.populateSyncDialog() && m.syncPullCurrent {
+				m.syncReturnStep = stepPush
+				m.step = stepSync
+				return m, nil
+			}
 		}
 		m.pushing = true
 		return m, tea.Batch(doPush(m.branch, branch), m.spinner.Tick)
 	case "n", "esc":
+		// Leaving the step — the next visit gets a fresh check.
+		m.pushCheckDone = false
 		m.step = stepDone
 		return m, nil
 	case "q":
@@ -89,7 +96,7 @@ func (m Model) viewPush() string {
 	b.WriteString("\n\n")
 
 	// Commit success
-	msg := m.commitPrefix() + ": " + strings.TrimSpace(m.msgInput.Value())
+	msg := m.subjectLine(strings.TrimSpace(m.msgInput.Value()))
 	b.WriteString("  " + successStyle.Render(symDone) + " Committed: " + msg + "\n")
 
 	stats := git.GetCommitStats()

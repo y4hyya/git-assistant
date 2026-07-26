@@ -85,57 +85,89 @@ func (m Model) canConnectGH() bool {
 
 // startAmend pre-loads the commit wizard with the last commit's content so
 // the user can edit message and/or stage additional files, then runs
-// `git commit --amend` at the end. Parses conventional-commit prefixes so
-// the type/scope/breaking flags survive the round-trip — non-conventional
-// commits fall through to the "custom" type with the original subject
-// preserved verbatim in the message input.
+// `git commit --amend` at the end.
+//
+// Conventional subjects are parsed so the type/scope/breaking flags survive
+// the round-trip. Anything else — merge commits, "Initial commit", plain
+// prose — enters raw mode: no type picker, no prefix, the subject goes back
+// to git exactly as it came out. Forcing "<type>: " onto those subjects
+// rewrote history the user never asked to change.
 func (m Model) startAmend() Model {
 	subject, body := git.GetLastCommitFull()
-	cType, scope, breaking, rest := parseConventionalSubject(subject)
+	m = m.applyAmendPrefill(subject, body)
 
-	m.typeIdx = len(types.CommitTypes) // default to "custom"
-	m.commitType = ""
-	if cType != "" {
-		for i, ct := range types.CommitTypes {
-			if ct.Name == cType {
-				m.typeIdx = i
-				m.commitType = ct.Name
-				break
-			}
-		}
-		if m.commitType == "" {
-			// Conventional-looking prefix but not in our type list — keep
-			// the parsed value so the amend preserves it via the custom path.
-			m.commitType = cType
-		}
-	}
-
-	m.scope = scope
-	m.breaking = breaking
-	m.scopeInput.SetValue(scope)
-	m.msgInput.SetValue(rest)
-	if body != "" {
-		m.bodyInput.SetValue(body)
-		m.showBody = true
-	} else {
-		m.bodyInput.Reset()
-		m.showBody = false
-	}
-	m.bodyFocused = false
-
-	m.amendMode = true
 	m.cursor = 0
 	m.fileScroll = 0
 	if len(m.files) == 0 {
-		// Clean tree — the flagship amend case. There is nothing to stage,
-		// so the file selector would be an empty list whose keys index into
-		// a zero-length slice. Go straight to the type picker: a
-		// message-only amend.
-		m.step = stepType
+		// Clean tree — the flagship amend case. There is nothing to stage, so
+		// the file selector would be an empty list whose keys index into a
+		// zero-length slice. Skip it: raw amends have no type to pick either.
+		m.step = m.firstAmendStep()
+		if m.step == stepMessage {
+			m.msgInput.Focus()
+		}
 		return m
 	}
 	m.step = stepFiles
 	return m
+}
+
+// applyAmendPrefill loads one commit's subject and body into the wizard
+// inputs. Split out from startAmend so the parse/prefill rules can be
+// exercised without a repo — and so the char-limit lift can never drift away
+// from the SetValue calls it protects.
+func (m Model) applyAmendPrefill(subject, body string) Model {
+	cType, scope, breaking, rest := parseConventionalSubject(subject)
+
+	// Start from a blank wizard so nothing from an earlier run leaks in.
+	m.resetWizard()
+	// Then lift the editor limits: SetValue silently truncates at CharLimit,
+	// and a truncated prefill becomes a truncated commit the moment the user
+	// confirms. resetWizard puts the everyday limits back afterwards.
+	m.msgInput.CharLimit = 0
+	m.bodyInput.CharLimit = 0
+
+	if cType == "" {
+		m.amendRaw = true
+		m.msgInput.SetValue(subject)
+	} else {
+		m.typeIdx = len(types.CommitTypes) // "custom" unless it's a known type
+		m.commitType = cType
+		for i, ct := range types.CommitTypes {
+			if ct.Name == cType {
+				m.typeIdx = i
+				break
+			}
+		}
+		if m.typeIdx == len(types.CommitTypes) {
+			// Conventional shape, unlisted type — pre-fill the custom input
+			// so enter-through preserves the original prefix.
+			m.customInput.SetValue(cType)
+		}
+		m.scope = scope
+		m.breaking = breaking
+		m.scopeInput.SetValue(scope)
+		m.msgInput.SetValue(rest)
+	}
+	m.msgInput.CursorEnd()
+
+	if body != "" {
+		m.bodyInput.SetValue(body)
+		m.showBody = true
+	}
+
+	m.amendMode = true
+	return m
+}
+
+// firstAmendStep is the step the wizard enters once file selection is settled.
+// Raw amends bypass the type picker entirely — there is no prefix to choose —
+// while conventional ones keep the normal Type → Message order.
+func (m Model) firstAmendStep() step {
+	if m.amendRaw {
+		return stepMessage
+	}
+	return stepType
 }
 
 // ── Update ──────────────────────────────────────────────
@@ -184,15 +216,20 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// are present, so name-based dispatch is harder to break.
 		switch items[m.menuCursor].name {
 		case "Commit":
+			// Re-read the tree first: the dashboard stays open for hours and
+			// the snapshot behind this gate goes stale the moment the user
+			// edits a file in their editor or another terminal.
+			m.refreshFiles()
 			if len(m.files) == 0 {
 				m.err = fmt.Errorf("nothing to commit — working tree clean")
 				return m, nil
 			}
-			m.amendMode = false
+			// Clears any leftovers (notably an abandoned amend's prefilled
+			// type/scope/subject/body) so this run starts blank.
+			m.resetWizard()
 			m.step = stepFiles
-			m.cursor = 0
-			m.fileScroll = 0
 		case "Amend":
+			m.refreshFiles()
 			return m.startAmend(), nil
 		case "Branch":
 			m.branchEntries = git.GetAllBranches()

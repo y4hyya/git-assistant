@@ -103,21 +103,42 @@ func (m Model) updateInit(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Success — refresh model from new git state and land on menu.
 			m.branch = msg.branch
 			m.hasRemote = git.HasRemote()
-			files, _ := git.GetStatus()
-			m.files = files
-			m.RefreshGraphs()
-			m.step = stepMenu
 			m.initPhase = initPhasePickOption
-			m.initSuccessMsg = msg.message
 			m.ghReuseMode = false
-			return m, m.maybeFetch()
+			cmd := m.returnToMenu()
+			m.initSuccessMsg = msg.message
+			return m, cmd
 		case ghAuthResultMsg:
 			m.initWorking = false
 			m.clearForceQuitPrompt()
-			if msg.err != nil {
-				m.err = fmt.Errorf("gh auth failed: %v", msg.err)
+			// `gh auth login` can exit 0 after the user bails out in the
+			// browser, so trust the session check over the process status.
+			authed := git.IsGHAuthed()
+			if !authed {
+				if msg.err != nil {
+					m.err = fmt.Errorf("gh auth failed: %v", msg.err)
+				} else {
+					m.err = fmt.Errorf("gh is still not authenticated — run `gh auth login` in your terminal")
+				}
+				m.initPhase = initPhasePickOption
+				if m.ghReuseMode {
+					// Reuse mode came from the menu of an already-initialized
+					// repo; the first-run picker has nothing to offer there.
+					m.ghReuseMode = false
+					cmd := m.returnToMenu()
+					return m, cmd
+				}
+				return m, nil
 			}
-			m.initPhase = initPhasePickOption
+			if m.ghReuseMode {
+				// Existing repo — resume exactly where the auth check
+				// interrupted us: naming the GitHub repo to create.
+				m.initNameInput.Focus()
+				m.initNameInput.CursorEnd()
+				m.initPhase = initPhaseInputRepoName
+				return m, nil
+			}
+			m.initPhase = initPhasePickTemplate
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -249,10 +270,10 @@ func (m Model) updateInitInputRepoName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.initNameInput.Blur()
 		if m.ghReuseMode {
 			// Recovery flow skips the template phase; bail to menu.
-			m.step = stepMenu
 			m.ghReuseMode = false
 			m.initPhase = initPhasePickOption
-			return m, nil
+			cmd := m.returnToMenu()
+			return m, cmd
 		}
 		m.initPhase = initPhasePickTemplate
 		return m, nil
@@ -364,10 +385,10 @@ func (m Model) updateInitConfirmGHAuth(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		})
 	case "n", "esc":
 		if m.ghReuseMode {
-			m.step = stepMenu
 			m.ghReuseMode = false
 			m.initPhase = initPhasePickOption
-			return m, nil
+			cmd := m.returnToMenu()
+			return m, cmd
 		}
 		m.initPhase = initPhasePickOption
 		return m, nil
