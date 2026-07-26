@@ -57,7 +57,7 @@ func (m Model) viewDone() string {
 			detail += dimStyle.Render(hash)
 		}
 		if hash != "" && stats != "" {
-			detail += dimStyle.Render(" · ")
+			detail += dimStyle.Render(" " + symMidDot + " ")
 		}
 		if stats != "" {
 			detail += dimStyle.Render(stats)

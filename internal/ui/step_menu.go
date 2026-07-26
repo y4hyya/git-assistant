@@ -8,6 +8,7 @@ import (
 	"git-assist/internal/types"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type menuItem struct {
@@ -46,12 +47,36 @@ func (m Model) menuItems() []menuItem {
 	return items
 }
 
+// isConventionalType reports whether s can be a conventional-commit type:
+// one word of letters, digits or hyphens. Nothing else — a type with a space
+// in it is prose that happens to contain a colon.
+func isConventionalType(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // parseConventionalSubject extracts the type, scope, breaking flag, and
 // remaining text from a conventional-commit-format subject like
 // "feat(auth)!: add login". Returns commitType="" if the input doesn't
 // match — in that case `rest` contains the original subject untouched
-// so the amend flow can fall back to the "custom" type with the original
-// message preserved.
+// so the amend flow can fall back to raw mode with the original message
+// preserved.
+//
+// The match has to be strict about what a type is. "Anything before the first
+// colon" accepted "Update the README: add badges" as type="Update the README",
+// a type no picker lists and no screen renders — the wizard opened with only
+// "add badges" in the subject field and the first half of the user's own
+// commit message was gone. Prose like that belongs on the raw amend path,
+// which round-trips the subject byte-for-byte.
 func parseConventionalSubject(subject string) (commitType, scope string, breaking bool, rest string) {
 	idx := strings.Index(subject, ":")
 	if idx <= 0 {
@@ -68,12 +93,32 @@ func parseConventionalSubject(subject string) (commitType, scope string, breakin
 		if !strings.HasSuffix(prefix, ")") {
 			return "", "", false, subject
 		}
-		commitType = prefix[:openParen]
-		scope = prefix[openParen+1 : len(prefix)-1]
-		return
+		cType := prefix[:openParen]
+		cScope := prefix[openParen+1 : len(prefix)-1]
+		if !isConventionalType(cType) || cScope == "" || strings.ContainsAny(cScope, "()") {
+			return "", "", false, subject
+		}
+		return cType, cScope, breaking, rest
 	}
-	commitType = prefix
-	return
+	if !isConventionalType(prefix) {
+		return "", "", false, subject
+	}
+	return prefix, "", breaking, rest
+}
+
+// clampMenuCursor keeps the menu cursor inside the item list. The list is
+// built fresh on every pass and can shrink underneath the cursor: "Connect to
+// GitHub" vanishes the instant the repo gains a remote, and a cursor left
+// past the end highlights no row, makes "down" dead and turns "enter" into a
+// no-op — with only "up" to escape.
+func clampMenuCursor(cursor, n int) int {
+	if cursor >= n {
+		cursor = n - 1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	return cursor
 }
 
 // canConnectGH reports whether the recovery menu entry is applicable.
@@ -197,6 +242,7 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	items := m.menuItems()
+	m.menuCursor = clampMenuCursor(m.menuCursor, len(items))
 
 	switch keyMsg.String() {
 	case "up", "k":
@@ -288,46 +334,52 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // ── View ────────────────────────────────────────────────
 
+// viewMenu renders the dashboard within the rows styledBox will actually
+// draw. Sections are assembled as whole blocks against a measured budget so
+// that overflow drops a section, never the box's own bottom border — the old
+// fixed "m.height - 14" guess ignored the fifth menu item, the error banner
+// and the sync spinner, and the box lost its floor exactly when an error was
+// on screen.
 func (m Model) viewMenu() string {
-	var b strings.Builder
+	// ── Header ───────────────────────────────────────
+	var head strings.Builder
+	head.WriteString(titleStyle.Render(" git-assist "))
+	head.WriteString("  ")
+	head.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 
-	// Header
-	b.WriteString(titleStyle.Render(" git-assist "))
-	b.WriteString("  ")
-	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
-
-	status := ""
 	if len(m.files) == 0 {
-		status = successStyle.Render("  clean")
+		head.WriteString(successStyle.Render("  clean"))
 	} else {
-		status = modifiedStyle.Render(fmt.Sprintf("  %d changes", len(m.files)))
+		head.WriteString(modifiedStyle.Render(fmt.Sprintf("  %d changes", len(m.files))))
 	}
-	b.WriteString(status)
 	if m.behindMain > 0 {
-		b.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind main", symArrowDown, m.behindMain)))
+		head.WriteString(modifiedStyle.Render(fmt.Sprintf("  %s%d behind main", symArrowDown, m.behindMain)))
 	}
 	if m.fetching {
-		b.WriteString("  " + dimStyle.Render(m.spinner.View()+" syncing"))
+		head.WriteString("  " + dimStyle.Render(m.spinner.View()+" syncing"))
 	}
-	b.WriteString("\n\n")
+
+	blocks := []string{head.String()}
 
 	// One-shot success banner from the init flow. Cleared on next keypress
 	// by the main Update handler, same lifecycle as m.err.
 	if m.initSuccessMsg != "" {
-		b.WriteString("  " + successStyle.Render(symDone+" "+m.initSuccessMsg) + "\n\n")
+		blocks = append(blocks, "  "+successStyle.Render(symDone+" "+m.initSuccessMsg))
 	}
 
-	// Menu items
+	// ── Menu items ───────────────────────────────────
 	items := m.menuItems()
+	cursorIdx := clampMenuCursor(m.menuCursor, len(items))
+	rows := make([]string, 0, len(items))
 	for i, item := range items {
 		cursor := "  "
-		if i == m.menuCursor {
+		if i == cursorIdx {
 			cursor = cursorStyle.Render(symCursor + " ")
 		}
 
 		name := inactiveStyle.Render(item.name)
 		desc := dimStyle.Render(item.desc)
-		if i == m.menuCursor {
+		if i == cursorIdx {
 			name = highlightStyle.Render(item.name)
 		}
 
@@ -337,21 +389,36 @@ func (m Model) viewMenu() string {
 			desc = dimStyle.Render(item.desc)
 		}
 
-		b.WriteString(fmt.Sprintf("%s%-12s %s\n", cursor, name, desc))
+		rows = append(rows, fmt.Sprintf("%s%-12s %s", cursor, name, desc))
 	}
+	blocks = append(blocks, strings.Join(rows, "\n"))
 
 	// Spinner for sync
 	if m.branchMerging {
-		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Syncing with main...") + "\n")
+		blocks = append(blocks, "  "+m.spinner.View()+" "+dimStyle.Render("Syncing with main..."))
 	}
 
 	// Error
 	if m.err != nil {
-		b.WriteString("\n  " + formatError(m.err) + "\n")
+		blocks = append(blocks, "  "+formatError(m.err))
 	}
 
-	// Help bar
-	b.WriteString("\n")
+	// ── Fit the blocks to the rows we have ───────────
+	budget := m.contentHeight()
+	used := 0
+	for _, blk := range blocks {
+		used += lipgloss.Height(blk)
+	}
+
+	// Blank lines between blocks are the first thing to go.
+	sep := "\n"
+	if gaps := len(blocks) - 1; used+gaps <= budget {
+		sep = "\n\n"
+		used += gaps
+	}
+	out := strings.Join(blocks, sep)
+
+	// Help bar: a blank line plus one row, dropped whole when it doesn't fit.
 	helpEntries := []helpEntry{
 		{symArrows, "navigate"},
 		{"enter", "select"},
@@ -363,14 +430,16 @@ func (m Model) viewMenu() string {
 		helpEntries = append(helpEntries, helpEntry{"s", "sync"})
 	}
 	helpEntries = append(helpEntries, helpEntry{"q", "quit"})
-	b.WriteString(renderHelp(helpEntries))
-
-	// Graph section
-	graphSection := m.renderGraphSection()
-	if graphSection != "" {
-		b.WriteString("\n\n")
-		b.WriteString(graphSection)
+	if used+2 <= budget {
+		out += "\n\n" + renderHelp(helpEntries)
+		used += 2
 	}
 
-	return m.styledBox(b.String())
+	// Graph section: takes whatever is left after its own blank line, and
+	// hides itself when that isn't enough for a useful panel.
+	if graph := m.renderGraphSection(budget - used - 1); graph != "" {
+		out += "\n\n" + graph
+	}
+
+	return m.styledBox(out)
 }
