@@ -90,18 +90,19 @@ func (m Model) viewPush() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Push to remote"))
 	b.WriteString("\n\n")
 
-	// Commit success
+	// Commit success. The stats come from the commit command (see doCommit) —
+	// this used to fork `git diff --stat` from inside the View, i.e. on every
+	// keypress, every resize and every spinner tick.
 	msg := m.subjectLine(strings.TrimSpace(m.msgInput.Value()))
 	b.WriteString("  " + successStyle.Render(symDone) + " Committed: " + msg + "\n")
 
-	stats := git.GetCommitStats()
-	if stats != "" {
-		b.WriteString("  " + dimStyle.Render(stats) + "\n")
+	if m.commitStats != "" {
+		b.WriteString("  " + dimStyle.Render(m.commitStats) + "\n")
 	}
 	b.WriteString("\n")
 
@@ -133,17 +134,20 @@ func (m Model) viewPush() string {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Pushing...") + "\n")
 	}
 
-	// Error
+	// Error. A rejected push is the one error whose right answer depends on what
+	// this session did to the local history — see formatErrorCtx.
 	if m.err != nil {
-		b.WriteString("\n  " + formatError(m.err) + "\n")
+		b.WriteString("\n  " + formatErrorCtx(m.err, m.historyRewritten) + "\n")
 	}
 
-	// Help bar
+	// Help bar. esc is a skip here, not a "back" — the commit is already
+	// written, and there is no step behind this one to return to. Saying so is
+	// the difference between a deliberate skip and a surprise.
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
 		{symArrows, "navigate"},
 		{"enter", "push"},
-		{"n", "skip"},
+		{"n/esc", "skip — commit is already made"},
 		{"q", "quit"},
 	}))
 

@@ -3,7 +3,6 @@ package ui
 import (
 	"strings"
 
-	"git-assist/internal/git"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -37,7 +36,7 @@ func (m Model) viewDone() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n\n")
 
 	// Commit / amend summary
@@ -48,38 +47,70 @@ func (m Model) viewDone() string {
 	}
 	b.WriteString("  " + successStyle.Render(symDone) + " " + verb + ": " + msg + "\n")
 
-	// Commit hash and stats
-	hash := git.GetLastCommitHash()
-	stats := git.GetCommitStats()
-	if hash != "" || stats != "" {
+	// Commit hash and stats, both read once by the commit command (see
+	// doCommit). This screen used to fork two git processes per render.
+	if m.commitHash != "" || m.commitStats != "" {
 		detail := "    "
-		if hash != "" {
-			detail += dimStyle.Render(hash)
+		if m.commitHash != "" {
+			detail += dimStyle.Render(m.commitHash)
 		}
-		if hash != "" && stats != "" {
+		if m.commitHash != "" && m.commitStats != "" {
 			detail += dimStyle.Render(" " + symMidDot + " ")
 		}
-		if stats != "" {
-			detail += dimStyle.Render(stats)
+		if m.commitStats != "" {
+			detail += dimStyle.Render(m.commitStats)
 		}
 		b.WriteString(detail + "\n")
 	}
 
-	// Push summary
-	if m.pushed {
+	// Push summary — what actually happened, and nothing else. A failed push
+	// used to arrive here as the neutral "Push skipped" with its reason already
+	// wiped by the keypress that navigated, so a push that did not happen and a
+	// push that broke read identically.
+	switch {
+	case m.pushed:
 		b.WriteString("  " + successStyle.Render(symDone) + " Pushed to " + branchStyle.Render("origin/"+m.pushBranch) + "\n")
-	} else if m.hasRemote {
-		b.WriteString("  " + dimStyle.Render(symSkip+" Push skipped") + "\n")
+	case m.pushFailed:
+		reason := "see the push step for details"
+		if m.pushErr != nil {
+			reason = firstLine(m.pushErr.Error())
+		}
+		b.WriteString("  " + errorStyle.Render(symWarn+" Push failed — "+reason) + "\n")
+		b.WriteString("  " + dimStyle.Render("The commit is safe locally. Try Push again from the menu.") + "\n")
+	case m.amendMode && m.amendPushed:
+		// The amend flow never pushes: the rewritten commit is already on
+		// origin, so the only correct push is a force-with-lease the user runs
+		// deliberately. Say that instead of "Push skipped".
+		b.WriteString("  " + modifiedStyle.Render(symArrowUp+" This commit is on origin — update it with:") + "\n")
+		b.WriteString("  " + modifiedStyle.Render("    git push --force-with-lease") + "\n")
+	case m.amendMode && m.hasRemote:
+		b.WriteString("  " + dimStyle.Render(symSkip+" Amended locally — push when you're ready") + "\n")
+	case m.hasRemote:
+		b.WriteString("  " + dimStyle.Render(symSkip+" Push skipped — the commit is local only") + "\n")
 	}
 
-	b.WriteString("\n  " + successStyle.Render("All done!") + "\n")
+	if m.pushFailed {
+		b.WriteString("\n  " + modifiedStyle.Render("Committed, not pushed.") + "\n")
+	} else {
+		b.WriteString("\n  " + successStyle.Render("All done!") + "\n")
+	}
 
 	// Help bar
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "menu"},
+		{"enter/esc", "menu"},
 		{"q", "quit"},
 	}))
 
 	return m.styledBox(b.String())
+}
+
+// firstLine trims an error down to its first line for the one-line summary on
+// the Done screen. Git's push failures are several lines of remote output; the
+// full text still lives on the push step.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
 }

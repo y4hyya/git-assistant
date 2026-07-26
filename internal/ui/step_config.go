@@ -49,9 +49,37 @@ func (m *Model) loadConfigItems() {
 
 // ── Update ──────────────────────────────────────────────
 
+// scopeName is what the current scope toggle is called on screen.
+func (m Model) scopeName() string {
+	if m.configGlobal {
+		return "global"
+	}
+	return "local"
+}
+
 func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
+		return m, nil
+	}
+
+	// Remove-origin confirmation. Submitting an empty Remote URL used to delete
+	// origin on the spot: push vanished from the wizard and the menu started
+	// offering "Connect to GitHub", with nothing on screen having asked.
+	if m.configRemoveRemote {
+		switch keyMsg.String() {
+		case "y":
+			m.configRemoveRemote = false
+			m.configRemoveURL = ""
+			if err := git.RemoveOriginRemote(); err != nil {
+				m.err = err
+			}
+			m.loadConfigItems()
+			m.hasRemote = git.HasRemote()
+		default:
+			m.configRemoveRemote = false
+			m.configRemoveURL = ""
+		}
 		return m, nil
 	}
 
@@ -95,28 +123,52 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			value := strings.TrimSpace(m.configEditInput.Value())
 			item := m.configItems[m.configCursor]
-			var err error
-			if item.remote {
-				// Remote URL is per-repo (ignores scope toggle). Empty value
-				// clears the remote; non-empty adds or updates origin.
-				if value == "" {
-					err = git.RemoveOriginRemote()
-				} else {
-					err = git.AddOriginRemote(value)
-				}
-			} else {
-				err = git.SetConfigValue(item.key, value, m.configGlobal)
-			}
-			if err != nil {
-				m.err = err
-			}
 			m.configEditMode = false
 			m.configEditInput.Blur()
-			m.loadConfigItems()
-			// Remote URL change affects menu banner / push availability.
 			if item.remote {
+				// Remote URL is per-repo (ignores the scope toggle).
+				if value == "" {
+					if !item.set {
+						return m, nil // nothing configured, nothing to remove
+					}
+					// Deleting the remote is not something to infer from an
+					// empty field — ask first.
+					m.configRemoveRemote = true
+					m.configRemoveURL = item.value
+					return m, nil
+				}
+				if err := git.AddOriginRemote(value); err != nil {
+					m.err = err
+				}
+				m.loadConfigItems()
+				// Remote URL change affects menu banner / push availability.
 				m.hasRemote = git.HasRemote()
+				return m, nil
 			}
+			// Clearing a field means UNSET, not "set to the empty string".
+			// `git config user.name ""` shadows the global value with an empty
+			// one, and `git commit` then dies with "empty ident name" while the
+			// editor cheerfully shows the key as set-but-blank.
+			if value == "" {
+				if item.set {
+					if err := git.UnsetConfigValue(item.key, m.configGlobal); err != nil {
+						m.err = err
+					}
+				}
+			} else if err := git.SetConfigValue(item.key, value, m.configGlobal); err != nil {
+				m.err = err
+			}
+			m.loadConfigItems()
+			return m, nil
+		case "tab":
+			// Scope switching mid-edit is ambiguous — writing the half-typed
+			// value to the scope being left is wrong, writing it to the one
+			// being entered is worse. Cancel the edit, then switch, and say so.
+			m.configEditMode = false
+			m.configEditInput.Blur()
+			m.configGlobal = !m.configGlobal
+			m.loadConfigItems()
+			m.err = fmt.Errorf("%s edit cancelled — now showing %s config", symWarn, m.scopeName())
 			return m, nil
 		case "esc":
 			m.configEditMode = false
@@ -144,8 +196,13 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if item.toggle {
+			// git accepts true/yes/on/1 (any case) as "on". Comparing the raw
+			// string to "true" reported a repo with commit.gpgsign = 1 as off —
+			// while git was signing every commit — and made the first press a
+			// no-op that wrote the value it already had. Read with git's rules,
+			// write the canonical spelling.
 			newVal := "true"
-			if item.value == "true" {
+			if git.ConfigBool(item.value) {
 				newVal = "false"
 			}
 			if err := git.SetConfigValue(item.key, newVal, m.configGlobal); err != nil {
@@ -200,10 +257,14 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) viewConfig() string {
 	var b strings.Builder
 
-	// Header
-	b.WriteString(titleStyle.Render(" Config "))
+	// Header — the same one every other screen draws. This was the only screen
+	// without the app title and the branch, and it is the screen whose Local
+	// scope edits that very repository.
+	b.WriteString(titleStyle.Render(" git-assist "))
 	b.WriteString("  ")
-	b.WriteString(dimStyle.Render("git settings"))
+	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
+	b.WriteString("\n")
+	b.WriteString(stepStyle.Render("  Config — git settings"))
 	b.WriteString("\n\n")
 
 	// Scope toggle
@@ -261,7 +322,8 @@ func (m Model) viewConfig() string {
 		if !item.set {
 			value = dimStyle.Render("not set")
 		} else if item.toggle {
-			if value == "true" {
+			// git's own bool rules — see the toggle handler.
+			if git.ConfigBool(value) {
 				value = successStyle.Render("on")
 			} else {
 				value = dimStyle.Render("off")
@@ -273,6 +335,13 @@ func (m Model) viewConfig() string {
 		b.WriteString(fmt.Sprintf("%s%s %s\n", cursor, label, value))
 	}
 
+	// Remove-origin confirmation
+	if m.configRemoveRemote {
+		b.WriteString("\n  " + modifiedStyle.Render("Remove remote origin?") + "\n")
+		b.WriteString("  " + dimStyle.Render(m.configRemoveURL) + "\n")
+		b.WriteString("  " + dimStyle.Render("Pushing disappears from the wizard until a remote is set again.") + "\n")
+	}
+
 	// Error
 	if m.err != nil {
 		b.WriteString("\n  " + formatError(m.err) + "\n")
@@ -280,23 +349,33 @@ func (m Model) viewConfig() string {
 
 	// Help bar
 	b.WriteString("\n")
-	if m.configPickMode {
+	switch {
+	case m.configRemoveRemote:
+		b.WriteString(renderHelp([]helpEntry{
+			{"y", "remove"},
+			{"any", "keep"},
+		}))
+	case m.configPickMode:
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "navigate"},
 			{"enter", "select"},
 			{"esc", "cancel"},
 		}))
-	} else if m.configEditMode {
+	case m.configEditMode:
 		b.WriteString(renderHelp([]helpEntry{
 			{"enter", "save"},
+			{"tab", "scope (cancels edit)"},
 			{"esc", "cancel"},
 		}))
-	} else {
+		b.WriteString("\n")
+		b.WriteString("  " + dimStyle.Render("Clearing the field unsets the key.") + "\n")
+	default:
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "navigate"},
 			{"enter", "edit"},
 			{"tab", "scope"},
 			{"esc", "back"},
+			{"q", "quit"},
 		}))
 	}
 

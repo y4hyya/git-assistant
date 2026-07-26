@@ -31,6 +31,126 @@ func fileStatusStyle(s types.FileStatus) lipgloss.Style {
 	}
 }
 
+// ── List geometry ───────────────────────────────────────
+//
+// Update and View must agree on how many rows a list shows. When they didn't,
+// the cursor moved through rows the view never drew: the arrow vanished and
+// keys appeared to do nothing.
+
+// listRows is how many list (or diff) rows a full-screen selector may draw —
+// the terminal minus box chrome, header, breadcrumb, counter and help bar.
+func (m Model) listRows() int {
+	rows := m.height - 13
+	if rows < 5 {
+		rows = 5
+	}
+	return rows
+}
+
+// fileListRows is listRows minus the commit-mode footer's second row (the
+// honest key set does not fit one 80-column line).
+func (m Model) fileListRows() int {
+	rows := m.listRows() - 1
+	if rows < 4 {
+		rows = 4
+	}
+	return rows
+}
+
+// gitignoreRows is listRows minus what the .gitignore screen additionally
+// spends: the "Already in .gitignore:" header, the counter and the
+// rm --cached warning.
+func (m Model) gitignoreRows() int {
+	rows := m.listRows() - 5
+	if rows < 4 {
+		rows = 4
+	}
+	return rows
+}
+
+// listWindow returns the [start,end) slice of a total-length list that is
+// visible at the given scroll offset.
+func listWindow(total, scroll, rows int) (start, end int) {
+	if total <= rows {
+		return 0, total
+	}
+	start = scroll
+	if start > total-rows {
+		start = total - rows
+	}
+	if start < 0 {
+		start = 0
+	}
+	end = start + rows
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+// followCursor scrolls the file list so the cursor stays inside the window the
+// view will draw. Every path that moves the cursor calls it — a jump out of the
+// filter used to leave the cursor outside the window, rendering no cursor at
+// all until the next ordinary keypress happened to repair the offset.
+func (m *Model) followCursor(total, rows int) {
+	if m.cursor < m.fileScroll {
+		m.fileScroll = m.cursor
+	}
+	if m.cursor >= m.fileScroll+rows {
+		m.fileScroll = m.cursor - rows + 1
+	}
+	if m.fileScroll > total-rows {
+		m.fileScroll = total - rows
+	}
+	if m.fileScroll < 0 {
+		m.fileScroll = 0
+	}
+}
+
+// diffMaxScroll is the largest offset that still renders a full window ending
+// at the last line. The old bound stopped one window short: `down` refused to
+// advance past len-1-visible, so the tail of every long diff was unreachable
+// and the counter said so — "Lines 1-40 of 41", with no key that moved it.
+func (m Model) diffMaxScroll() int {
+	n := len(strings.Split(m.diffContent, "\n")) - m.listRows()
+	if n < 0 {
+		n = 0
+	}
+	return n
+}
+
+// diffScrollMemory is how deep a remembered diff position is still worth
+// restoring. Closing a diff to check something and reopening it should come
+// back where you were; being dropped 300 lines into a file you just reopened
+// is disorienting, and the deeper the offset the likelier it is stale after an
+// edit. Positions at or past this line start from the top instead.
+const diffScrollMemory = 15
+
+// rememberDiffScroll stores where the user was in the diff being closed, for
+// the rest of this visit to the file selector (resetWizard drops the map).
+func (m *Model) rememberDiffScroll() {
+	if m.diffFile == "" {
+		return
+	}
+	if m.diffScroll <= 0 || m.diffScroll >= diffScrollMemory {
+		delete(m.diffScrollByFile, m.diffFile)
+		return
+	}
+	if m.diffScrollByFile == nil {
+		m.diffScrollByFile = make(map[string]int)
+	}
+	m.diffScrollByFile[m.diffFile] = m.diffScroll
+}
+
+// rememberedDiffScroll returns the offset to reopen path at.
+func (m Model) rememberedDiffScroll(path string) int {
+	s := m.diffScrollByFile[path]
+	if s < 0 || s >= diffScrollMemory {
+		return 0
+	}
+	return s
+}
+
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -63,6 +183,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.confirmUndo = false
 			m.undoPushed = false
+			m.undoSubject = ""
 			return m, nil
 		}
 	}
@@ -125,6 +246,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			if len(addPaths) == 0 && len(removePaths) == 0 {
+				// Same silence as the commit-mode enter used to have: say what
+				// the key is waiting for instead of doing nothing.
+				m.err = fmt.Errorf("%s nothing toggled yet — press space to pick what .gitignore should cover", symWarn)
 				return m, nil
 			}
 			m.gitignoreCached = cachedPaths
@@ -143,13 +267,19 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor >= len(m.files) {
 				m.cursor = max(0, len(m.files)-1)
 			}
-			if m.fileScroll > m.cursor {
-				m.fileScroll = m.cursor
-			}
+			// Back in commit mode the window is a different size, so re-follow
+			// the cursor there rather than with the .gitignore geometry below.
+			m.followCursor(len(m.files), m.fileListRows())
+			return m, nil
 		case "q":
 			m.quitting = true
 			return m, tea.Quit
 		}
+		// The combined list (changed files + existing .gitignore entries) is
+		// windowed exactly like the commit-mode list. It used to render whole,
+		// so styledBox cut it off at the terminal edge while up/down happily
+		// walked the cursor into the part nobody could see.
+		m.followCursor(totalItems, m.gitignoreRows())
 		return m, nil
 	}
 
@@ -221,6 +351,10 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if len(m.filterMatches) > 0 {
 				m.cursor = m.filterMatches[m.filterCursor]
+				// Jumping to a match 40 files down used to leave fileScroll
+				// where it was, so the selector came back with no visible
+				// cursor at all until some other key repaired the window.
+				m.followCursor(len(m.files), m.fileListRows())
 			}
 			m.filterMode = false
 			m.filterInput.Reset()
@@ -244,17 +378,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Diff preview mode ──────────────────────────────
 	if m.showDiff {
-		diffLines := strings.Split(m.diffContent, "\n")
-		maxScroll := len(diffLines) - 1
-		if maxScroll < 0 {
-			maxScroll = 0
-		}
-
-		// Visible lines based on terminal height (box padding + header + footer)
-		visible := m.height - 13
-		if visible < 5 {
-			visible = 5
-		}
+		maxScroll := m.diffMaxScroll()
 
 		switch keyMsg.String() {
 		case "up", "k":
@@ -262,7 +386,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.diffScroll--
 			}
 		case "down", "j":
-			if m.diffScroll < maxScroll-visible {
+			if m.diffScroll < maxScroll {
 				m.diffScroll++
 			}
 		case "e":
@@ -300,22 +424,16 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.editArea.SetValue(content)
-			// Size the textarea to fill available space
-			w := m.width - 10
-			if w < 40 {
-				w = 40
-			}
-			h := m.height - 10
-			if h < 5 {
-				h = 5
-			}
-			m.editArea.SetWidth(w)
-			m.editArea.SetHeight(h)
+			// Same sizing the resize handler applies, from one place: entry and
+			// resize used to compute it separately and could disagree.
+			m.editArea.SetWidth(editAreaWidth(m.width))
+			m.editArea.SetHeight(editAreaHeight(m.height))
 			m.editArea.Focus()
 			m.editMode = true
 			m.editDirty = false
 			return m, nil
 		case "esc":
+			m.rememberDiffScroll()
 			m.showDiff = false
 			m.diffContent = ""
 			m.diffFile = ""
@@ -363,7 +481,10 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.diffContent = diff
 		m.diffFile = f.Path
-		m.diffScroll = 0
+		m.diffScroll = m.rememberedDiffScroll(f.Path)
+		if maxScroll := m.diffMaxScroll(); m.diffScroll > maxScroll {
+			m.diffScroll = maxScroll
+		}
 		m.showDiff = true
 	case "/":
 		m.filterMode = true
@@ -394,10 +515,11 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "u":
 		m.confirmUndo = true
-		// Checked once, here — never from a View func. Undoing a commit that
+		// Both read once, here — never from a View func. Undoing a commit that
 		// is already on origin makes the branch diverge, which is worth
 		// saying out loud before the soft reset.
 		m.undoPushed = git.IsLastCommitPushed()
+		m.undoSubject = git.GetLastCommitMessage()
 	case "enter":
 		hasSelected := false
 		for _, f := range m.files {
@@ -409,6 +531,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// In amend mode the user can advance without selecting anything —
 		// they may just want to edit the message of the existing commit.
 		if !hasSelected && !m.amendMode {
+			// Silence was the whole problem: enter did nothing, said nothing,
+			// and the "0/N selected" counter never connected the two.
+			m.err = fmt.Errorf("%s nothing selected yet — press space to select a file, a to select all", symWarn)
 			return m, nil
 		}
 		if m.amendMode {
@@ -433,18 +558,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Adjust scroll to keep cursor visible
-	if !m.gitignoreMode {
-		visible := m.height - 13
-		if visible < 5 {
-			visible = 5
-		}
-		if m.cursor < m.fileScroll {
-			m.fileScroll = m.cursor
-		}
-		if m.cursor >= m.fileScroll+visible {
-			m.fileScroll = m.cursor - visible + 1
-		}
-	}
+	m.followCursor(len(m.files), m.fileListRows())
 
 	return m, nil
 }
@@ -516,7 +630,7 @@ func (m Model) viewFiles() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	if m.gitignoreMode {
 		b.WriteString(stepStyle.Render("  Select files to add .gitignore"))
@@ -539,28 +653,25 @@ func (m Model) viewFiles() string {
 		}
 	}
 
-	// Calculate visible window
-	start := 0
-	end := len(m.files)
-	if !m.gitignoreMode {
-		visibleCount := m.height - 13
-		if visibleCount < 5 {
-			visibleCount = 5
-		}
-		if len(m.files) > visibleCount {
-			start = m.fileScroll
-			end = start + visibleCount
-			if end > len(m.files) {
-				end = len(m.files)
-			}
-		}
-		if start > 0 {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp, start)) + "\n")
-		}
+	// Visible window. In .gitignore mode it spans the COMBINED list — changed
+	// files first, existing entries after — so one offset scrolls through both
+	// sections and the cursor is on screen wherever it is. That list used to
+	// render whole, which meant styledBox cut it at the terminal edge while
+	// up/down walked the cursor on into the invisible part.
+	total := len(m.files)
+	rows := m.fileListRows()
+	if m.gitignoreMode {
+		total += len(m.existingIgnored)
+		rows = m.gitignoreRows()
+	}
+	start, end := listWindow(total, m.fileScroll, rows)
+
+	if start > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp, start)) + "\n")
 	}
 
-	// File list
-	for i := start; i < end; i++ {
+	// File list — the part of the window inside the changed-files half
+	for i := start; i < min(end, len(m.files)); i++ {
 		f := m.files[i]
 		// Cursor arrow
 		cursor := "  "
@@ -594,16 +705,11 @@ func (m Model) viewFiles() string {
 		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", cursor, check, status, path))
 	}
 
-	// Scroll-down indicator
-	if !m.gitignoreMode && end < len(m.files) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown, len(m.files)-end)) + "\n")
-	}
-
-	// Existing gitignore entries (only in gitignore mode)
-	if m.gitignoreMode && len(m.existingIgnored) > 0 {
+	// Existing gitignore entries — the part of the same window past the files
+	if m.gitignoreMode && end > len(m.files) {
 		b.WriteString("\n  " + dimStyle.Render("Already in .gitignore:") + "\n\n")
-		for j, entry := range m.existingIgnored {
-			idx := len(m.files) + j
+		for idx := max(start, len(m.files)); idx < end; idx++ {
+			entry := m.existingIgnored[idx-len(m.files)]
 
 			cursor := "  "
 			if idx == m.cursor {
@@ -622,6 +728,11 @@ func (m Model) viewFiles() string {
 
 			b.WriteString(fmt.Sprintf("%s%s      %s\n", cursor, check, path))
 		}
+	}
+
+	// Scroll-down indicator
+	if end < total {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown, total-end)) + "\n")
 	}
 
 	// Counter
@@ -660,6 +771,12 @@ func (m Model) viewFiles() string {
 		b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(fmt.Sprintf("%d/%d selected", selected, len(m.files)))))
 	}
 
+	// What just happened here — the .gitignore apply and the undo both land back
+	// on this screen, and both used to wait for the dashboard to say anything.
+	if note := m.renderStatusNote(); note != "" {
+		b.WriteString("\n" + note + "\n")
+	}
+
 	// Async op spinners
 	if m.undoing {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Undoing last commit...") + "\n")
@@ -670,11 +787,16 @@ func (m Model) viewFiles() string {
 
 	// Undo confirmation
 	if m.confirmUndo {
-		lastMsg := git.GetLastCommitMessage()
-		if lastMsg != "" {
-			b.WriteString("\n  " + dimStyle.Render("Last: "+lastMsg))
+		// Both cached when the prompt opened (see the "u" handler) — this used
+		// to shell out to git on every frame the prompt was up.
+		if m.undoSubject != "" {
+			b.WriteString("\n  " + dimStyle.Render("Last: "+m.undoSubject))
 		}
-		b.WriteString("\n  " + modifiedStyle.Render("Undo last commit? Changes will be kept.") + "\n")
+		b.WriteString("\n  " + modifiedStyle.Render("Undo last commit?") + "\n")
+		// Say what undo does, in terms of where the work ends up: it is
+		// `git reset --soft`, so the commit's changes come back staged and
+		// ready to re-commit. "Changes will be kept" left people guessing.
+		b.WriteString("  " + dimStyle.Render("Moves the last commit's changes back to staged — nothing is lost.") + "\n")
 		if m.undoPushed {
 			b.WriteString("  " + modifiedStyle.Render(symWarn+" already pushed to origin — undoing will make your branch diverge") + "\n")
 		}
@@ -691,25 +813,35 @@ func (m Model) viewFiles() string {
 		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
-	// Help bar
+	// Help bar. Every key listed here is handled in updateFiles, and every key
+	// handled there is listed — "a" (select all) and "esc" (back to the menu)
+	// were both live and undocumented. Two rows because the honest set does not
+	// fit one 80-column line, and a wrapped help bar is worse than two tidy ones.
 	b.WriteString("\n")
 	if m.gitignoreMode {
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "navigate"},
 			{"space", "toggle"},
+			{"a", "all"},
 			{"enter", "confirm"},
-			{"g", "cancel"},
+			{"g/esc", "cancel"},
+			{"q", "quit"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "navigate"},
 			{"space", "select"},
+			{"a", "all"},
 			{"/", "filter"},
+			{"enter", "next"},
+		}))
+		b.WriteString("\n")
+		b.WriteString(renderHelp([]helpEntry{
 			{"d", "diff"},
 			{"b", "branch"},
 			{"g", "ignore"},
 			{"u", "undo"},
-			{"enter", "next"},
+			{"esc", "menu"},
 			{"q", "quit"},
 		}))
 	}
@@ -727,7 +859,7 @@ func (m Model) viewDiff() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Diff: " + m.diffFile))
 	b.WriteString("\n\n")
@@ -744,28 +876,21 @@ func (m Model) viewDiff() string {
 		return m.styledBox(b.String())
 	}
 
-	// Diff content with colors
+	// Diff content with colors. The window comes from the same helper the key
+	// handler bounds itself with, so the last line is always reachable and the
+	// counter can never promise a line the keys cannot reach.
 	lines := strings.Split(m.diffContent, "\n")
-	visible := m.height - 13
-	if visible < 5 {
-		visible = 5
-	}
+	start, end := listWindow(len(lines), m.diffScroll, m.listRows())
 
-	end := m.diffScroll + visible
-	if end > len(lines) {
-		end = len(lines)
-	}
-
-	visibleLines := lines[m.diffScroll:end]
-	for i, line := range visibleLines {
-		lineNum := dimStyle.Render(fmt.Sprintf("%4d ", m.diffScroll+i+1))
+	for i, line := range lines[start:end] {
+		lineNum := dimStyle.Render(fmt.Sprintf("%4d ", start+i+1))
 		styled := styleDiffLine(line)
 		b.WriteString("  " + lineNum + styled + "\n")
 	}
 
 	// Line counter
 	b.WriteString(fmt.Sprintf("\n  %s\n", dimStyle.Render(
-		fmt.Sprintf("Lines %d-%d of %d", m.diffScroll+1, end, len(lines)),
+		fmt.Sprintf("Lines %d-%d of %d", start+1, end, len(lines)),
 	)))
 
 	// Error
@@ -784,12 +909,14 @@ func (m Model) viewDiff() string {
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "scroll"},
 			{"esc", "back"},
+			{"q", "quit"},
 		}))
 	} else {
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "scroll"},
 			{"e", "edit"},
 			{"esc", "back"},
+			{"q", "quit"},
 		}))
 	}
 
@@ -825,7 +952,7 @@ func (m Model) viewEdit() string {
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
 
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	title := "  Editing: " + m.diffFile
 	if m.editDirty {
@@ -895,6 +1022,15 @@ func renderHelp(entries []helpEntry) string {
 // ── Actionable errors ─────────────────────────────────
 
 func formatError(err error) string {
+	return formatErrorCtx(err, false)
+}
+
+// formatErrorCtx is formatError with the one thing the app knows about itself
+// that changes the advice: whether this session rewrote a commit origin already
+// had (see Model.historyRewritten). A push rejected after an amend or an undo
+// must not be answered with "run git pull first" — that pull merges the
+// pre-rewrite commit straight back in, undoing exactly what the user did.
+func formatErrorCtx(err error, historyRewritten bool) string {
 	msg := err.Error()
 	hint := ""
 
@@ -910,7 +1046,15 @@ func formatError(err error) string {
 	case strings.Contains(msg, "CONFLICT"):
 		hint = "Resolve merge conflicts before committing."
 	case strings.Contains(msg, "rejected"), strings.Contains(msg, "non-fast-forward"):
-		hint = "Remote has newer changes. Run git pull first."
+		if historyRewritten {
+			// Two lines on purpose: one long line wraps mid-command inside the
+			// box, and a wrapped `git push --force-with-lease` is not copyable.
+			hint = "You rewrote a pushed commit (amend/undo) — origin still has the old one.\n  Update it with: git push --force-with-lease"
+		} else {
+			hint = "Remote has newer changes. Run git pull first."
+		}
+	case strings.Contains(msg, "would be overwritten by merge"):
+		hint = "Commit or stash your changes first — the merge would overwrite them."
 	case strings.Contains(msg, "Authentication failed"):
 		hint = "Check your git credentials or SSH key."
 	case strings.Contains(msg, "Permission denied"):
@@ -921,7 +1065,10 @@ func formatError(err error) string {
 		hint = "Nothing was committed. Refresh the file list (esc, then enter) and try again."
 	case strings.Contains(msg, "nothing to undo"):
 		hint = "Use Amend from the menu to change the first commit instead."
-	case strings.Contains(msg, "invalid branch name"):
+	// git's own wording is "'my branch' is not a valid branch name"; the old
+	// pattern looked for "invalid branch name", which git never says, so this
+	// hint could not fire at all.
+	case strings.Contains(msg, "not a valid branch name"):
 		hint = "Branch names cannot contain spaces or special characters like ~, ^, :, ?, *, ["
 	}
 	// No "saved in stash" hint here on purpose: every stash message now
@@ -942,34 +1089,64 @@ func formatError(err error) string {
 
 // ── Progress breadcrumb ───────────────────────────────
 
-func stepProgressIndex(s step) int {
-	switch s {
-	case stepFiles:
-		return 0
-	case stepType, stepCustom:
-		return 1
-	case stepMessage:
-		return 2
-	case stepConfirm:
-		return 3
-	case stepPush:
-		return 4
-	default:
-		return 5
+// progressPlan returns the breadcrumb labels that apply to THIS wizard run,
+// plus the index of the step on screen. The list used to be the fixed
+// Files/Type/Message/Confirm/Push regardless of context, so the Done screen
+// check-marked a Push that had not happened — and after an amend, one that
+// deliberately never will: amends route straight to Done and leave the
+// force-with-lease push to the user.
+func (m Model) progressPlan() (names []string, idx int) {
+	entries := []struct {
+		name  string
+		steps []step
+		skip  bool
+	}{
+		{name: "Files", steps: []step{stepFiles}},
+		// A raw amend never picks a type — the subject goes back verbatim.
+		{name: "Type", steps: []step{stepType, stepCustom}, skip: m.amendRaw},
+		{name: "Message", steps: []step{stepMessage}},
+		{name: "Confirm", steps: []step{stepConfirm}},
+		{name: "Push", steps: []step{stepPush}, skip: m.amendMode || !m.hasRemote},
 	}
+	idx = -1
+	for _, e := range entries {
+		if e.skip {
+			continue
+		}
+		for _, s := range e.steps {
+			if s == m.step {
+				idx = len(names)
+			}
+		}
+		names = append(names, e.name)
+	}
+	// Done — and anything else past the wizard — means every listed step is
+	// behind us.
+	if idx < 0 {
+		idx = len(names)
+	}
+	return names, idx
 }
 
-func renderProgress(current step) string {
-	names := []string{"Files", "Type", "Message", "Confirm", "Push"}
-	currentIdx := stepProgressIndex(current)
+func (m Model) renderProgress() string {
+	names, idx := m.progressPlan()
 
 	var parts []string
 	for i, name := range names {
-		if i < currentIdx {
+		switch {
+		case m.step == stepDone && name == "Push" && !m.pushed:
+			// The wizard finished without pushing: skipped, or the push failed.
+			// A checkmark here is the same lie the Done body used to tell.
+			style := dimStyle
+			if m.pushFailed {
+				style = errorStyle
+			}
+			parts = append(parts, style.Render(symSkip+" "+name))
+		case i < idx:
 			parts = append(parts, successStyle.Render(symDone+" "+name))
-		} else if i == currentIdx {
+		case i == idx:
 			parts = append(parts, activeStyle.Render(symCursor+" "+name))
-		} else {
+		default:
 			parts = append(parts, dimStyle.Render(symUnselected+" "+name))
 		}
 	}
@@ -1016,17 +1193,14 @@ func (m Model) viewFilter() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n\n")
 
 	// Search input
 	b.WriteString("  " + dimStyle.Render("/") + " " + m.filterInput.View() + "\n\n")
 
-	// Calculate visible window
-	visibleCount := m.height - 13
-	if visibleCount < 5 {
-		visibleCount = 5
-	}
+	// Calculate visible window — same row budget as the unfiltered list.
+	visibleCount := m.listRows()
 	start := 0
 	end := len(m.filterMatches)
 	if len(m.filterMatches) > visibleCount {

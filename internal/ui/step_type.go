@@ -69,7 +69,7 @@ func (m Model) viewType() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Choose commit type"))
 	if m.breaking {
@@ -127,17 +127,46 @@ func (m Model) viewType() string {
 
 // ── Custom type input ───────────────────────────────────
 
+// customTypeLimit caps the custom commit type. It is also what the input's
+// CharLimit is set to (see NewModel), so the counter on screen and the point
+// where keystrokes stop being accepted are the same number.
+const customTypeLimit = 40
+
+// customTypeCounterAt is when the remaining-characters counter appears. Showing
+// it from the first keystroke is noise; showing it only after keys have silently
+// stopped registering is too late.
+const customTypeCounterAt = 30
+
+// validateCustomType checks a typed commit type and returns it in the form that
+// will actually be committed. The prefix goes into the commit message verbatim,
+// so "Bug Fix" produced `Bug Fix: subject` — not a conventional commit at all,
+// and nothing on the screen had said a word about it.
+func validateCustomType(raw string) (string, error) {
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return "", fmt.Errorf("type cannot be empty — try fix, hotfix or chore")
+	}
+	if strings.ContainsAny(val, " \t") {
+		return "", fmt.Errorf("a commit type is a single word, e.g. hotfix")
+	}
+	// Conventional commit types are lowercase. Correcting it beats rejecting it:
+	// "FEAT" is unambiguous about what was meant.
+	return strings.ToLower(val), nil
+}
+
 func (m Model) updateCustom(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
 		case "enter":
-			val := strings.TrimSpace(m.customInput.Value())
-			if val != "" {
-				m.commitType = val
-				m.step = stepMessage
-				m.scopeInput.Focus()
+			val, err := validateCustomType(m.customInput.Value())
+			if err != nil {
+				m.err = err
 				return m, nil
 			}
+			m.commitType = val
+			m.customInput.SetValue(val)
+			m.step = stepMessage
+			m.scopeInput.Focus()
 			return m, nil
 		case "esc":
 			m.step = stepType
@@ -158,12 +187,25 @@ func (m Model) viewCustom() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Enter custom commit type"))
 	b.WriteString("\n\n")
 
 	b.WriteString("  " + m.customInput.View() + "\n")
+
+	// Character counter, close to the limit only — the input simply stops
+	// accepting keystrokes there, and it used to do so with nothing on screen
+	// to explain why the word had stopped growing.
+	if used := len([]rune(m.customInput.Value())); used >= customTypeCounterAt {
+		b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%d/%d characters", used, customTypeLimit)) + "\n")
+	}
+
+	// Error — this screen used to render none at all, so a rejected enter was
+	// indistinguishable from a dead key.
+	if m.err != nil {
+		b.WriteString("\n  " + formatError(m.err) + "\n")
+	}
 
 	b.WriteString("\n")
 	b.WriteString(renderHelp([]helpEntry{

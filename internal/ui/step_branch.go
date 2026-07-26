@@ -105,7 +105,8 @@ func doMergeBranch(name string) tea.Cmd {
 			stashed = true
 			stashRef = ref
 		}
-		if err := git.MergeBranch(name); err != nil {
+		upToDate, err := git.MergeBranch(name)
+		if err != nil {
 			return branchMergeResultMsg{
 				err:           err,
 				conflictFiles: git.GetConflictFiles(),
@@ -118,16 +119,17 @@ func doMergeBranch(name string) tea.Cmd {
 			if popErr := git.StashPop(); popErr != nil {
 				git.CleanupFailedStashPop()
 				return branchMergeResultMsg{
-					source: name,
-					merged: true,
+					source:   name,
+					merged:   true,
+					upToDate: upToDate,
 					err: recoveryError{fmt.Errorf(
 						"merged %s, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s",
 						name, stashRef, stashRef)},
 				}
 			}
-			return branchMergeResultMsg{source: name, merged: true, stashRestored: true}
+			return branchMergeResultMsg{source: name, merged: true, upToDate: upToDate, stashRestored: true}
 		}
-		return branchMergeResultMsg{source: name, merged: true}
+		return branchMergeResultMsg{source: name, merged: true, upToDate: upToDate}
 	}
 }
 
@@ -162,10 +164,6 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-
-	// Clear transient post-operation notes on any keypress. m.statusNote has
-	// its own lifecycle in the outer Update (it survives cursor movement).
-	m.branchCreatedHint = ""
 
 	// ── Create mode ────────────────────────────────────
 	if m.branchCreateMode {
@@ -602,13 +600,7 @@ func (m Model) viewBranch() string {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Deleting...") + "\n")
 	}
 
-	// Post-creation hint
-	if m.branchCreatedHint != "" {
-		b.WriteString("\n  " + successStyle.Render(symDone) + " Created & switched to " + branchStyle.Render(m.branchCreatedHint) + "\n")
-		b.WriteString("  " + dimStyle.Render("Make changes and commit here, then merge back when ready.") + "\n")
-	}
-
-	// Post-operation note (merge result, stash disclosure, delete)
+	// Post-operation note (branch created, merge result, stash disclosure, delete)
 	if note := m.renderStatusNote(); note != "" {
 		b.WriteString("\n" + note + "\n")
 	}

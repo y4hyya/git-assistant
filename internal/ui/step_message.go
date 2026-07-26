@@ -111,8 +111,22 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "up":
-			switch f {
-			case focusSubject:
+			// Inside the body, up is the textarea's own line movement — it used
+			// to be swallowed here, so the arrow keys did nothing in a
+			// multi-line body and only the undiscoverable ctrl+p worked. It
+			// only means "leave the field" from the first line, where there is
+			// no line above to move to.
+			if f == focusBody {
+				if m.bodyInput.Line() > 0 {
+					break
+				}
+				m.bodyInput.Blur()
+				m.bodyFocused = false
+				m.msgInput.Focus()
+				m.msgInput.CursorEnd()
+				return m, nil
+			}
+			if f == focusSubject {
 				if m.amendRaw {
 					return m, nil
 				}
@@ -122,6 +136,11 @@ func (m Model) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "down":
+			// The body is the last field, so down there is always text
+			// navigation: hand it to the textarea.
+			if f == focusBody {
+				break
+			}
 			switch f {
 			case focusScope:
 				m.scope = strings.TrimSpace(m.scopeInput.Value())
@@ -194,10 +213,17 @@ func (m Model) buildCommitMessage(subject string) string {
 	return msg
 }
 
+// doCommit writes the commit and reads back the two facts the Push and Done
+// screens display: the short hash and the diffstat. They are read HERE, on the
+// command goroutine, because those screens are View functions — viewPush and
+// viewDone used to fork `git log` and `git diff --stat` themselves, on every
+// keypress, every resize and every spinner tick.
 func doCommit(files []types.FileEntry, cachedPaths []string, message string) tea.Cmd {
 	return func() tea.Msg {
-		err := git.Commit(files, cachedPaths, message)
-		return commitResultMsg{err: err}
+		if err := git.Commit(files, cachedPaths, message); err != nil {
+			return commitResultMsg{err: err}
+		}
+		return commitResultMsg{hash: git.GetLastCommitHash(), stats: git.GetCommitStats()}
 	}
 }
 
@@ -207,8 +233,10 @@ func doCommit(files []types.FileEntry, cachedPaths []string, message string) tea
 // straight to Done.
 func doAmend(files []types.FileEntry, message string) tea.Cmd {
 	return func() tea.Msg {
-		err := git.Amend(files, message)
-		return commitResultMsg{err: err}
+		if err := git.Amend(files, message); err != nil {
+			return commitResultMsg{err: err}
+		}
+		return commitResultMsg{hash: git.GetLastCommitHash(), stats: git.GetCommitStats()}
 	}
 }
 
@@ -222,7 +250,7 @@ func (m Model) viewMessage() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Write commit message"))
 	b.WriteString("\n\n")
@@ -308,7 +336,7 @@ func (m Model) viewMessage() string {
 	case focusScope:
 		b.WriteString(renderHelp([]helpEntry{
 			{symArrows, "navigate"},
-			{"enter", "subject"},
+			{"enter/tab", "subject"},
 			{"esc", "back"},
 		}))
 	case focusBody:
@@ -317,6 +345,7 @@ func (m Model) viewMessage() string {
 			tabTarget = "subject"
 		}
 		b.WriteString(renderHelp([]helpEntry{
+			{symArrows, "move"},
 			{"ctrl+d", "next"},
 			{"tab", tabTarget},
 			{"esc", "subject"},

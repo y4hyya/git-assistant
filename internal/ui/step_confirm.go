@@ -30,6 +30,7 @@ func (m *Model) enterConfirm() {
 	m.amendStaged = nil
 	m.amendSHA = ""
 	m.amendPushed = false
+	m.confirmScroll = 0
 	if m.amendMode {
 		if staged, err := git.GetStagedFiles(); err == nil {
 			m.amendStaged = staged
@@ -64,6 +65,32 @@ func (m Model) extraStagedFiles() []string {
 	return extra
 }
 
+// confirmListRows is how many file rows the review list may draw, sized to the
+// terminal. It replaces a flat five-row cap: a 30-file commit showed five paths
+// and "... and 25 more" at the one screen whose entire job is letting the user
+// see what is about to be committed.
+func (m Model) confirmListRows() int {
+	rows := m.contentHeight() - 14
+	if rows < 3 {
+		rows = 3
+	}
+	if rows > 20 {
+		rows = 20
+	}
+	return rows
+}
+
+// selectedFiles returns the entries the wizard will commit.
+func (m Model) selectedFiles() []types.FileEntry {
+	var selected []types.FileEntry
+	for _, f := range m.files {
+		if f.Selected {
+			selected = append(selected, f)
+		}
+	}
+	return selected
+}
+
 func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Forward spinner ticks while committing
 	if m.committing {
@@ -78,18 +105,23 @@ func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch keyMsg.String() {
+	case "up", "k":
+		if m.confirmScroll > 0 {
+			m.confirmScroll--
+		}
+		return m, nil
+	case "down", "j":
+		if maxScroll := len(m.selectedFiles()) - m.confirmListRows(); m.confirmScroll < maxScroll {
+			m.confirmScroll++
+		}
+		return m, nil
 	case "enter":
 		m.committing = true
 		val := strings.TrimSpace(m.msgInput.Value())
 		fullMsg := m.buildCommitMessage(val)
 		// Pass whole entries, not paths: a rename needs its original path
 		// staged alongside the new one.
-		var selected []types.FileEntry
-		for _, f := range m.files {
-			if f.Selected {
-				selected = append(selected, f)
-			}
-		}
+		selected := m.selectedFiles()
 		if m.amendMode {
 			return m, tea.Batch(doAmend(selected, fullMsg), m.spinner.Tick)
 		}
@@ -118,7 +150,7 @@ func (m Model) viewConfirm() string {
 	b.WriteString("  ")
 	b.WriteString(branchStyle.Render(symBranch + " " + m.branch))
 	b.WriteString("\n")
-	b.WriteString(renderProgress(m.step))
+	b.WriteString(m.renderProgress())
 	b.WriteString("\n")
 	if m.amendMode {
 		// Both of these are cached by enterConfirm — see the note there.
@@ -156,12 +188,7 @@ func (m Model) viewConfirm() string {
 
 	// Selected files
 	b.WriteString("\n")
-	var selected []int
-	for i, f := range m.files {
-		if f.Selected {
-			selected = append(selected, i)
-		}
-	}
+	selected := m.selectedFiles()
 
 	// An amend keeps everything the commit already had, so a bare "0 file(s):"
 	// reads like the commit is about to be emptied. Say what actually happens.
@@ -174,25 +201,32 @@ func (m Model) viewConfirm() string {
 		b.WriteString(fmt.Sprintf("  %s\n", dimStyle.Render(fmt.Sprintf("%d file(s):", len(selected)))))
 	}
 
-	maxShow := 5
-	for j, idx := range selected {
-		if j >= maxShow {
-			remaining := len(selected) - maxShow
-			b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("... and %d more", remaining))))
-			break
-		}
-		f := m.files[idx]
+	// Scrollable window instead of the old five-row cap.
+	rows := m.confirmListRows()
+	start, end := listWindow(len(selected), m.confirmScroll, rows)
+	if start > 0 {
+		b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("%s %d more", symArrowUp, start))))
+	}
+	for _, f := range selected[start:end] {
 		status := fileStatusStyle(f.Status).Render(fmt.Sprintf("%-2s", f.Status.Symbol()))
 		b.WriteString(fmt.Sprintf("    %s  %s\n", status, filePathStyle.Render(f.Path)))
 	}
+	if end < len(selected) {
+		b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("%s %d more", symArrowDown, len(selected)-end))))
+	}
+	if len(selected) > rows {
+		b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("showing %d-%d of %d", start+1, end, len(selected)))))
+	}
 
 	// `git commit --amend` commits the whole index — disclose anything staged
-	// outside this wizard rather than folding it in silently.
+	// outside this wizard rather than folding it in silently. This list is a
+	// disclosure, not a review surface, so it keeps a short cap.
 	if extra := m.extraStagedFiles(); len(extra) > 0 {
+		const extraMaxShow = 5
 		b.WriteString("\n  " + modifiedStyle.Render(fmt.Sprintf("Also included (already staged): %d file(s)", len(extra))) + "\n")
 		for j, p := range extra {
-			if j >= maxShow {
-				b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("... and %d more", len(extra)-maxShow))))
+			if j >= extraMaxShow {
+				b.WriteString(fmt.Sprintf("    %s\n", dimStyle.Render(fmt.Sprintf("... and %d more", len(extra)-extraMaxShow))))
 				break
 			}
 			b.WriteString(fmt.Sprintf("    %s\n", filePathStyle.Render(p)))
@@ -209,13 +243,18 @@ func (m Model) viewConfirm() string {
 		b.WriteString("\n  " + formatError(m.err) + "\n")
 	}
 
-	// Help bar
+	// Help bar — scroll keys only when there is something to scroll.
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "commit"},
-		{"esc", "back"},
-		{"q", "quit"},
-	}))
+	entries := []helpEntry{}
+	if len(selected) > rows {
+		entries = append(entries, helpEntry{symArrows, "scroll files"})
+	}
+	entries = append(entries,
+		helpEntry{"enter", "commit"},
+		helpEntry{"esc", "back"},
+		helpEntry{"q", "quit"},
+	)
+	b.WriteString(renderHelp(entries))
 
 	return m.styledBox(b.String())
 }

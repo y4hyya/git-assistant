@@ -1549,22 +1549,39 @@ func TestStatusNoteSurvivesNavigationAndClearsOnAnAction(t *testing.T) {
 	}
 }
 
-// The .gitignore apply lands back in the file selector, which has nowhere to
-// render a note. It has to keep until the dashboard can say what happened.
-func TestStatusNoteWaitsForAScreenThatShowsIt(t *testing.T) {
+// The .gitignore apply and the undo both finish in the file selector, so that
+// is where their note has to appear — immediately, not once the user happens to
+// walk back to the dashboard.
+func TestStatusNoteIsShownOnTheFileSelector(t *testing.T) {
 	tempRepo(t, "chore: seed", "")
-	m := wizardModel(t, stepFiles)
+	m := wizardModel(t, stepFiles, file("a.txt"))
 	m.statusNote = "Updated .gitignore — 2 entries added"
-	for _, k := range []string{"j", "d", "esc"} {
-		m, _ = key(t, m, k)
+
+	if out := m.viewFiles(); !strings.Contains(out, "Updated .gitignore") {
+		t.Fatalf("the file selector does not render the note:\n%s", out)
 	}
-	if m.step != stepMenu {
-		t.Fatalf("step = %v, want stepMenu (esc left the file selector)", m.step)
+	// Cursor movement is not an acknowledgement.
+	m, _ = key(t, m, "j")
+	if m.statusNote == "" {
+		t.Fatal("moving the cursor wiped the note")
 	}
+	// A real action replaces it.
+	m, _ = key(t, m, "d")
+	if m.statusNote != "" {
+		t.Fatalf("the note survived a real action: %q", m.statusNote)
+	}
+}
+
+// A note that lands on a step with nowhere to render it still waits for one
+// that does — the branch manager's result reaching the standalone menu, say.
+func TestStatusNoteWaitsForAScreenThatShowsIt(t *testing.T) {
+	m := Model{step: stepConfig, width: 120, height: 40, statusNote: "Deleted branch old-ui"}
+	m, _ = key(t, m, "j")
 	if m.statusNote == "" {
 		t.Fatal("the note was cleared on a step that never displayed it")
 	}
-	if out := m.viewMenu(); !strings.Contains(out, "Updated .gitignore") {
+	m.step = stepMenu
+	if out := m.viewMenu(); !strings.Contains(out, "Deleted branch old-ui") {
 		t.Errorf("the dashboard never got to say what happened:\n%s", out)
 	}
 }
@@ -1573,8 +1590,14 @@ func TestStatusNoteWaitsForAScreenThatShowsIt(t *testing.T) {
 func TestANewResultDropsThePreviousNote(t *testing.T) {
 	m := Model{step: stepMenu, statusNote: "Undid the last commit"}
 	next, _ := m.Update(branchCreateResultMsg{newBranch: "feat"})
-	if got := next.(Model).statusNote; got != "" {
+	got := next.(Model).statusNote
+	if strings.Contains(got, "Undid the last commit") {
 		t.Errorf("a stale note survived the next operation: %q", got)
+	}
+	// The create used to report through its own one-shot field, rendered a few
+	// lines above the identical statusNote block.
+	if !strings.Contains(got, "Created & switched to feat") {
+		t.Errorf("the branch create reported nothing: %q", got)
 	}
 }
 
@@ -1777,5 +1800,781 @@ func TestWindowResizeReachesTheEditorAndInitInputs(t *testing.T) {
 	if shrunk.initURLInput.Width > 50 || shrunk.initNameInput.Width > 50 {
 		t.Errorf("init inputs still at their fixed width: %d / %d",
 			shrunk.initURLInput.Width, shrunk.initNameInput.Width)
+	}
+}
+
+// ── Phase-2 cluster: file selector, diff, confirm, config ──
+
+// configIndex finds a config row by label so tests don't hardcode the order.
+func configIndex(t *testing.T, m Model, label string) int {
+	t.Helper()
+	for i, item := range m.configItems {
+		if item.label == label {
+			return i
+		}
+	}
+	t.Fatalf("%q row missing from the config editor", label)
+	return -1
+}
+
+// gitCmd runs a git command in the current directory (test fixtures only).
+func gitCmd(t *testing.T, args ...string) {
+	t.Helper()
+	if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func manyFiles(n int) []types.FileEntry {
+	files := make([]types.FileEntry, n)
+	for i := range files {
+		files[i] = file(fmt.Sprintf("pkg/file%02d.go", i))
+	}
+	return files
+}
+
+func longDiff(n int) string {
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = fmt.Sprintf(" line %d", i+1)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// M14: `down` used to stop a full window short of the end, so the last hunk of
+// every long diff was unreachable — and the counter admitted it.
+func TestDiffScrollReachesTheLastLine(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.showDiff = true
+	m.diffFile = "a.txt"
+	m.diffContent = longDiff(100)
+
+	for i := 0; i < 200; i++ {
+		m, _ = key(t, m, "j")
+	}
+
+	want := 100 - m.listRows()
+	if m.diffScroll != want {
+		t.Fatalf("diffScroll = %d, want %d (the last line must be reachable)", m.diffScroll, want)
+	}
+	out := m.viewDiff()
+	if !strings.Contains(out, "line 100") {
+		t.Errorf("the last diff line is still unreachable:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("Lines %d-100 of 100", want+1)) {
+		t.Errorf("counter does not end at the last line:\n%s", out)
+	}
+	// And it stops there.
+	m, _ = key(t, m, "j")
+	if m.diffScroll != want {
+		t.Errorf("scrolled past the end: %d", m.diffScroll)
+	}
+}
+
+// Reopening a diff inside one visit comes back where you were — but only for
+// shallow positions; a deep one starts at the top instead of dumping the user
+// hundreds of lines in.
+func TestDiffScrollMemoryIsShallowOnly(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.diffFile = "a.txt"
+
+	m.diffScroll = 6
+	m.rememberDiffScroll()
+	if got := m.rememberedDiffScroll("a.txt"); got != 6 {
+		t.Errorf("shallow position not remembered: %d", got)
+	}
+
+	m.diffScroll = 400
+	m.rememberDiffScroll()
+	if got := m.rememberedDiffScroll("a.txt"); got != 0 {
+		t.Errorf("deep position was restored: %d", got)
+	}
+	// Never carried across wizard runs.
+	m.diffScroll = 6
+	m.rememberDiffScroll()
+	m.resetWizard()
+	if got := m.rememberedDiffScroll("a.txt"); got != 0 {
+		t.Errorf("scroll memory survived resetWizard: %d", got)
+	}
+}
+
+// .gitignore mode renders changed files AND existing entries; that combined
+// list had no window at all, so the cursor walked off the bottom of the box.
+func TestGitignoreModeKeepsTheCursorOnScreen(t *testing.T) {
+	m := wizardModel(t, stepFiles, manyFiles(15)...)
+	m.height = 30
+	m.gitignoreMode = true
+	m.removeIgnored = map[string]bool{}
+	for i := 0; i < 20; i++ {
+		m.existingIgnored = append(m.existingIgnored, fmt.Sprintf("build/out%02d", i))
+	}
+	total := len(m.files) + len(m.existingIgnored)
+
+	for i := 0; i < total+5; i++ {
+		m, _ = key(t, m, "j")
+		start, end := listWindow(total, m.fileScroll, m.gitignoreRows())
+		if m.cursor < start || m.cursor >= end {
+			t.Fatalf("cursor %d is outside the visible window [%d,%d)", m.cursor, start, end)
+		}
+	}
+	// The cursor is on an existing entry by now, and it is on screen.
+	if m.cursor < len(m.files) {
+		t.Fatalf("cursor never reached the .gitignore section: %d", m.cursor)
+	}
+	out := m.viewFiles()
+	entry := m.existingIgnored[m.cursor-len(m.files)]
+	if !strings.Contains(out, entry) {
+		t.Errorf("the row under the cursor (%s) is not rendered:\n%s", entry, out)
+	}
+	if !strings.Contains(out, symCursor) {
+		t.Errorf("no cursor drawn anywhere:\n%s", out)
+	}
+}
+
+// Jumping out of the filter moved the cursor without moving the window, so the
+// selector came back with no visible cursor at all.
+func TestFilterJumpSyncsTheScrollWindow(t *testing.T) {
+	m := wizardModel(t, stepFiles, manyFiles(40)...)
+	m.filterMode = true
+	m.filterMatches = computeFilterMatches(m.files, "")
+	m.filterCursor = 35
+
+	m, _ = key(t, m, "enter")
+
+	if m.cursor != 35 {
+		t.Fatalf("cursor = %d, want 35", m.cursor)
+	}
+	start, end := listWindow(len(m.files), m.fileScroll, m.fileListRows())
+	if m.cursor < start || m.cursor >= end {
+		t.Fatalf("cursor %d is outside the window [%d,%d) after the jump", m.cursor, start, end)
+	}
+	if out := m.viewFiles(); !strings.Contains(out, m.files[35].Path) {
+		t.Errorf("the jumped-to file is not on screen:\n%s", out)
+	}
+}
+
+// Enter with nothing selected used to do nothing and say nothing.
+func TestEnterWithNothingSelectedExplainsWhy(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"), file("b.txt"))
+
+	m, _ = key(t, m, "enter")
+
+	if m.step != stepFiles {
+		t.Fatalf("step = %v, want stepFiles", m.step)
+	}
+	if m.err == nil {
+		t.Fatal("enter with no selection is still silent")
+	}
+	out := m.viewFiles()
+	if !strings.Contains(out, "press space") {
+		t.Errorf("the hint does not name the key that fixes it:\n%s", out)
+	}
+	// Advisory, not a scary "Error:" banner.
+	if strings.Contains(out, "Error:") {
+		t.Errorf("an empty selection is not an error:\n%s", out)
+	}
+}
+
+// Every key the footer advertises is handled, and every handled key is listed.
+func TestFileSelectorFootersMatchTheHandlers(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	out := m.viewFiles()
+	for _, want := range []string{"select", "all", "filter", "diff", "branch", "ignore", "undo", "menu", "quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("commit-mode footer is missing %q:\n%s", want, out)
+		}
+	}
+
+	m.gitignoreMode = true
+	m.removeIgnored = map[string]bool{}
+	out = m.viewFiles()
+	for _, want := range []string{"toggle", "all", "confirm", "cancel", "quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf(".gitignore footer is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// The undo prompt says what undo does, warns when the commit is pushed, and
+// reads both facts from the model — never from git inside the View.
+func TestUndoPromptExplainsWhatUndoDoes(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.confirmUndo = true
+	m.undoSubject = "feat: the commit in question"
+	m.undoPushed = true
+	t.Chdir(t.TempDir()) // not a repo: anything forked from the View returns nothing
+
+	out := m.viewFiles()
+	if !strings.Contains(out, "back to staged") {
+		t.Errorf("the prompt never says where the changes go:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing is lost") {
+		t.Errorf("the prompt never reassures:\n%s", out)
+	}
+	if !strings.Contains(out, "feat: the commit in question") {
+		t.Errorf("the cached subject is not rendered:\n%s", out)
+	}
+	if !strings.Contains(out, "diverge") {
+		t.Errorf("the pushed-commit warning is gone:\n%s", out)
+	}
+}
+
+// ── formatError ────────────────────────────────────────
+
+func TestFormatErrorHints(t *testing.T) {
+	cases := []struct {
+		name    string
+		msg     string
+		rewrote bool
+		want    string
+		wantNot string
+	}{
+		{
+			name: "git's real branch-name wording",
+			// The old pattern looked for "invalid branch name", which git never says.
+			msg:  "fatal: 'my branch' is not a valid branch name",
+			want: "cannot contain spaces",
+		},
+		{
+			name: "rejected push, ordinary case",
+			msg:  "! [rejected] main -> main (non-fast-forward)",
+			want: "git pull",
+		},
+		{
+			name:    "rejected push after a rewrite",
+			msg:     "! [rejected] main -> main (non-fast-forward)",
+			rewrote: true,
+			want:    "--force-with-lease",
+			wantNot: "git pull first",
+		},
+		{
+			name: "merge would clobber local work",
+			msg:  "error: Your local changes to the following files would be overwritten by merge:",
+			want: "stash",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatErrorCtx(errors.New(tc.msg), tc.rewrote)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("hint %q missing from:\n%s", tc.want, got)
+			}
+			if tc.wantNot != "" && strings.Contains(got, tc.wantNot) {
+				t.Errorf("hint still contains %q:\n%s", tc.wantNot, got)
+			}
+		})
+	}
+}
+
+// Amending a commit that is already on origin is what makes the next push fail;
+// the advice has to follow that, not the generic "pull first".
+func TestPushHintFollowsAnAmendOfAPushedCommit(t *testing.T) {
+	m := wizardModel(t, stepConfirm, file("a.txt"))
+	m.hasRemote = true
+	m.amendMode = true
+	m.amendPushed = true
+	m.committing = true
+
+	next, _ := m.Update(commitResultMsg{hash: "abc1234", stats: "1 file changed"})
+	m = next.(Model)
+	if !m.historyRewritten {
+		t.Fatal("the amend of a pushed commit was not recorded")
+	}
+
+	m.step = stepPush
+	m.err = errors.New("! [rejected] main -> main (non-fast-forward)")
+	out := m.viewPush()
+	if !strings.Contains(out, "--force-with-lease") {
+		t.Errorf("the push hint would undo the amend:\n%s", out)
+	}
+}
+
+// ── Confirm ────────────────────────────────────────────
+
+// M15: the review gate used to show five paths and "... and 25 more".
+func TestConfirmListScrollsInsteadOfTruncating(t *testing.T) {
+	files := manyFiles(30)
+	for i := range files {
+		files[i].Selected = true
+	}
+	m := wizardModel(t, stepConfirm, files...)
+	m.height = 30
+	m.msgInput.SetValue("something")
+
+	out := m.viewConfirm()
+	if strings.Contains(out, "and 25 more") {
+		t.Errorf("still capped at five entries:\n%s", out)
+	}
+	if !strings.Contains(out, "of 30") {
+		t.Errorf("no \"N of M\" indicator:\n%s", out)
+	}
+
+	rows := m.confirmListRows()
+	if rows >= 30 {
+		t.Fatalf("test needs a windowed list, rows = %d", rows)
+	}
+	// The last file is reachable.
+	for i := 0; i < 40; i++ {
+		m, _ = key(t, m, "j")
+	}
+	if want := 30 - rows; m.confirmScroll != want {
+		t.Fatalf("confirmScroll = %d, want %d", m.confirmScroll, want)
+	}
+	if out := m.viewConfirm(); !strings.Contains(out, files[29].Path) {
+		t.Errorf("the last selected file is unreachable:\n%s", out)
+	}
+	// And back up.
+	for i := 0; i < 40; i++ {
+		m, _ = key(t, m, "up")
+	}
+	if m.confirmScroll != 0 {
+		t.Errorf("scrolling back up left an offset of %d", m.confirmScroll)
+	}
+}
+
+// Non-amend commits cannot reach the confirm step with nothing selected — the
+// file step refuses to advance — so "0 file(s):" is unreachable there.
+func TestZeroFileConfirmIsUnreachableOutsideAmend(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m, _ = key(t, m, "enter")
+	if m.step == stepConfirm || m.step == stepType {
+		t.Fatal("the wizard advanced with nothing selected")
+	}
+	// The amend wording is the one that is reachable, and it is not "0 file(s)".
+	m = wizardModel(t, stepConfirm)
+	m.amendMode = true
+	if out := m.viewConfirm(); strings.Contains(out, "0 file(s)") {
+		t.Errorf("message-only amend still says 0 file(s):\n%s", out)
+	}
+}
+
+// ── Custom commit type ─────────────────────────────────
+
+func TestCustomTypeValidation(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr string
+	}{
+		{in: "hotfix", want: "hotfix"},
+		{in: "  hotfix  ", want: "hotfix"},
+		{in: "HOTFIX", want: "hotfix"},
+		{in: "", wantErr: "empty"},
+		{in: "   ", wantErr: "empty"},
+		{in: "Bug Fix", wantErr: "single word"},
+		{in: "two\twords", wantErr: "single word"},
+	}
+	for _, tc := range cases {
+		got, err := validateCustomType(tc.in)
+		if tc.wantErr != "" {
+			if err == nil {
+				t.Errorf("validateCustomType(%q) accepted it", tc.in)
+			} else if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("validateCustomType(%q) error = %v, want mention of %q", tc.in, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validateCustomType(%q): %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("validateCustomType(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCustomTypeRejectionStaysOnTheStepAndSaysWhy(t *testing.T) {
+	m := wizardModel(t, stepCustom)
+	m.customInput.SetValue("Bug Fix")
+
+	m, _ = key(t, m, "enter")
+
+	if m.step != stepCustom {
+		t.Fatalf("step = %v, want stepCustom", m.step)
+	}
+	if m.commitType != "" {
+		t.Errorf("an invalid type reached the commit prefix: %q", m.commitType)
+	}
+	if out := m.viewCustom(); !strings.Contains(out, "single word") {
+		t.Errorf("the custom-type screen renders no error at all:\n%s", out)
+	}
+
+	// A valid one is lowercased on the way through.
+	m.customInput.SetValue("HotFix")
+	m, _ = key(t, m, "enter")
+	if m.commitType != "hotfix" {
+		t.Errorf("commitType = %q, want hotfix", m.commitType)
+	}
+	if m.step != stepMessage {
+		t.Errorf("step = %v, want stepMessage", m.step)
+	}
+}
+
+func TestCustomTypeCounterAppearsNearTheLimit(t *testing.T) {
+	m := wizardModel(t, stepCustom)
+	m.customInput.SetValue("short")
+	if out := m.viewCustom(); strings.Contains(out, "characters") {
+		t.Errorf("counter shown far from the limit:\n%s", out)
+	}
+	m.customInput.SetValue(strings.Repeat("x", customTypeCounterAt))
+	out := m.viewCustom()
+	if !strings.Contains(out, fmt.Sprintf("%d/%d characters", customTypeCounterAt, customTypeLimit)) {
+		t.Errorf("no counter near the limit:\n%s", out)
+	}
+	if m.customInput.CharLimit != customTypeLimit {
+		t.Errorf("CharLimit = %d, want %d", m.customInput.CharLimit, customTypeLimit)
+	}
+}
+
+// ── Message body navigation ────────────────────────────
+
+// The arrow keys never reached the body textarea: up/down were swallowed by the
+// field-navigation switch, leaving only the undiscoverable ctrl+p/ctrl+n.
+func TestBodyArrowsNavigateTextAndLeaveOnlyFromTheTop(t *testing.T) {
+	m := wizardModel(t, stepMessage, file("a.txt"))
+	m.commitType = "feat"
+	m.showBody = true
+	m.bodyFocused = true
+	m.bodyInput.SetValue("first\nsecond\nthird")
+	m.bodyInput.Focus()
+	if got := m.bodyInput.Line(); got != 2 {
+		t.Fatalf("setup: cursor on line %d, want 2", got)
+	}
+
+	m, _ = key(t, m, "up")
+	if !m.bodyFocused {
+		t.Fatal("up in the middle of the body jumped out of the field")
+	}
+	if got := m.bodyInput.Line(); got != 1 {
+		t.Fatalf("cursor on line %d, want 1", got)
+	}
+
+	m, _ = key(t, m, "down")
+	if !m.bodyFocused || m.bodyInput.Line() != 2 {
+		t.Fatalf("down inside the body left the field (focused=%v line=%d)", m.bodyFocused, m.bodyInput.Line())
+	}
+
+	// Walk to the top, then one more up leaves for the subject.
+	m, _ = key(t, m, "up")
+	m, _ = key(t, m, "up")
+	if got := m.bodyInput.Line(); got != 0 {
+		t.Fatalf("cursor on line %d, want 0", got)
+	}
+	if !m.bodyFocused {
+		t.Fatal("left the body before reaching its first line")
+	}
+	m, _ = key(t, m, "up")
+	if m.bodyFocused {
+		t.Fatal("up on the first line did not move focus to the subject")
+	}
+	if !m.msgInput.Focused() {
+		t.Error("the subject input was not focused")
+	}
+}
+
+// ── Push / Done truthfulness ───────────────────────────
+
+func TestFailedPushStaysOnTheStepAndDoneTellsTheTruth(t *testing.T) {
+	m := wizardModel(t, stepPush, file("a.txt"))
+	m.hasRemote = true
+	m.pushing = true
+	m.msgInput.SetValue("do things")
+	m.commitType = "feat"
+
+	next, _ := m.Update(pushResultMsg{err: errors.New("! [rejected] main -> main (fetch first)")})
+	m = next.(Model)
+	if m.step != stepPush {
+		t.Fatalf("step = %v, want stepPush — a failed push must not walk forward", m.step)
+	}
+	if !m.pushFailed || m.pushErr == nil {
+		t.Fatal("the failure was not remembered")
+	}
+
+	// The keypress that leaves clears m.err; the Done screen must still know.
+	m, _ = key(t, m, "n")
+	if m.step != stepDone {
+		t.Fatalf("step = %v, want stepDone", m.step)
+	}
+	out := m.viewDone()
+	if strings.Contains(out, "Push skipped") {
+		t.Errorf("a failed push is reported as a deliberate skip:\n%s", out)
+	}
+	if !strings.Contains(out, "Push failed") {
+		t.Errorf("Done never mentions the failure:\n%s", out)
+	}
+	if !strings.Contains(out, "rejected") {
+		t.Errorf("Done drops the reason entirely:\n%s", out)
+	}
+	if strings.Contains(out, "All done!") {
+		t.Errorf("\"All done!\" after a failed push:\n%s", out)
+	}
+	// And the breadcrumb does not check-mark a push that failed.
+	if strings.Contains(out, symDone+" Push") {
+		t.Errorf("breadcrumb check-marks the failed push:\n%s", out)
+	}
+}
+
+func TestEscOnPushIsLabelledAsASkip(t *testing.T) {
+	m := wizardModel(t, stepPush, file("a.txt"))
+	m.hasRemote = true
+	m.branches = []string{"main"}
+	m.msgInput.SetValue("do things")
+	m.commitType = "feat"
+
+	out := m.viewPush()
+	if !strings.Contains(out, "n/esc") {
+		t.Errorf("esc's meaning is still undiscoverable:\n%s", out)
+	}
+	if !strings.Contains(out, "commit is already made") {
+		t.Errorf("the footer does not say why skipping is safe:\n%s", out)
+	}
+
+	m, _ = key(t, m, "esc")
+	if m.step != stepDone {
+		t.Fatalf("step = %v, want stepDone", m.step)
+	}
+	if out := m.viewDone(); !strings.Contains(out, "Push skipped") {
+		t.Errorf("a real skip should say so:\n%s", out)
+	}
+}
+
+// The breadcrumb used to check-mark a Push step that amends never take.
+func TestAmendBreadcrumbDropsPushAndStatesTheNextStep(t *testing.T) {
+	m := wizardModel(t, stepDone, file("a.txt"))
+	m.hasRemote = true
+	m.amendMode = true
+	m.amendPushed = true
+	m.commitHash = "abc1234"
+	m.msgInput.SetValue("fix things")
+	m.commitType = "fix"
+
+	names, _ := m.progressPlan()
+	for _, n := range names {
+		if n == "Push" {
+			t.Fatalf("Push is still in the amend breadcrumb: %v", names)
+		}
+	}
+	out := m.viewDone()
+	if strings.Contains(out, "Push skipped") {
+		t.Errorf("an amend does not \"skip\" a push:\n%s", out)
+	}
+	if !strings.Contains(out, "--force-with-lease") {
+		t.Errorf("Done never names the manual next step:\n%s", out)
+	}
+
+	// Without a remote, the breadcrumb drops Push for ordinary commits too.
+	m2 := wizardModel(t, stepConfirm, file("a.txt"))
+	m2.hasRemote = false
+	names, _ = m2.progressPlan()
+	for _, n := range names {
+		if n == "Push" {
+			t.Fatalf("Push is in the breadcrumb of a repo with no remote: %v", names)
+		}
+	}
+}
+
+// R6: the Push and Done screens read the commit facts off the model. Rendered
+// outside a repository, anything they forked would come back empty.
+func TestPushAndDoneRenderCachedCommitFacts(t *testing.T) {
+	m := wizardModel(t, stepDone, file("a.txt"))
+	m.hasRemote = true
+	m.commitHash = "deadbee"
+	m.commitStats = "2 files changed, 4 insertions(+)"
+	m.msgInput.SetValue("do things")
+	m.commitType = "feat"
+	t.Chdir(t.TempDir()) // not a git repo
+
+	done := m.viewDone()
+	if !strings.Contains(done, "deadbee") || !strings.Contains(done, "2 files changed") {
+		t.Errorf("Done does not render the cached commit facts:\n%s", done)
+	}
+	m.step = stepPush
+	push := m.viewPush()
+	if !strings.Contains(push, "2 files changed") {
+		t.Errorf("Push does not render the cached stats:\n%s", push)
+	}
+}
+
+// ── Config editor ──────────────────────────────────────
+
+func TestConfigHeaderShowsTheAppTitleAndBranch(t *testing.T) {
+	m := wizardModel(t, stepConfig)
+	m.branch = "feature/x"
+	m.loadConfigItems()
+	out := m.viewConfig()
+	if !strings.Contains(out, "git-assist") {
+		t.Errorf("config screen has no app title:\n%s", out)
+	}
+	if !strings.Contains(out, "feature/x") {
+		t.Errorf("config screen never says which repo/branch it is editing:\n%s", out)
+	}
+}
+
+func TestConfigEmptyValueUnsetsTheKey(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitCmd(t, "config", "--local", "user.name", "Someone")
+
+	m := wizardModel(t, stepConfig)
+	m.loadConfigItems()
+	m.configCursor = configIndex(t, m, "User name")
+
+	m, _ = key(t, m, "enter")
+	if !m.configEditMode {
+		t.Fatal("enter did not open the inline editor")
+	}
+	m.configEditInput.SetValue("")
+	m, _ = key(t, m, "enter")
+
+	if err := exec.Command("git", "config", "--local", "user.name").Run(); err == nil {
+		t.Error("the key was written empty instead of unset")
+	}
+	if item := m.configItems[configIndex(t, m, "User name")]; item.set {
+		t.Errorf("the editor still shows the key as set: %+v", item)
+	}
+	if out := m.viewConfig(); !strings.Contains(out, "not set") {
+		t.Errorf("the \"not set\" hint never came back:\n%s", out)
+	}
+}
+
+func TestConfigRemoteDeleteAsksFirst(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitCmd(t, "remote", "add", "origin", "https://example.invalid/x.git")
+
+	m := wizardModel(t, stepConfig)
+	m.hasRemote = true
+	m.loadConfigItems()
+	m.configCursor = configIndex(t, m, "Remote URL")
+
+	m, _ = key(t, m, "enter")
+	m.configEditInput.SetValue("")
+	m, _ = key(t, m, "enter")
+
+	if !m.configRemoveRemote {
+		t.Fatal("an emptied remote URL deleted origin with no confirmation")
+	}
+	if git.GetRemoteURL() == "" {
+		t.Fatal("origin was already gone before the confirmation")
+	}
+	if out := m.viewConfig(); !strings.Contains(out, "Remove remote origin?") {
+		t.Errorf("the confirmation is not rendered:\n%s", out)
+	}
+
+	// Declining keeps it.
+	m, _ = key(t, m, "n")
+	if m.configRemoveRemote {
+		t.Error("the prompt stayed up after declining")
+	}
+	if git.GetRemoteURL() == "" {
+		t.Fatal("declining still removed origin")
+	}
+
+	// Confirming removes it.
+	m, _ = key(t, m, "enter")
+	m.configEditInput.SetValue("")
+	m, _ = key(t, m, "enter")
+	m, _ = key(t, m, "y")
+	if git.GetRemoteURL() != "" {
+		t.Error("confirming did not remove origin")
+	}
+	if m.hasRemote {
+		t.Error("hasRemote was not refreshed after the removal")
+	}
+}
+
+func TestConfigTabDuringEditCancelsTheEdit(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitCmd(t, "config", "--local", "user.name", "Local Person")
+
+	m := wizardModel(t, stepConfig)
+	m.loadConfigItems()
+	m.configCursor = configIndex(t, m, "User name")
+	m, _ = key(t, m, "enter")
+	m.configEditInput.SetValue("Half Typed")
+
+	m, _ = key(t, m, "tab")
+
+	if m.configEditMode {
+		t.Fatal("the editor stayed open across a scope switch")
+	}
+	if !m.configGlobal {
+		t.Fatal("tab did not switch scope")
+	}
+	if m.err == nil {
+		t.Error("the cancelled edit was not disclosed")
+	}
+	// The half-typed value went nowhere.
+	out, _ := exec.Command("git", "config", "--local", "user.name").Output()
+	if strings.TrimSpace(string(out)) != "Local Person" {
+		t.Errorf("local user.name = %q, want the untouched original", strings.TrimSpace(string(out)))
+	}
+}
+
+func TestConfigGPGToggleUnderstandsGitSpellings(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitCmd(t, "config", "--local", "commit.gpgsign", "1")
+
+	m := wizardModel(t, stepConfig)
+	m.loadConfigItems()
+	m.configCursor = configIndex(t, m, "GPG signing")
+
+	if out := m.viewConfig(); !strings.Contains(out, "on") {
+		t.Errorf("commit.gpgsign = 1 is rendered as off:\n%s", out)
+	}
+
+	// One press turns it off — it used to write "true" over "1" and need two.
+	m, _ = key(t, m, "enter")
+	out, err := exec.Command("git", "config", "--local", "commit.gpgsign").Output()
+	if err != nil {
+		t.Fatalf("git config: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "false" {
+		t.Errorf("commit.gpgsign = %q after one toggle, want false", got)
+	}
+}
+
+// ── Merge / pull reporting (R1, R2) ────────────────────
+
+func TestMergeWithNothingToMergeIsNotReportedAsAMerge(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepBranch)
+	m.branchMerging = true
+
+	next, _ := m.Update(branchMergeResultMsg{source: "feature", merged: true, upToDate: true})
+	got := next.(Model)
+	if strings.Contains(got.statusNote, "Merged feature into") {
+		t.Errorf("a no-op merge claims to have merged: %q", got.statusNote)
+	}
+	if !strings.Contains(got.statusNote, "Already up to date") {
+		t.Errorf("note = %q, want an \"already up to date\" report", got.statusNote)
+	}
+
+	// A real merge still reads as one.
+	next, _ = m.Update(branchMergeResultMsg{source: "feature", merged: true})
+	if note := next.(Model).statusNote; !strings.Contains(note, "Merged feature into") {
+		t.Errorf("a real merge lost its note: %q", note)
+	}
+}
+
+func TestPullReportsUpToDateAndTheStashRoundTrip(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+
+	m := wizardModel(t, stepSync)
+	m.pulling = true
+	m.syncCurrTotal = 3 // pre-operation counts must not invent an arrival
+	next, _ := m.Update(pullResultMsg{kind: pullKindCurrent, upToDate: true})
+	if note := next.(Model).statusNote; !strings.Contains(note, "Already up to date") {
+		t.Errorf("note = %q, want an \"already up to date\" report", note)
+	}
+
+	m = wizardModel(t, stepSync)
+	m.pulling = true
+	m.syncCurrTotal = 2
+	next, _ = m.Update(pullResultMsg{kind: pullKindCurrent, stashRestored: true})
+	note := next.(Model).statusNote
+	if !strings.Contains(note, "Pulled") {
+		t.Errorf("note = %q, want the pull reported", note)
+	}
+	if !strings.Contains(note, "stashed and restored") {
+		t.Errorf("the auto-stash round trip is still silent: %q", note)
 	}
 }

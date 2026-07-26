@@ -38,7 +38,16 @@ const (
 )
 
 // Async result messages
-type commitResultMsg struct{ err error }
+type commitResultMsg struct {
+	err error
+	// hash/stats describe the commit that was just written. They are read on
+	// the command goroutine, right after the commit lands, because the Push and
+	// Done screens need them: those used to call GetLastCommitHash and
+	// GetCommitStats from their View funcs, which run on every keypress, every
+	// resize and every spinner tick.
+	hash  string
+	stats string
+}
 type pushResultMsg struct{ err error }
 type undoResultMsg struct {
 	err   error
@@ -75,6 +84,10 @@ type branchMergeResultMsg struct {
 	// but restoring the auto-stash afterwards did not" — the second still
 	// needs the graph refreshed.
 	merged bool
+	// upToDate marks a merge git answered with "Already up to date": no commit,
+	// no file changed. Reporting that as "Merged X into Y" is a lie the user
+	// then goes looking for in the graph.
+	upToDate bool
 	// stashed/stashRef carry the auto-stash the merge took before starting.
 	// On failure the handler owns recovery (it aborts the merge first); on
 	// success the command has already popped and reports via stashRestored.
@@ -100,6 +113,13 @@ type pullResultMsg struct {
 	// which ref — otherwise those changes vanish silently.
 	stashed  bool
 	stashRef string
+	// stashRestored says the command already popped the stash itself, on the
+	// success path. The note has to disclose that round trip the way the branch
+	// switch and the branch merge do — uncommitted work disappearing and
+	// reappearing around a pull is exactly what a beginner needs told.
+	stashRestored bool
+	// upToDate: git answered "Already up to date" — nothing arrived.
+	upToDate bool
 }
 
 type pullKind int
@@ -175,6 +195,11 @@ type Model struct {
 	diffContent string
 	diffFile    string
 	diffScroll  int
+	// diffScrollByFile remembers where the user was in each file's diff for the
+	// duration of one visit to the file selector: closing a 400-line diff to
+	// check something and reopening it used to drop them back at line 1.
+	// Cleared by resetWizard, so it never carries across wizard runs.
+	diffScrollByFile map[string]int
 
 	// Edit mode
 	editMode    bool
@@ -209,7 +234,6 @@ type Model struct {
 	// reporting "already exists") and left the dying branch interactive.
 	branchCreating     bool
 	branchDeleting     bool
-	branchCreatedHint  string
 	branchMergePending string
 	mergeSource        string
 	mergeTarget        string
@@ -226,6 +250,12 @@ type Model struct {
 	configPickMode   bool
 	configPickItems  []string
 	configPickCursor int
+	// configRemoveRemote is the y/N gate in front of `git remote remove origin`.
+	// Submitting an empty Remote URL used to delete origin on the spot: push
+	// vanished from the wizard and the menu started offering "Connect to
+	// GitHub", with nothing on screen having asked or said so.
+	configRemoveRemote bool
+	configRemoveURL    string
 
 	// Undo confirmation
 	confirmUndo bool
@@ -234,6 +264,10 @@ type Model struct {
 	// opened. Undoing a pushed commit makes the branch diverge from origin,
 	// which is worth warning about — but never from a View func.
 	undoPushed bool
+	// undoSubject is the subject of the commit the prompt is about to undo,
+	// read at the same moment for the same reason: viewFiles used to call
+	// git.GetLastCommitMessage() on every frame the prompt was up.
+	undoSubject string
 
 	// Step 4 — push
 	branches   []string
@@ -244,6 +278,19 @@ type Model struct {
 	// this visit to the push step. Without it the check re-fires on every
 	// enter and declining the offered pull makes pushing unreachable.
 	pushCheckDone bool
+	// pushFailed/pushErr remember a push that was attempted and did not work.
+	// m.err is wiped by the next keypress, so without these the Done screen
+	// reported a failed push as the neutral "Push skipped" — indistinguishable
+	// from deliberately declining, with the reason gone.
+	pushFailed bool
+	pushErr    error
+	// historyRewritten records that this session amended or undid a commit that
+	// was already on origin. The next push is then rejected as non-fast-forward,
+	// and the stock "run git pull first" hint is the one piece of advice that
+	// undoes the rewrite — it merges the pre-rewrite commit straight back in.
+	// Deliberately NOT cleared by resetWizard: the rewrite happens in one wizard
+	// run and the rejected push usually happens in the next.
+	historyRewritten bool
 
 	// Gitignore — paths that need git rm --cached during commit
 	gitignoreCached []string
@@ -269,6 +316,16 @@ type Model struct {
 	// times a second for the whole duration of "Committing...".
 	amendSHA    string
 	amendPushed bool
+	// confirmScroll is the scroll offset of the confirm screen's file list. The
+	// list used to stop dead at five entries with "... and 25 more", which made
+	// the final review gate unable to show what was being reviewed.
+	confirmScroll int
+
+	// commitHash/commitStats describe the commit the wizard just made, read
+	// once by the commit command (see commitResultMsg) so the Push and Done
+	// screens can render them without forking git from a View func.
+	commitHash  string
+	commitStats string
 
 	// Cached: whether the repo has at least one commit. Refreshed by the
 	// dashboard snapshot so menuItems doesn't fork git per keypress.
@@ -376,8 +433,11 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	mi.Width = 50
 
 	ci := textinput.New()
-	ci.Placeholder = "Enter custom type..."
-	ci.CharLimit = 20
+	ci.Placeholder = "e.g. hotfix"
+	// Same limit the screen advertises with its counter. The old silent 20-char
+	// cap simply stopped accepting keystrokes with nothing on screen to explain
+	// why the word being typed had stopped growing.
+	ci.CharLimit = customTypeLimit
 	ci.Width = 30
 
 	si := textinput.New()
@@ -629,7 +689,13 @@ func (m *Model) resetWizard() {
 	m.pushBranch = ""
 	m.branchIdx = 0
 	m.pushCheckDone = false
+	m.pushFailed = false
+	m.pushErr = nil
 	m.gitignoreCached = nil
+	m.confirmScroll = 0
+	m.commitHash = ""
+	m.commitStats = ""
+	m.diffScrollByFile = nil
 
 	m.msgInput.Reset()
 	m.msgInput.Blur()
@@ -680,13 +746,30 @@ func (m *Model) setStatusNote(format string, args ...any) {
 	m.statusNote = fmt.Sprintf(format, args...)
 }
 
+// appendNoteClause adds a second fact to the current note — typically the
+// auto-stash round trip — with a separator that doesn't collide with the dash
+// the note may already carry ("Already up to date — nothing to merge").
+func (m *Model) appendNoteClause(clause string) {
+	switch {
+	case m.statusNote == "":
+		m.statusNote = clause
+	case strings.Contains(m.statusNote, "—"):
+		m.statusNote += "; " + clause
+	default:
+		m.statusNote += " — " + clause
+	}
+}
+
 // rendersStatusNote reports whether the current step actually draws
 // m.statusNote. Notes are only cleared on steps that showed them — an
-// operation finishing on a screen with nowhere to render it (the .gitignore
-// apply, which lands back in the file selector) keeps its note until the
-// dashboard can say what happened.
+// operation finishing on a screen with nowhere to render it keeps its note
+// until a screen that can say what happened comes up.
+//
+// The file selector is on the list because the two operations it owns — the
+// .gitignore apply and the undo — both finish there. Their notes used to wait
+// for the user to walk back to the dashboard before saying anything at all.
 func (m Model) rendersStatusNote() bool {
-	return m.step == stepMenu || m.step == stepBranch
+	return m.step == stepMenu || m.step == stepBranch || m.step == stepFiles
 }
 
 // isNavKey reports whether a keypress only moves a cursor. Status notes
@@ -859,11 +942,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case undoResultMsg:
 		m.confirmUndo = false
 		m.undoing = false
+		wasPushed := m.undoPushed
 		m.undoPushed = false
+		m.undoSubject = ""
 		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
+		}
+		// Undoing a commit origin already has rewrites shared history: remember
+		// it so the rejected push that follows gets force-with-lease guidance
+		// instead of the "run git pull first" advice that would restore it.
+		if wasPushed {
+			m.historyRewritten = true
 		}
 		// The commit the wizard was pointed at no longer exists. Staying
 		// latched in amendMode would make the next confirm rewrite the
@@ -872,7 +963,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.files = msg.files
 		m.cursor = 0
 		m.fileScroll = 0
-		m.setStatusNote("Undid the last commit — its changes are back in your working tree")
+		// `git reset --soft` leaves the changes staged — the same words the
+		// confirmation used before running it.
+		m.setStatusNote("Undid the last commit — its changes are back, staged and ready to re-commit")
 		// Without this the menu graph still shows the undone commit, which
 		// reads as "undo failed" and invites a second, destructive undo.
 		return m, m.requestDashboardRefresh()
@@ -960,6 +1053,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
+		// Read once, here — the Push and Done screens render these on every
+		// frame and must never fork git to do it.
+		m.commitHash = msg.hash
+		m.commitStats = msg.stats
+		// Amending a commit that is already on origin rewrites shared history.
+		// See historyRewritten: the push it makes fail needs different advice.
+		if m.amendMode && m.amendPushed {
+			m.historyRewritten = true
+		}
 		refresh := m.requestDashboardRefresh()
 		// Amends route straight to Done — auto-routing to push after an
 		// amend would either fail (non-FF on pushed commits) or surprise
@@ -989,10 +1091,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushing = false
 		m.startResult()
 		if msg.err != nil {
+			// Stay on the push step so the user can retry or pick another
+			// branch, and remember the failure: m.err is gone on the next
+			// keypress, but the Done screen still has to tell the truth about
+			// what happened here.
 			m.err = msg.err
+			m.pushFailed = true
+			m.pushErr = msg.err
 			return m, nil
 		}
 		m.pushed = true
+		m.pushFailed = false
+		m.pushErr = nil
+		// Whatever the local history looked like, origin has it now.
+		m.historyRewritten = false
 		m.step = stepDone
 		return m, m.requestDashboardRefresh()
 
@@ -1015,6 +1127,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// read before the post-switch refresh replaces the list.
 		carried := len(m.files)
 		m.branch = msg.newBranch
+		// The rewrite belonged to the branch we just left.
+		m.historyRewritten = false
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
@@ -1067,7 +1181,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchScroll = 0
 		m.branchCreateMode = false
 		m.branchCreateInput.Reset()
-		m.branchCreatedHint = msg.newBranch
+		// One feedback channel, not two: this used to be its own one-shot field
+		// with its own clearing rule, rendered a few lines above the identical
+		// statusNote block.
+		m.setStatusNote("Created & switched to %s — commit here, then merge back when ready", msg.newBranch)
 		// Creating a branch also checks it out, so the ahead/behind chip, the
 		// branch count and the graph decorations are all stale now.
 		return m, m.requestDashboardRefresh()
@@ -1171,7 +1288,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// menu came back looking exactly as it had. Say what arrived, using the
 		// counts the dialog was already showing — exitSyncDialog clears them,
 		// so build the note first.
+		ref := "origin/" + m.branch
+		if msg.kind == pullKindMain {
+			ref = "origin/" + m.syncMainBranchName
+		}
 		switch {
+		case msg.upToDate:
+			// git found nothing to merge. Saying "Pulled 3 commits" here (the
+			// counts are from before the operation) would invent an arrival.
+			m.setStatusNote("Already up to date with %s — nothing to merge", ref)
 		case msg.kind == pullKindMain && m.syncMainTotal > 0:
 			m.setStatusNote("Merged %s from origin/%s into %s",
 				plural(m.syncMainTotal, "commit", "commits"), m.syncMainBranchName, m.branch)
@@ -1183,6 +1308,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.setStatusNote("Pulled origin/%s", m.branch)
 		}
+		// The pull stashed a dirty tree and put it back. Disclose that round
+		// trip exactly as the branch switch and the branch merge do.
+		if msg.stashRestored {
+			m.appendNoteClause("your uncommitted changes were stashed and restored")
+		}
+		// A completed pull re-joins the branch to its upstream, so whatever
+		// rewrite made them diverge is no longer what a rejected push means.
+		m.historyRewritten = false
 		// exitSyncDialog only refreshes when it lands back on the menu; the
 		// pre-push check returns to the push step, where the graph is just as
 		// stale.
@@ -1234,10 +1367,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The menu's sync shortcut used to have nowhere to say this and smuggled
 		// the stash disclosure out through m.err instead.
 		note := fmt.Sprintf("Merged %s into %s", msg.source, m.branch)
-		if msg.stashRestored {
-			note += " — your uncommitted changes were stashed and restored"
+		if msg.upToDate {
+			// git created no commit and changed no file. "Merged X into Y" here
+			// sends the user looking through the graph for a merge that does
+			// not exist — and, worse, reads as "your work is integrated".
+			note = fmt.Sprintf("Already up to date — %s has nothing %s doesn't already have", msg.source, m.branch)
 		}
 		m.statusNote = note
+		if msg.stashRestored {
+			m.appendNoteClause("your uncommitted changes were stashed and restored")
+		}
 		return m, refresh
 
 	case tea.KeyMsg:

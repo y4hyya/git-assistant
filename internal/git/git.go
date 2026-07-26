@@ -1008,6 +1008,46 @@ func SetConfigValue(key, value string, global bool) error {
 	return nil
 }
 
+// UnsetConfigValue removes a git config key from the given scope.
+//
+// This is what "clear this field" has to mean. SetConfigValue(key, "") writes
+// an EMPTY key, which is not the same thing at all: an empty local user.name
+// shadows the global one and `git commit` then dies with "empty ident name",
+// while the editor happily renders the key as set-but-blank.
+//
+// Exit code 5 is git's "you tried to unset something that was not set" — the
+// desired end state, so it counts as success.
+func UnsetConfigValue(key string, global bool) error {
+	args := []string{"config"}
+	if global {
+		args = append(args, "--global")
+	} else {
+		args = append(args, "--local")
+	}
+	args = append(args, "--unset", "--", key)
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 5 {
+			return nil
+		}
+		return fmt.Errorf("config unset failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ConfigBool interprets a raw config value the way git itself does: true, yes,
+// on and 1 all mean enabled, in any case. Reading the raw string and comparing
+// it to "true" reported a repository with `commit.gpgsign = 1` as "off" — while
+// git was signing every commit — and made the first toggle a no-op.
+func ConfigBool(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "yes", "on", "1":
+		return true
+	}
+	return false
+}
+
 // GetRemoteURL returns the URL of the 'origin' remote.
 func GetRemoteURL() string {
 	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
@@ -1209,20 +1249,36 @@ func CheckRefFormatBranch(name string) error {
 	return errors.New(msg)
 }
 
+// mergeWasNoOp reports whether git's merge output means "there was nothing to
+// merge". Both spellings are covered: git renamed the message from
+// "Already up-to-date." to "Already up to date." in 2.29.
+func mergeWasNoOp(out []byte) bool {
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "already up to date") ||
+		strings.Contains(s, "already up-to-date")
+}
+
 // MergeBranch merges the given branch into the current branch.
-func MergeBranch(name string) error {
+//
+// upToDate reports that git found nothing to merge. It is deliberately not an
+// error: the callers used to render "Merged feature into main" for a merge that
+// created no commit and changed no file, which reads as a completed integration
+// and sends people looking for changes that were never there.
+func MergeBranch(name string) (upToDate bool, err error) {
 	out, err := exec.Command("git", "merge", "--no-ff", name).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+		return false, fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
-	return nil
+	return mergeWasNoOp(out), nil
 }
 
 // MergeFromOrigin merges origin/<branch> into the current branch. When noFF is
 // true, forces a merge commit (used for integrating upstream branches like
 // main → feature). When false, allows fast-forward (used for pulling the same
 // branch from origin — no artificial merge commits when catching up).
-func MergeFromOrigin(branch string, noFF bool) error {
+//
+// upToDate carries the same meaning as in MergeBranch.
+func MergeFromOrigin(branch string, noFF bool) (upToDate bool, err error) {
 	args := []string{"merge"}
 	if noFF {
 		args = append(args, "--no-ff")
@@ -1230,9 +1286,9 @@ func MergeFromOrigin(branch string, noFF bool) error {
 	args = append(args, "origin/"+branch)
 	out, err := runNetwork("git", args...)
 	if err != nil {
-		return netFail("", out, err)
+		return false, netFail("", out, err)
 	}
-	return nil
+	return mergeWasNoOp(out), nil
 }
 
 // GetIncomingCommits returns commit subjects reachable from `to` but not from

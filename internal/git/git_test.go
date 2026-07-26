@@ -1016,3 +1016,103 @@ func TestResolveMainBranchTakesOriginsSpelling(t *testing.T) {
 		t.Errorf("MainSyncRef() = %q, want origin/master", got)
 	}
 }
+
+// ── Config: unset vs empty, and git's bool spellings ───
+
+// Clearing a config field has to UNSET the key. Writing "" instead leaves a
+// key that exists and is empty: a local user.name = "" shadows the global one
+// and `git commit` dies with "empty ident name", while the editor happily
+// renders the key as set-but-blank.
+func TestUnsetConfigValueRemovesTheKeyInsteadOfEmptyingIt(t *testing.T) {
+	scratchRepo(t)
+
+	if err := SetConfigValue("user.name", "Someone", false); err != nil {
+		t.Fatalf("SetConfigValue: %v", err)
+	}
+	if v, set, _ := GetConfigValue("user.name", false); !set || v != "Someone" {
+		t.Fatalf("setup: value = %q set = %v", v, set)
+	}
+
+	if err := UnsetConfigValue("user.name", false); err != nil {
+		t.Fatalf("UnsetConfigValue: %v", err)
+	}
+	if v, set, _ := GetConfigValue("user.name", false); set {
+		t.Errorf("key survived the unset: value = %q set = %v", v, set)
+	}
+
+	// Unsetting what is already unset is the desired end state, not an error
+	// (git exits 5 for it).
+	if err := UnsetConfigValue("user.name", false); err != nil {
+		t.Errorf("second UnsetConfigValue: %v", err)
+	}
+
+	// The contrast this exists to avoid.
+	if err := SetConfigValue("user.name", "", false); err != nil {
+		t.Fatalf("SetConfigValue empty: %v", err)
+	}
+	if _, set, _ := GetConfigValue("user.name", false); !set {
+		t.Error("writing an empty value should leave the key SET — the premise of the fix")
+	}
+}
+
+// git reads true/yes/on/1 (any case) as true. The config editor compared the
+// raw string to "true", so a repo with commit.gpgsign = 1 displayed "off"
+// while git was signing every commit.
+func TestConfigBoolUnderstandsGitSpellings(t *testing.T) {
+	on := []string{"true", "TRUE", "True", "yes", "YES", "on", "On", "1", " true "}
+	off := []string{"false", "no", "off", "0", "", "  ", "maybe", "2"}
+	for _, v := range on {
+		if !ConfigBool(v) {
+			t.Errorf("ConfigBool(%q) = false, want true", v)
+		}
+	}
+	for _, v := range off {
+		if ConfigBool(v) {
+			t.Errorf("ConfigBool(%q) = true, want false", v)
+		}
+	}
+}
+
+// ── Merge: "Already up to date" is not a merge ─────────
+
+func TestMergeBranchReportsAlreadyUpToDate(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "seed")
+	runGit(t, "branch", "feature")
+
+	// feature is an ancestor of main: git has nothing to merge.
+	upToDate, err := MergeBranch("feature")
+	if err != nil {
+		t.Fatalf("MergeBranch: %v", err)
+	}
+	if !upToDate {
+		t.Error("a merge with nothing to merge was reported as a real merge")
+	}
+
+	// Now give feature a commit of its own — a genuine merge.
+	runGit(t, "checkout", "-q", "feature")
+	write(t, "b.txt", "b\n")
+	commitAll(t, "feature work")
+	runGit(t, "checkout", "-q", "main")
+
+	upToDate, err = MergeBranch("feature")
+	if err != nil {
+		t.Fatalf("MergeBranch (real): %v", err)
+	}
+	if upToDate {
+		t.Error("a real merge was reported as up to date")
+	}
+}
+
+func TestMergeWasNoOpMatchesBothSpellings(t *testing.T) {
+	// git renamed the message in 2.29; both spellings are in the wild.
+	for _, out := range []string{"Already up to date.\n", "Already up-to-date.\n", "ALREADY UP TO DATE.\n"} {
+		if !mergeWasNoOp([]byte(out)) {
+			t.Errorf("mergeWasNoOp(%q) = false, want true", out)
+		}
+	}
+	if mergeWasNoOp([]byte("Merge made by the 'ort' strategy.\n")) {
+		t.Error("a real merge was classified as a no-op")
+	}
+}

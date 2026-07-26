@@ -34,7 +34,8 @@ func doPullCurrent(branch string) tea.Cmd {
 			stashed = true
 			stashRef = ref
 		}
-		if err := git.MergeFromOrigin(branch, false); err != nil {
+		upToDate, err := git.MergeFromOrigin(branch, false)
+		if err != nil {
 			// Restoring the stash is the handler's job: on a conflict it has
 			// to abort the merge first, and only then does the tree sit at
 			// the commit the stash applies cleanly onto.
@@ -56,7 +57,9 @@ func doPullCurrent(branch string) tea.Cmd {
 				}
 			}
 		}
-		return pullResultMsg{kind: pullKindCurrent}
+		// stashRestored is reported, not inferred: the note has to disclose a
+		// round trip the user never saw happen.
+		return pullResultMsg{kind: pullKindCurrent, upToDate: upToDate, stashRestored: stashed}
 	}
 }
 
@@ -78,7 +81,8 @@ func doSyncMain(mainBranch string) tea.Cmd {
 			stashed = true
 			stashRef = ref
 		}
-		if err := git.MergeFromOrigin(mainBranch, true); err != nil {
+		upToDate, err := git.MergeFromOrigin(mainBranch, true)
+		if err != nil {
 			// See doPullCurrent: the handler owns stash recovery because it
 			// aborts the merge first.
 			return pullResultMsg{
@@ -98,7 +102,7 @@ func doSyncMain(mainBranch string) tea.Cmd {
 				}
 			}
 		}
-		return pullResultMsg{kind: pullKindMain}
+		return pullResultMsg{kind: pullKindMain, upToDate: upToDate, stashRestored: stashed}
 	}
 }
 

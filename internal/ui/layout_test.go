@@ -591,3 +591,43 @@ func TestUnifiedGraphRendersRealHistory(t *testing.T) {
 		}
 	}
 }
+
+// The file selector's footer is two rows now (the honest key set does not fit
+// one 80-column line), and the list budget has to leave room for both — at
+// every height, in both modes.
+func TestFileSelectorKeepsItsFooterAndBorder(t *testing.T) {
+	for _, h := range []int{12, 15, 20, 24, 30, 40} {
+		for _, gitignore := range []bool{false, true} {
+			m := wizardModel(t, stepFiles, manyFiles(40)...)
+			m.width = 80
+			m.height = h
+			if gitignore {
+				m.gitignoreMode = true
+				m.removeIgnored = map[string]bool{}
+				for i := 0; i < 20; i++ {
+					m.existingIgnored = append(m.existingIgnored, fmt.Sprintf("build/out%02d", i))
+				}
+			}
+
+			view := m.viewFiles()
+			lines := strings.Split(view, "\n")
+			last := lines[len(lines)-1]
+			if !strings.Contains(last, "╰") || !strings.Contains(last, "╯") {
+				t.Errorf("height %d (gitignore=%v): bottom border missing, last line = %q", h, gitignore, last)
+			}
+			if got := len(lines); got > h {
+				t.Errorf("height %d (gitignore=%v): box is %d rows tall", h, gitignore, got)
+			}
+			// The last footer row survives from the height where the screen is
+			// usable at all.
+			if h >= 20 && !strings.Contains(view, "quit") {
+				t.Errorf("height %d (gitignore=%v): the footer was clipped:\n%s", h, gitignore, view)
+			}
+			for i, line := range lines {
+				if w := lipgloss.Width(line); w > m.width {
+					t.Errorf("height %d (gitignore=%v): line %d is %d cells wide: %q", h, gitignore, i, w, line)
+				}
+			}
+		}
+	}
+}
