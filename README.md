@@ -8,6 +8,7 @@ An interactive TUI git dashboard built with Go and [Bubble Tea](https://github.c
 │                                                  │
 │  ▸ Commit    no changes                          │
 │    Branch    3 branches                          │
+│    History   214 commits                         │
 │    Config    git settings                        │
 │                                                  │
 │   ↑↓ navigate    enter select    q quit          │
@@ -48,6 +49,15 @@ Appears on the menu (and answers `S`) only once there is something stashed — f
 - Results are reported in plain words: *"Applied stash abc1234 — 3 files restored to the working tree; the entry is still in the stash list."*
 - A conflicted apply or pop is described truthfully: which files now hold conflict markers, that the stash itself was kept, and how to either resolve or cancel. Nothing is auto-aborted behind your back.
 - Entries are always addressed by their stable SHA, re-resolved just before every operation — a `stash@{N}` read a moment ago can name a different entry after a drop.
+
+### History browser
+Appears on the menu as `History  N commits` once the repo has any. Answers the two questions the dashboard graph cannot: *what did I do yesterday*, and *what exactly did that commit touch*.
+- Scrollable list of the **current branch's** commits — `abc1234  2h ago  subject`, with branch / tag decorations coloured exactly as they are in the graph, and merges marked in a word rather than a glyph.
+- Loaded in pages of 200 and extended automatically as you scroll, so opening the browser on a 50,000-commit repository is as fast as on a fresh one. The counter is honest about it (`200 of 3,412 commits loaded`).
+- `enter` / `d` opens the commit: short and full SHA, author and email, absolute date *and* relative age, refs, the full message (subject **and** body), and the `--stat` block.
+- `p` shows the whole patch, diff-coloured and scrollable. Oversized patches are capped and say so, with the true size. A clean merge's empty patch is explained rather than shown as a blank pane.
+- Read-only by design: no checkout, no revert-from-here, no cherry-pick. Nothing on this screen can change your repository.
+- Works on a detached HEAD too — where the header names the commit you are sitting on.
 
 ### Remote sync
 - Sync dialog auto-shows on startup when the current branch is behind origin or behind main.
@@ -190,6 +200,14 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `x` | Delete the entry (asks first; there is no undo) |
 | `esc` | Back to menu |
 
+### History browser
+| Key | Action |
+|-----|--------|
+| `↑↓` or `j/k` | Navigate (older pages load as you approach the end) |
+| `enter` or `d` | Open the commit — message, author, date, refs, stat |
+| `p` | Toggle the full patch (in the detail pane) |
+| `esc` | Patch → detail → list → menu |
+
 ### Config editor
 | Key | Action |
 |-----|--------|
@@ -221,7 +239,7 @@ Builds embed the current `git describe --tags --always --dirty` output as the ve
 main.go                    Entry, flag and subcommand parsing
 internal/
   git/                     Pure git operations — no TUI dependencies
-                           (git.go, stash.go, gitignore_templates.go)
+                           (git.go, stash.go, history.go, gitignore_templates.go)
   types/                   Shared types (FileEntry, BranchEntry, …)
   ui/
     model.go               Bubble Tea Model, step enum, async msg handlers
@@ -231,6 +249,7 @@ internal/
     step_files.go          File selector, diff, edit, gitignore, discard, undo/revert, filter
     step_branch.go         Branch manager (switch, create, rename, delete, merge)
     step_stash.go          Stash manager (list, preview, apply, pop, delete)
+    step_history.go        History browser (paged commit list, detail, patch)
     step_config.go         Config editor
     step_init.go           First-run init flow
     step_sync.go           Pull / sync-with-main dialog

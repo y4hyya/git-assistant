@@ -36,6 +36,7 @@ const (
 	stepSync                // sync dialog (pull current / merge origin/main)
 	stepInit                // first-run setup when cwd is not a git repo
 	stepStash               // stash manager: list, preview, apply, pop, delete
+	stepHistory             // commit history browser: list, detail, patch (read-only)
 )
 
 // Async result messages
@@ -312,6 +313,38 @@ type Model struct {
 	stashConfirmDrop bool
 	stashApplying    bool // apply or pop in flight (blocks re-dispatch)
 	stashDropping    bool
+
+	// Commit history browser (read-only — see step_history.go).
+	//
+	// historyEntries is APPENDED to as older pages arrive: the cursor is an
+	// index into it and the user may be holding an arrow key when a page lands,
+	// so nothing may reorder or replace what is already on screen. historyRef is
+	// the revision those pages were read from, echoed back by every page message
+	// so a result for a branch we have left can be dropped. historyTotal comes
+	// from the dashboard snapshot and is what the menu entry is gated on.
+	historyEntries   []git.CommitEntry
+	historyCursor    int
+	historyScroll    int
+	historyTotal     int
+	historyRef       string
+	historyLoading   bool // first page in flight
+	historyPaging    bool // an older page in flight
+	historyExhausted bool // a short page came back — there is nothing older
+	// The detail pane, and the patch pane inside it. historyDetailSHA is the
+	// commit both are about; every async result is matched against it, because
+	// the user can walk on to another commit before a read lands.
+	historyDetailSHA     string
+	historyDetail        git.CommitDetail
+	historyDetailLoading bool
+	historyDetailScroll  int
+	historyShowDetail    bool
+	historyShowPatch     bool
+	historyPatch         git.CommitPatchInfo
+	// historyPatchLoaded, not len(Patch) > 0: a clean merge's patch is
+	// legitimately empty, and without this `p` would re-read it every press.
+	historyPatchLoaded  bool
+	historyPatchLoading bool
+	historyPatchScroll  int
 
 	// Config editor
 	configCursor     int
@@ -715,6 +748,10 @@ type dashboardSnapshot struct {
 	// `S` key at all. Read here with everything else — the menu must never fork
 	// `git stash list` from a View func or a keypress.
 	stashCount int
+	// totalCommits is what the History entry counts, and the gate that hides it
+	// in a repository with no commits. Same rule as stashCount: read here, never
+	// from the menu.
+	totalCommits int
 	// detached: HEAD is on no branch. Read here with everything else so the
 	// dashboard's gating never depends on a git call made inside Update.
 	detached bool
@@ -741,6 +778,7 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 	snap.branchCount = len(git.GetAllBranches())
 	snap.hasAnyCommit = git.HasAnyCommit()
 	snap.stashCount = git.StashCount()
+	snap.totalCommits = git.TotalCommits()
 	snap.detached = git.IsDetachedHead()
 	if withStatus {
 		if files, err := git.GetStatus(); err == nil {
@@ -769,6 +807,7 @@ func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.mainRef = s.mainRef
 	m.branchCount = s.branchCount
 	m.hasAnyCommit = s.hasAnyCommit
+	m.historyTotal = s.totalCommits
 	m.detached = s.detached
 	// Not while the manager is on screen: it holds the authoritative list (it
 	// re-reads on entry and after every mutation), and a snapshot taken before
@@ -1201,6 +1240,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stashDropResultMsg:
 		return m.handleStashDropResult(msg)
+
+	// The history browser's three reads. None of them calls startResult: they
+	// are reads the user asked to LOOK at something, not operations, and
+	// clearing the status note of the merge that sent them here would be wrong.
+	case historyPageMsg:
+		return m.handleHistoryPage(msg)
+
+	case historyDetailMsg:
+		return m.handleHistoryDetail(msg)
+
+	case historyPatchMsg:
+		return m.handleHistoryPatch(msg)
 
 	case discardResultMsg:
 		m.confirmDiscard = false
@@ -1798,6 +1849,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateInit(msg)
 	case stepStash:
 		return m.updateStash(msg)
+	case stepHistory:
+		return m.updateHistory(msg)
 	}
 
 	return m, nil
@@ -1843,6 +1896,8 @@ func (m Model) View() string {
 		content = m.viewInit()
 	case stepStash:
 		content = m.viewStash()
+	case stepHistory:
+		content = m.viewHistory()
 	}
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)

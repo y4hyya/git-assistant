@@ -30,6 +30,10 @@ func (m Model) menuItems() []menuItem {
 		// belongs to no branch, and a detached HEAD is precisely the state
 		// where uncommitted work most needs a way back out.
 		items = append(items, m.stashMenuItem()...)
+		// History is the second exception, and for a sharper reason: it reads
+		// HEAD, it changes nothing, and "which commit am I actually sitting on"
+		// is the question a detached HEAD raises.
+		items = append(items, m.historyMenuItem()...)
 		return append(items, menuItem{"Config", "git settings"})
 	}
 
@@ -60,6 +64,7 @@ func (m Model) menuItems() []menuItem {
 	}
 	items = append(items, menuItem{"Branch", fmt.Sprintf("%d branches", m.branchCount)})
 	items = append(items, m.stashMenuItem()...)
+	items = append(items, m.historyMenuItem()...)
 	items = append(items, menuItem{"Config", "git settings"})
 	// Recovery entry: when this local repo has no remote and `gh` is
 	// available, offer to create the GitHub repo from here.
@@ -79,6 +84,17 @@ func (m Model) stashMenuItem() []menuItem {
 		return nil
 	}
 	return []menuItem{{"Stash", fmt.Sprintf("%d stashed", m.stashCount)}}
+}
+
+// historyMenuItem is the History entry, or nothing. Spliced in like the stash
+// entry, gated on the same kind of condition (historyAvailable, i.e. the
+// snapshot counted at least one commit): a repository with no commits has no
+// history, and an empty browser is one more thing for a beginner to wonder at.
+func (m Model) historyMenuItem() []menuItem {
+	if !m.historyAvailable() {
+		return nil
+	}
+	return []menuItem{{"History", plural(m.historyTotal, "commit", "commits")}}
 }
 
 // isConventionalType reports whether s can be a conventional-commit type:
@@ -367,6 +383,10 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "Stash":
 			m.enterStash()
 			return m, nil
+		case "History":
+			// Returns a command: the first page is read off the UI thread like
+			// everything else this screen dispatches.
+			return m, m.enterHistory()
 		case "Config":
 			m.configCursor = 0
 			m.configGlobal = false

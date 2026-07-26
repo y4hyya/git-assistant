@@ -3685,6 +3685,54 @@ func helpScreens(t *testing.T) []struct {
 			*m = stashModel(t, 1)
 			m.stashConfirmDrop = true
 		})},
+		// The history browser's four states. Its reads are async, so "still
+		// loading" is a screen the user sees and has to be able to leave.
+		{"history list", mk(stepHistory, func(m *Model) { *m = historyModel(t, 3) })},
+		{"history loading", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 0)
+			m.historyLoading = true
+		})},
+		{"history detail", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 3)
+			m.historyShowDetail = true
+			m.historyDetailSHA = "abc1234"
+			m.historyDetail = git.CommitDetail{SHA: "abc1234", Subject: "feat: x", Author: "Yahya"}
+		})},
+		{"history detail loading", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 3)
+			m.historyShowDetail = true
+			m.historyDetailSHA = "abc1234"
+			m.historyDetailLoading = true
+		})},
+		{"history patch", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 3)
+			m.historyShowDetail = true
+			m.historyDetailSHA = "abc1234"
+			m.historyPatchLoaded, m.historyShowPatch = true, true
+			m.historyPatch = git.CommitPatchInfo{Patch: "@@ -1 +1 @@\n-a\n+b\n"}
+		})},
+		// Both panes drop their scroll keys when there is nothing to scroll,
+		// so both states need covering.
+		{"history detail scrollable", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 3)
+			m.height = 24
+			m.historyShowDetail = true
+			m.historyDetailSHA = "abc1234"
+			m.historyDetail = git.CommitDetail{
+				SHA: "abc1234", Subject: "feat: x",
+				Body: strings.TrimRight(strings.Repeat("body line\n", 60), "\n"),
+			}
+		})},
+		{"history patch scrollable", mk(stepHistory, func(m *Model) {
+			*m = historyModel(t, 3)
+			m.height = 24
+			m.historyShowDetail = true
+			m.historyDetailSHA = "abc1234"
+			m.historyPatchLoaded, m.historyShowPatch = true, true
+			m.historyPatch = git.CommitPatchInfo{
+				Patch: strings.TrimRight(strings.Repeat("+line\n", 200), "\n"),
+			}
+		})},
 	}
 }
 
@@ -3841,8 +3889,11 @@ func TestDetachedHeadMenuOffersOnlyTheWayOut(t *testing.T) {
 	for _, item := range m.menuItems() {
 		names = append(names, item.name)
 	}
-	if len(names) != 2 || names[0] != "Branch" || names[1] != "Config" {
-		t.Fatalf("menu = %v, want just Branch and Config", names)
+	// Branch is the way out; History reads HEAD and writes nothing, so it stays
+	// (see TestDetachedMenuKeepsTheHistoryBrowser). Everything that assumes a
+	// branch — Commit, Amend, Push, Sync — is gone.
+	if strings.Join(names, ",") != "Branch,History,Config" {
+		t.Fatalf("menu = %v, want just Branch, History and Config", names)
 	}
 	if desc := m.menuItems()[0].desc; !strings.Contains(desc, "switch to a branch") {
 		t.Errorf("the Branch entry does not point at the way out: %q", desc)

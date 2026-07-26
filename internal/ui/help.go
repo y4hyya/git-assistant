@@ -49,6 +49,8 @@ func (m Model) helpRows() [][]helpEntry {
 		return m.initHelp()
 	case stepStash:
 		return m.stashHelp()
+	case stepHistory:
+		return m.historyHelp()
 	}
 	return nil
 }
@@ -302,6 +304,51 @@ func (m Model) stashHelp() [][]helpEntry {
 			{"x", "delete"},
 		},
 	}
+}
+
+// historyHelp mirrors viewHistory's dispatch: the detail pane short-circuits
+// the list and the patch pane short-circuits the detail, in that order.
+//
+// Every screen here is read-only, and the key list is the proof: there is
+// nothing on it that writes. The browser deliberately offers no checkout, no
+// revert-from-here and no cherry-pick — see the note at the top of
+// step_history.go.
+func (m Model) historyHelp() [][]helpEntry {
+	// Scroll keys only where there is something to scroll — a merge's patch is
+	// routinely one line long, and the confirm screen sets the same precedent.
+	switch {
+	case m.historyShowDetail && m.historyShowPatch:
+		var entries []helpEntry
+		if m.historyPatchMaxScroll() > 0 {
+			entries = append(entries, helpEntry{symArrows, "scroll"})
+		}
+		return oneRow(append(entries,
+			helpEntry{"p/esc", "back to details"},
+			helpEntry{"q", "quit"})...)
+	case m.historyShowDetail:
+		if m.historyDetailLoading {
+			return oneRow(helpEntry{"esc", "back"}, helpEntry{"q", "quit"})
+		}
+		var entries []helpEntry
+		if m.historyDetailMaxScroll() > 0 {
+			entries = append(entries, helpEntry{symArrows, "scroll"})
+		}
+		return oneRow(append(entries,
+			helpEntry{"p", "patch"},
+			helpEntry{"esc", "back"},
+			helpEntry{"q", "quit"})...)
+	}
+	// The list. With nothing loaded there is no commit to open, so the only
+	// honest keys are the ways out.
+	if len(m.historyEntries) == 0 {
+		return oneRow(helpEntry{"esc", "menu"}, helpEntry{"q", "quit"})
+	}
+	return oneRow(
+		helpEntry{symArrows, "navigate"},
+		helpEntry{"enter/d", "details"},
+		helpEntry{"esc", "menu"},
+		helpEntry{"q", "quit"},
+	)
 }
 
 func (m Model) configHelp() [][]helpEntry {
@@ -565,6 +612,14 @@ func (m Model) screenName() string {
 			return "Stash preview"
 		}
 		return "Stash manager"
+	case stepHistory:
+		switch {
+		case m.historyShowDetail && m.historyShowPatch:
+			return "Commit patch"
+		case m.historyShowDetail:
+			return "Commit details"
+		}
+		return "History"
 	}
 	return "git-assist"
 }

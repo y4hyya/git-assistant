@@ -258,9 +258,16 @@ func cleanDecoration(raw string) []decoRef {
 	if !strings.HasPrefix(raw, "(") || !strings.HasSuffix(raw, ")") {
 		return nil
 	}
+	return parseDecoRefs(strings.Split(raw[1:len(raw)-1], ", "))
+}
 
+// parseDecoRefs classifies and orders already-split ref names. Split out from
+// cleanDecoration because the history browser reads %D, which git prints
+// without the parentheses %d wraps around it — the two screens must colour the
+// same ref the same way, and that only holds while they share this function.
+func parseDecoRefs(parts []string) []decoRef {
 	var head, branches, tags []decoRef
-	for _, p := range strings.Split(raw[1:len(raw)-1], ", ") {
+	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		switch {
 		case p == "", p == "HEAD", strings.HasSuffix(p, "/HEAD"):

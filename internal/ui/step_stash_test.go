@@ -111,7 +111,9 @@ func TestDetachedMenuStillOffersTheStash(t *testing.T) {
 	for _, item := range m.menuItems() {
 		names = append(names, item.name)
 	}
-	want := []string{"Branch", "Stash", "Config"}
+	// History rides along for a different reason (it reads HEAD and writes
+	// nothing) — see TestDetachedMenuKeepsTheHistoryBrowser.
+	want := []string{"Branch", "Stash", "History", "Config"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("detached menu is %v, want %v", names, want)
 	}
