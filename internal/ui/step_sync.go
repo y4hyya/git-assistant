@@ -231,19 +231,7 @@ func (m Model) viewSync() string {
 
 	// Help bar
 	b.WriteString("\n")
-	entries := []helpEntry{}
-	if m.syncPullCurrent {
-		label := "pull"
-		if m.syncDiverged {
-			label = "pull anyway"
-		}
-		entries = append(entries, helpEntry{"p", label})
-	}
-	if m.syncSyncMain {
-		entries = append(entries, helpEntry{"s", "sync with " + m.syncMainBranchName})
-	}
-	entries = append(entries, helpEntry{"enter", "skip"})
-	b.WriteString(renderHelp(entries))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }
@@ -254,7 +242,9 @@ func (m Model) viewSync() string {
 // Returns true if either condition fired (i.e., the dialog is worth showing).
 // Does NOT change m.step — caller decides whether to transition.
 func (m *Model) populateSyncDialog() bool {
-	if !m.hasRemote {
+	// A detached HEAD tracks nothing and merges into nothing: every question
+	// below would be asked about the branch we are NOT on.
+	if !m.hasRemote || m.detached {
 		return false
 	}
 	main := git.ResolveMainBranch()

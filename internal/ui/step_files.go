@@ -47,10 +47,14 @@ func (m Model) listRows() int {
 	return rows
 }
 
-// fileListRows is listRows minus the commit-mode footer's second row (the
-// honest key set does not fit one 80-column line).
+// fileListRows is listRows minus the footer rows past the first — listRows
+// already accounts for one. The commit-mode key set spans three rows (the
+// honest list does not fit one 80-column line), and the budget reads that off
+// the footer itself rather than hardcoding a number that goes stale the next
+// time a key is added: when it did, the whole footer vanished instead of one
+// file row.
 func (m Model) fileListRows() int {
-	rows := m.listRows() - 1
+	rows := m.listRows() - (m.footerHeight() - 1)
 	if rows < 4 {
 		rows = 4
 	}
@@ -151,15 +155,111 @@ func (m Model) rememberedDiffScroll(path string) int {
 	return s
 }
 
+// diffFileEditable reports whether the file the diff view is showing can be
+// opened in the editor: a deleted entry has nothing on disk to edit, and
+// neither does a path that has since disappeared. Shared with the footer
+// (see filesHelp), so the `e` key and the row advertising it agree.
+func (m Model) diffFileEditable() bool {
+	if m.cursor >= len(m.files) {
+		return false // no entry to check → treat as non-editable
+	}
+	if m.files[m.cursor].Status == types.StatusDeleted {
+		return false
+	}
+	_, err := os.Stat(m.diffFile)
+	return err == nil
+}
+
+// ── Discarding one file's changes ───────────────────────
+
+// discardAction is everything the `x` key needs to SAY about one entry: the
+// footer's label, the question, what it costs, and what to report afterwards.
+// One function decides all four so the sentence on screen can never describe a
+// different operation from the one git.DiscardFile will run.
+//
+// The deleted case is why this exists. `x` there is not "delete harder" — the
+// file is already gone and restoring it is what discarding its change means, so
+// the key is labelled "restore" and the prompt asks to bring the file back.
+type discardAction struct {
+	key    string // footer label for x
+	title  string // the question, as a full sentence
+	detail string // what is lost, in plain words
+	note   string // the status note once it has happened
+}
+
+func discardActionFor(f types.FileEntry) discardAction {
+	p := f.Path
+	switch f.Status {
+	case types.StatusUntracked:
+		// A directory entry is an embedded repository or a folder git has never
+		// looked inside; saying "file" there understates what is about to go.
+		if strings.HasSuffix(p, "/") {
+			return discardAction{
+				key:    "delete",
+				title:  "Delete " + p + " and everything in it?",
+				detail: "It was never committed — this cannot be undone.",
+				note:   "Deleted " + p + " — it was never committed",
+			}
+		}
+		return discardAction{
+			key:    "delete",
+			title:  "Delete " + p + "?",
+			detail: "It was never committed — this cannot be undone.",
+			note:   "Deleted " + p + " — it was never committed",
+		}
+	case types.StatusAdded:
+		// Staged, but no commit has it: there is no earlier version to fall
+		// back to, so discarding removes the file exactly like an untracked one.
+		return discardAction{
+			key:    "delete",
+			title:  "Delete " + p + "?",
+			detail: "It is staged but was never committed — this cannot be undone.",
+			note:   "Deleted " + p + " — it was never committed",
+		}
+	case types.StatusDeleted:
+		return discardAction{
+			key:    "restore",
+			title:  "Restore " + p + "?",
+			detail: "Brings the deleted file back, exactly as the last commit has it.",
+			note:   "Restored " + p,
+		}
+	case types.StatusRenamed:
+		if f.OrigPath == "" {
+			break
+		}
+		return discardAction{
+			key:    "undo rename",
+			title:  "Undo the rename of " + f.OrigPath + " " + symArrowRight + " " + p + "?",
+			detail: "The file goes back to " + f.OrigPath + "; edits made since the last commit are lost.",
+			note:   "Undid the rename — " + f.OrigPath + " is back",
+		}
+	}
+	return discardAction{
+		key:    "discard",
+		title:  "Discard changes to " + p + "?",
+		detail: "Your edits since the last commit are permanently lost.",
+		note:   "Discarded changes to " + p,
+	}
+}
+
+// discardKeyLabel is what the footer's `x` entry says for the file under the
+// cursor. Empty list → the key is a no-op, and "discard" is the honest default.
+func (m Model) discardKeyLabel() string {
+	if m.cursor >= len(m.files) {
+		return "discard"
+	}
+	return discardActionFor(m.files[m.cursor]).key
+}
+
 // ── Update ──────────────────────────────────────────────
 
 func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// While undo or the .gitignore apply is in flight, block key input so a
-	// second press can't dispatch the same command twice (two soft resets
-	// move HEAD back two commits; a second `git rm --cached` fails on paths
-	// the first pass already removed). Spinner ticks are non-key messages
-	// and are forwarded so the animation keeps running.
-	if m.undoing || m.gitignoring {
+	// While undo, revert, discard or the .gitignore apply is in flight, block
+	// key input so a second press can't dispatch the same command twice (two
+	// soft resets move HEAD back two commits; a second `git rm --cached` fails
+	// on paths the first pass already removed). Spinner ticks are non-key
+	// messages and are forwarded so the animation keeps running.
+	if m.undoing || m.gitignoring || m.discarding || m.reverting {
 		if _, ok := msg.(tea.KeyMsg); ok {
 			return m, nil
 		}
@@ -180,10 +280,42 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmUndo = false
 			m.undoing = true
 			return m, tea.Batch(doUndo(), m.spinner.Tick)
-		default:
+		// The two extra keys exist only for a commit origin already has, where
+		// the prompt offers a real choice between rewriting shared history and
+		// adding a commit that undoes it. On an unpushed commit they are not
+		// advertised and fall through to "any key cancels".
+		case "u":
+			if !m.undoPushed {
+				break
+			}
 			m.confirmUndo = false
-			m.undoPushed = false
-			m.undoSubject = ""
+			m.undoing = true
+			return m, tea.Batch(doUndo(), m.spinner.Tick)
+		case "r":
+			if !m.undoPushed {
+				break
+			}
+			m.confirmUndo = false
+			m.reverting = true
+			return m, tea.Batch(doRevert(m.undoSHA, m.undoSubject), m.spinner.Tick)
+		}
+		m.confirmUndo = false
+		m.undoPushed = false
+		m.undoSubject = ""
+		m.undoSHA = ""
+		return m, nil
+	}
+
+	// Handle discard confirmation
+	if m.confirmDiscard {
+		switch keyMsg.String() {
+		case "y":
+			m.confirmDiscard = false
+			m.discarding = true
+			return m, tea.Batch(doDiscard(m.discardEntry), m.spinner.Tick)
+		default:
+			m.confirmDiscard = false
+			m.discardEntry = types.FileEntry{}
 			return m, nil
 		}
 	}
@@ -349,15 +481,22 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.files[idx].Selected = !m.files[idx].Selected
 			}
 		case "enter":
+			target := -1
 			if len(m.filterMatches) > 0 {
-				m.cursor = m.filterMatches[m.filterCursor]
+				target = m.filterMatches[m.filterCursor]
+			}
+			// Leave filter mode FIRST: the window being scrolled is the commit
+			// list's, and its row budget is not the filter screen's (they have
+			// differently sized footers).
+			m.filterMode = false
+			m.filterInput.Reset()
+			if target >= 0 {
+				m.cursor = target
 				// Jumping to a match 40 files down used to leave fileScroll
 				// where it was, so the selector came back with no visible
 				// cursor at all until some other key repaired the window.
 				m.followCursor(len(m.files), m.fileListRows())
 			}
-			m.filterMode = false
-			m.filterInput.Reset()
 		case "esc":
 			m.filterMode = false
 			m.filterInput.Reset()
@@ -513,6 +652,15 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i := range m.files {
 			m.files[i].Selected = !allSelected
 		}
+	case "x":
+		if m.cursor >= len(m.files) {
+			return m, nil
+		}
+		// Cached, not re-read from files[cursor] later: the prompt has to keep
+		// describing the entry it opened on even though the list is replaced the
+		// moment the discard lands.
+		m.discardEntry = m.files[m.cursor]
+		m.confirmDiscard = true
 	case "u":
 		m.confirmUndo = true
 		// Both read once, here — never from a View func. Undoing a commit that
@@ -520,9 +668,12 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// saying out loud before the soft reset.
 		m.undoPushed = git.IsLastCommitPushed()
 		m.undoSubject = git.GetLastCommitMessage()
-		// The commit origin will still be holding once this one is gone
-		// locally — the lease for any force push that follows the undo.
-		m.rewritePendingSHA = git.HeadSHA()
+		// One reading, two jobs: the commit revert has to name, and the commit
+		// origin will still be holding once an undo has removed it locally —
+		// the lease for any force push that follows.
+		head := git.HeadSHA()
+		m.undoSHA = head
+		m.rewritePendingSHA = head
 	case "enter":
 		hasSelected := false
 		for _, f := range m.files {
@@ -576,6 +727,48 @@ func doUndo() tea.Cmd {
 			return undoResultMsg{err: err}
 		}
 		return undoResultMsg{files: files}
+	}
+}
+
+// doRevert records a new commit that undoes sha. Unlike undo, it adds to
+// history instead of rewriting it, so a branch that is already on origin stays
+// push-compatible — which is the whole reason the prompt offers it.
+//
+// A revert can conflict (the lines it wants to put back have moved since). There
+// is no in-TUI conflict resolution, so the sequencer is aborted and the failure
+// says so plainly: nothing changed, the commit is still there.
+func doRevert(sha, subject string) tea.Cmd {
+	return func() tea.Msg {
+		if err := git.Revert(sha); err != nil {
+			if conflicts := git.GetConflictFiles(); len(conflicts) > 0 {
+				git.RevertAbort()
+				return revertResultMsg{err: fmt.Errorf(
+					"revert conflict — %s, so the revert was aborted and nothing changed. The commit is still there; undoing it now needs your terminal",
+					plural(len(conflicts), "conflicting file", "conflicting files"))}
+			}
+			return revertResultMsg{err: err}
+		}
+		files, err := git.GetStatus()
+		if err != nil {
+			return revertResultMsg{err: err}
+		}
+		return revertResultMsg{files: files, subject: subject}
+	}
+}
+
+// doDiscard throws away one entry's changes and re-reads the tree. The routing
+// (restore / delete / resurrect) lives in git.DiscardFile, next to the switch
+// the confirmation's wording comes from.
+func doDiscard(entry types.FileEntry) tea.Cmd {
+	return func() tea.Msg {
+		if err := git.DiscardFile(entry); err != nil {
+			return discardResultMsg{err: err, entry: entry}
+		}
+		files, err := git.GetStatus()
+		if err != nil {
+			return discardResultMsg{err: err, entry: entry}
+		}
+		return discardResultMsg{entry: entry, files: files}
 	}
 }
 
@@ -784,6 +977,12 @@ func (m Model) viewFiles() string {
 	if m.undoing {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Undoing last commit...") + "\n")
 	}
+	if m.reverting {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Reverting last commit...") + "\n")
+	}
+	if m.discarding {
+		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Discarding changes...") + "\n")
+	}
 	if m.gitignoring {
 		b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Updating .gitignore...") + "\n")
 	}
@@ -801,13 +1000,33 @@ func (m Model) viewFiles() string {
 		// ready to re-commit. "Changes will be kept" left people guessing.
 		b.WriteString("  " + dimStyle.Render("Moves the last commit's changes back to staged — nothing is lost.") + "\n")
 		if m.undoPushed {
-			b.WriteString("  " + modifiedStyle.Render(symWarn+" already pushed to origin — undoing will make your branch diverge") + "\n")
+			// origin has this commit, so there are two different operations
+			// here and the user has to be able to tell them apart. Spelled out
+			// in full: the footer below only has room for their names.
+			b.WriteString("  " + modifiedStyle.Render(symWarn+" already pushed to origin — undoing will make your branch diverge") + "\n\n")
+			b.WriteString("  " + helpKeyStyle.Render("u") + " " +
+				highlightStyle.Render("undo anyway") + " " +
+				dimStyle.Render("— rewrites history; the next push has to be a force-push") + "\n")
+			b.WriteString("  " + helpKeyStyle.Render("r") + " " +
+				highlightStyle.Render("revert instead") + " " +
+				dimStyle.Render("— adds a new commit that undoes it; safe for pushed work") + "\n")
 		}
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "confirm"},
-			{"any", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
+		return m.styledBox(b.String())
+	}
+
+	// Discard confirmation. Every word of it — the question, the cost — comes
+	// from the same switch that routes the operation (see discardActionFor).
+	if m.confirmDiscard {
+		act := discardActionFor(m.discardEntry)
+		b.WriteString("\n  " + modifiedStyle.Render(act.title) + "\n")
+		b.WriteString("  " + dimStyle.Render(act.detail) + "\n")
+		if m.discardEntry.Status != types.StatusDeleted {
+			b.WriteString("  " + dimStyle.Render("git cannot bring this back — there is no undo for it.") + "\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -821,33 +1040,7 @@ func (m Model) viewFiles() string {
 	// were both live and undocumented. Two rows because the honest set does not
 	// fit one 80-column line, and a wrapped help bar is worse than two tidy ones.
 	b.WriteString("\n")
-	if m.gitignoreMode {
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"space", "toggle"},
-			{"a", "all"},
-			{"enter", "confirm"},
-			{"g/esc", "cancel"},
-			{"q", "quit"},
-		}))
-	} else {
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"space", "select"},
-			{"a", "all"},
-			{"/", "filter"},
-			{"enter", "next"},
-		}))
-		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"d", "diff"},
-			{"b", "branch"},
-			{"g", "ignore"},
-			{"u", "undo"},
-			{"esc", "menu"},
-			{"q", "quit"},
-		}))
-	}
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }
@@ -873,9 +1066,7 @@ func (m Model) viewDiff() string {
 		b.WriteString("          ")
 		b.WriteString(dimStyle.Render("Binary file — cannot preview or edit"))
 		b.WriteString("\n\n\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"esc", "back"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -903,25 +1094,7 @@ func (m Model) viewDiff() string {
 
 	// Help bar
 	b.WriteString("\n")
-	deleted := true // no entry to check → treat as non-editable
-	if m.cursor < len(m.files) {
-		deleted = m.files[m.cursor].Status == types.StatusDeleted
-	}
-	_, fileExists := os.Stat(m.diffFile)
-	if deleted || fileExists != nil {
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "scroll"},
-			{"esc", "back"},
-			{"q", "quit"},
-		}))
-	} else {
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "scroll"},
-			{"e", "edit"},
-			{"esc", "back"},
-			{"q", "quit"},
-		}))
-	}
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }
@@ -970,10 +1143,7 @@ func (m Model) viewEdit() string {
 		b.WriteString("\n\n")
 		b.WriteString("  " + modifiedStyle.Render("You have unsaved changes. Discard?") + "\n")
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "discard"},
-			{"any", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -999,10 +1169,7 @@ func (m Model) viewEdit() string {
 
 	// Help bar
 	b.WriteString("\n\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"ctrl+s", "save"},
-		{"esc", "back"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }
@@ -1273,12 +1440,7 @@ func (m Model) viewFilter() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{symArrows, "navigate"},
-		{"tab", "select"},
-		{"enter", "jump"},
-		{"esc", "cancel"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

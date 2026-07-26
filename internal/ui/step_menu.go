@@ -17,6 +17,18 @@ type menuItem struct {
 }
 
 func (m Model) menuItems() []menuItem {
+	// Detached HEAD: every other entry needs a branch. Commit and Amend would
+	// write commits nothing points at, Push would try to create a remote branch
+	// literally named "HEAD (detached)", and Sync has no upstream to measure
+	// against. One way out is offered instead — the branch manager, where
+	// switching to a branch is the cure.
+	if m.detached {
+		return []menuItem{
+			{"Branch", "switch to a branch to continue"},
+			{"Config", "git settings"},
+		}
+	}
+
 	changeCount := 0
 	for _, f := range m.files {
 		_ = f
@@ -133,7 +145,7 @@ func clampMenuCursor(cursor, n int) int {
 // (or hide one it should). mainRef is empty in a repository with no main
 // branch at all, where there is nothing to sync with.
 func (m Model) canSyncMain() bool {
-	return m.behindMain > 0 && m.mainRef != ""
+	return m.behindMain > 0 && m.mainRef != "" && !m.detached
 }
 
 // mainLabel names the main branch for display. Falls back to "main" before the
@@ -150,7 +162,7 @@ func (m Model) mainLabel() string {
 // branch origin has never seen, and a local rewrite origin still contradicts.
 // A branch that is merely BEHIND is not one of them — that is Pull's job.
 func (m Model) canPush() bool {
-	if !m.hasRemote || !m.hasAnyCommit {
+	if !m.hasRemote || !m.hasAnyCommit || m.detached {
 		return false
 	}
 	return m.aheadOrigin > 0 || !m.hasUpstream || m.historyRewritten
@@ -377,6 +389,9 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Manual pull fallback. Opens the sync dialog if there's anything
 		// to pull — user may have skipped the startup dialog, or new
 		// upstream commits appeared mid-session.
+		if m.detached {
+			return m, nil
+		}
 		if m.populateSyncDialog() && m.syncPullCurrent {
 			m.syncReturnStep = stepMenu
 			m.step = stepSync
@@ -425,6 +440,15 @@ func (m Model) viewMenu() string {
 	}
 
 	blocks := []string{head.String()}
+
+	// Detached HEAD. Loud, and above everything else on the screen: a commit
+	// made here belongs to no branch and the next checkout leaves it reachable
+	// only through the reflog. The menu below is already down to its one exit.
+	if m.detached {
+		blocks = append(blocks,
+			"  "+errorStyle.Render(symWarn+" detached HEAD — you're not on any branch; commits made here can be lost")+
+				"\n  "+dimStyle.Render("Open Branch and switch to a branch to carry on."))
+	}
 
 	// One-shot success banner from the init flow. Cleared on next keypress
 	// by the main Update handler, same lifecycle as m.err.
@@ -489,21 +513,13 @@ func (m Model) viewMenu() string {
 	}
 	out := strings.Join(blocks, sep)
 
-	// Help bar: a blank line plus one row, dropped whole when it doesn't fit.
-	helpEntries := []helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "select"},
-	}
-	if m.hasRemote && m.behindOrigin > 0 {
-		helpEntries = append(helpEntries, helpEntry{"p", "pull"})
-	}
-	if m.canSyncMain() {
-		helpEntries = append(helpEntries, helpEntry{"s", "sync"})
-	}
-	helpEntries = append(helpEntries, helpEntry{"q", "quit"})
-	if used+2 <= budget {
-		out += "\n\n" + renderHelp(helpEntries)
-		used += 2
+	// Help bar: a blank line plus its row(s), dropped whole when they don't fit.
+	// The keys come from menuHelp, which the `?` overlay renders too.
+	if help := renderHelpRows(m.helpRows()); help != "" {
+		if cost := lipgloss.Height(help) + 1; used+cost <= budget {
+			out += "\n\n" + help
+			used += cost
+		}
 	}
 
 	// Graph section: takes whatever is left after its own blank line, and

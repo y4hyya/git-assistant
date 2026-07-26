@@ -72,6 +72,21 @@ func doCreateBranch(name string) tea.Cmd {
 	}
 }
 
+// doRenameBranch renames a local branch. wasCurrent/hadUpstream are read when
+// the prompt opens and carried through, because after the rename the branch
+// they describe no longer answers to that name.
+func doRenameBranch(from, to string, wasCurrent, hadUpstream bool) tea.Cmd {
+	return func() tea.Msg {
+		return branchRenameResultMsg{
+			err:         git.RenameBranchTo(from, to),
+			from:        from,
+			to:          to,
+			wasCurrent:  wasCurrent,
+			hadUpstream: hadUpstream,
+		}
+	}
+}
+
 func doDeleteBranch(name string, force bool) tea.Cmd {
 	return func() tea.Msg {
 		err := git.DeleteBranch(name, force)
@@ -151,7 +166,7 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// outer Update still handles ctrl+c before we get here, so quitting
 	// remains possible). Spinner ticks are non-key messages and are
 	// forwarded so the animation keeps running.
-	if m.branchSwitching || m.branchMerging || m.branchCreating || m.branchDeleting {
+	if m.branchSwitching || m.branchMerging || m.branchCreating || m.branchDeleting || m.branchRenaming {
 		if _, ok := msg.(tea.KeyMsg); ok {
 			return m, nil
 		}
@@ -190,6 +205,49 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			m.branchCreateInput, cmd = m.branchCreateInput.Update(msg)
+			return m, cmd
+		}
+	}
+
+	// ── Rename mode ────────────────────────────────────
+	if m.branchRenameMode {
+		switch keyMsg.String() {
+		case "enter":
+			name := strings.TrimSpace(m.branchRenameInput.Value())
+			if name == "" {
+				return m, nil
+			}
+			if name == m.branchRenameFrom {
+				// The input is prefilled with the current name, so enter-through
+				// is easy to hit by accident. Say what happened instead of
+				// forwarding git's "is already called that".
+				m.err = fmt.Errorf("%s that is already this branch's name — edit it, or press esc", symWarn)
+				return m, nil
+			}
+			// git owns the ref-name rules; ask it rather than guessing, then lead
+			// with something a beginner can act on.
+			if err := git.CheckRefFormatBranch(name); err != nil {
+				m.err = fmt.Errorf("branch names can't contain spaces, ':', '..', or end with '/'\n  %v", err)
+				return m, nil
+			}
+			if git.BranchExists(name) {
+				m.err = fmt.Errorf("a branch named %s already exists — pick another name", name)
+				return m, nil
+			}
+			m.branchRenaming = true
+			return m, tea.Batch(
+				doRenameBranch(m.branchRenameFrom, name,
+					m.branchRenameFrom == m.branch, m.branchRenameUpstream),
+				m.spinner.Tick)
+		case "esc":
+			m.branchRenameMode = false
+			m.branchRenameInput.Reset()
+			m.branchRenameFrom = ""
+			m.branchRenameUpstream = false
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.branchRenameInput, cmd = m.branchRenameInput.Update(msg)
 			return m, cmd
 		}
 	}
@@ -306,6 +364,26 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchCreateInput.Focus()
 		m.branchCreateInput.Reset()
 		return m, nil
+	case "r":
+		if len(m.branchEntries) == 0 {
+			return m, nil
+		}
+		entry := m.branchEntries[m.branchCursor]
+		if entry.IsRemote {
+			// There is no local branch to move, and renaming on origin is a
+			// push-and-delete, not a rename.
+			m.err = fmt.Errorf("cannot rename %s — it only exists on origin. Switch to it first (enter), then rename", entry.Name)
+			return m, nil
+		}
+		m.branchRenameMode = true
+		m.branchRenameFrom = entry.Name
+		// Read once, here: the confirm line has to disclose that the rename is
+		// local, and a View func must never fork git to find out.
+		m.branchRenameUpstream = git.HasUpstream(entry.Name)
+		m.branchRenameInput.SetValue(entry.Name)
+		m.branchRenameInput.CursorEnd()
+		m.branchRenameInput.Focus()
+		return m, nil
 	case "d":
 		if len(m.branchEntries) == 0 {
 			return m, nil
@@ -376,8 +454,11 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		// The branch may have changed under us — resolve it first, since the
-		// shared return path reads status and graphs against it.
+		// shared return path reads status and graphs against it. Switching out
+		// of a detached HEAD is the whole reason this screen stays reachable
+		// there, so the flag the menu gates on is re-read with it.
 		m.branch, _ = git.GetCurrentBranch()
+		m.detached = git.IsDetachedHead()
 		cmd := m.returnToMenu()
 		return m, cmd
 	case "q":
@@ -426,10 +507,30 @@ func (m Model) viewBranch() string {
 			b.WriteString("\n  " + formatError(m.err) + "\n")
 		}
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"enter", "create"},
-			{"esc", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
+		return m.styledBox(b.String())
+	}
+
+	// ── Rename mode ────────────────────────────────────
+	if m.branchRenameMode {
+		b.WriteString("  Rename " + branchStyle.Render(m.branchRenameFrom) + " to:\n\n")
+		b.WriteString("  " + m.branchRenameInput.View() + "\n")
+		if m.branchRenameUpstream {
+			// `git branch -m` moves nothing on the remote. A beginner who
+			// renames a pushed branch and then looks at GitHub has no way to
+			// guess that from anywhere else.
+			b.WriteString("\n  " + dimStyle.Render(symWarn+" origin still has "+m.branchRenameFrom+
+				" — the rename is local only.") + "\n")
+		}
+		if m.branchRenaming {
+			b.WriteString("\n  " + m.spinner.View() + " " + dimStyle.Render("Renaming...") + "\n")
+		}
+		// Name validation lands here, so the error has to render on this screen.
+		if m.err != nil {
+			b.WriteString("\n  " + formatError(m.err) + "\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -438,10 +539,7 @@ func (m Model) viewBranch() string {
 		entry := m.branchEntries[m.branchCursor]
 		b.WriteString("  " + modifiedStyle.Render("Delete branch "+entry.Name+"?") + "\n")
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "confirm"},
-			{"any", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -453,10 +551,7 @@ func (m Model) viewBranch() string {
 			dimStyle.Render("(y/N)") + "\n")
 		b.WriteString("  " + dimStyle.Render("Those commits become unreachable — only `git reflog` can find them.") + "\n")
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "force delete"},
-			{"any", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -483,11 +578,7 @@ func (m Model) viewBranch() string {
 			b.WriteString(fmt.Sprintf("%s%s%s\n", cursor, name, label))
 		}
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"enter", "select"},
-			{"esc", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -507,10 +598,7 @@ func (m Model) viewBranch() string {
 		}
 		b.WriteString("  " + dimStyle.Render("Creates a merge commit (--no-ff). Uncommitted changes are stashed and restored.") + "\n")
 		b.WriteString("\n")
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "confirm"},
-			{"any", "cancel"},
-		}))
+		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
 	}
 
@@ -612,19 +700,7 @@ func (m Model) viewBranch() string {
 
 	// Help bar
 	b.WriteString("\n")
-	entries := []helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "switch"},
-		{"c", "create"},
-		{"d", "delete"},
-		{"m", "merge"},
-	}
-	if m.branchStandalone {
-		entries = append(entries, helpEntry{"q", "quit"})
-	} else {
-		entries = append(entries, helpEntry{"esc", "back"})
-	}
-	b.WriteString(renderHelp(entries))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

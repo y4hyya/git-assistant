@@ -217,7 +217,28 @@ func PushInitial(branch string) error {
 	return nil
 }
 
-// GetCurrentBranch returns the name of the current branch.
+// DetachedLabel is what GetCurrentBranch answers when HEAD is on no branch at
+// all. It is a DISPLAY string and nothing else: it is not a ref, `git checkout
+// "HEAD (detached)"` is a fatal, and pushing it would try to create a remote
+// branch of that name. Anything that has to change BEHAVIOUR in this state must
+// ask IsDetachedHead rather than compare against this constant.
+const DetachedLabel = "HEAD (detached)"
+
+// IsDetachedHead reports whether HEAD points straight at a commit instead of at
+// a branch — after `git checkout <sha>`, a tag, or a bisect. Commits made there
+// belong to no branch and are only reachable through the reflog.
+//
+// `symbolic-ref --quiet HEAD` is the exact question: it exits non-zero only when
+// HEAD is not a symref. An unborn HEAD (a fresh `git init`, no commits yet) is
+// still a symref pointing at refs/heads/<default>, so it correctly reports
+// false — that repository is on a branch, it just has nothing on it.
+func IsDetachedHead() bool {
+	return exec.Command("git", "symbolic-ref", "--quiet", "HEAD").Run() != nil
+}
+
+// GetCurrentBranch returns the name of the current branch, or DetachedLabel when
+// there is none. See DetachedLabel: callers that do more than print it must gate
+// on IsDetachedHead first.
 func GetCurrentBranch() (string, error) {
 	out, err := exec.Command("git", "branch", "--show-current").Output()
 	if err != nil {
@@ -225,7 +246,7 @@ func GetCurrentBranch() (string, error) {
 	}
 	branch := strings.TrimSpace(string(out))
 	if branch == "" {
-		return "HEAD (detached)", nil
+		return DetachedLabel, nil
 	}
 	return branch, nil
 }
@@ -508,6 +529,92 @@ func UndoLastCommit() error {
 	out, err := exec.Command("git", "reset", "--soft", "HEAD~1").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("undo failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Revert records a NEW commit that undoes sha, leaving sha itself in history.
+// It is the counterpart to UndoLastCommit for work that is already on origin:
+// undo rewrites the branch and needs a force push afterwards, revert only adds
+// to it and pushes normally.
+//
+// --no-edit keeps git from opening $EDITOR inside our alt-screen TUI; the
+// generated "Revert "<subject>"" message is exactly what the screen promised.
+// A conflicting revert leaves the sequencer mid-flight — callers must
+// RevertAbort, there is no in-TUI conflict resolution.
+func Revert(sha string) error {
+	if strings.TrimSpace(sha) == "" {
+		return errors.New("no commit to revert")
+	}
+	out, err := exec.Command("git", "revert", "--no-edit", sha).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("revert failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// RevertAbort cancels a revert that stopped on conflicts and puts the working
+// tree back where it started. Best-effort: callers run it on the failure path,
+// where a second error has nothing to add.
+func RevertAbort() error {
+	out, err := exec.Command("git", "revert", "--abort").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// DiscardFile throws one entry's changes away, routed by what the entry
+// actually is. Every branch below is destructive and none of them is
+// recoverable through git — the confirmation in front of this call is the only
+// safety there is, which is why the routing lives here rather than in the UI:
+// the sentence on screen and the command that runs must be decided by the same
+// switch.
+//
+//   - untracked: git has never seen this path, so there is nothing to restore
+//     it FROM. Discarding means deleting it off disk.
+//   - renamed: both halves or neither. Restoring only the new path leaves the
+//     old one deleted — half a rename, and a working tree in a state the user
+//     never asked for.
+//   - deleted: the same restore resurrects the file from HEAD. `x` on a deleted
+//     entry is the one case that CREATES something.
+//   - added: `git add`ed but never committed. restore --staged --worktree
+//     unstages it and removes it, because HEAD has no version to fall back to.
+//   - modified (and everything else): back to the last committed content.
+func DiscardFile(f types.FileEntry) error {
+	path := strings.TrimSpace(f.Path)
+	if path == "" {
+		return errors.New("no file to discard")
+	}
+	switch f.Status {
+	case types.StatusUntracked:
+		// RemoveAll, not Remove: `--untracked-files=all` expands untracked
+		// directories into their files, except an embedded repository, which
+		// git reports as the single directory entry it is.
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("could not delete %s: %w", path, err)
+		}
+		return nil
+	case types.StatusRenamed:
+		paths := []string{path}
+		if f.OrigPath != "" && f.OrigPath != path {
+			paths = append(paths, f.OrigPath)
+		}
+		return restorePaths(paths)
+	default:
+		return restorePaths([]string{path})
+	}
+}
+
+// restorePaths runs the one restore both the index and the working tree see.
+// --staged without --worktree would leave the edits on disk (the file still
+// differs from HEAD, just unstaged), which is not what "discard" means to
+// anyone.
+func restorePaths(paths []string) error {
+	args := append([]string{"restore", "--worktree", "--staged", "--"}, paths...)
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("discard failed: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -1311,6 +1418,49 @@ func DeleteBranch(name string, force bool) error {
 			return fmt.Errorf("%w: %s", ErrBranchNotMerged, msg)
 		}
 		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
+// BranchExists reports whether a LOCAL branch of that name is already there.
+// Asked before a rename so the refusal can name the collision instead of
+// forwarding git's bare "fatal: a branch named 'x' already exists".
+func BranchExists(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	return exec.Command("git", "show-ref", "--verify", "--quiet",
+		"refs/heads/"+name).Run() == nil
+}
+
+// RenameBranchTo renames an existing local branch. Unlike RenameBranch (which
+// is `-M` on whatever is checked out, used once during init), this is the safe
+// `-m` form and names both ends, so it works on a branch you are not standing
+// on and refuses to clobber an existing name.
+//
+// Purely local. `git branch -m` moves the branch's config section along with
+// it, so a renamed branch keeps tracking the SAME remote-tracking ref: origin
+// still holds the old name until something pushes the new one. Callers say so —
+// a beginner who renames a pushed branch and sees no change on GitHub has no
+// way to guess that from here.
+func RenameBranchTo(oldName, newName string) error {
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if oldName == "" || newName == "" {
+		return errors.New("branch rename needs both names")
+	}
+	if oldName == newName {
+		return fmt.Errorf("%s is already called that", oldName)
+	}
+	if err := CheckRefFormatBranch(newName); err != nil {
+		return err
+	}
+	if BranchExists(newName) {
+		return fmt.Errorf("a branch named %s already exists — pick another name", newName)
+	}
+	out, err := exec.Command("git", "branch", "-m", oldName, newName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

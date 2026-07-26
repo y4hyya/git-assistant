@@ -332,41 +332,7 @@ func (m Model) viewMessage() string {
 
 	// Help bar
 	b.WriteString("\n")
-	switch f {
-	case focusScope:
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"enter/tab", "subject"},
-			{"esc", "back"},
-		}))
-	case focusBody:
-		tabTarget := "scope"
-		if m.amendRaw {
-			tabTarget = "subject"
-		}
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "move"},
-			{"ctrl+d", "next"},
-			{"tab", tabTarget},
-			{"esc", "subject"},
-		}))
-	default:
-		// Raw amends have no scope field, so esc leaves the step entirely.
-		escTarget := "scope"
-		if m.amendRaw {
-			escTarget = "back"
-		}
-		tabTarget := "add body"
-		if m.showBody {
-			tabTarget = "body"
-		}
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"enter", "next"},
-			{"tab", tabTarget},
-			{"esc", escTarget},
-		}))
-	}
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

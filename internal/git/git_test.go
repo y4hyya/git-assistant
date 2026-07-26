@@ -1363,3 +1363,255 @@ func TestMergeWasNoOpMatchesBothSpellings(t *testing.T) {
 		t.Error("a real merge was classified as a no-op")
 	}
 }
+
+// ── Discarding a file's changes ────────────────────────
+
+// fileExists is the "is it on disk at all" check the discard tests need —
+// os.Stat follows symlinks, and a discarded symlink is gone either way.
+func fileExists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// Each status routes to a different operation, and getting one wrong destroys
+// something the confirmation did not warn about: restoring an untracked file
+// fails outright, deleting a modified one throws away the committed version too.
+func TestDiscardFileRoutesByStatus(t *testing.T) {
+	scratchRepo(t)
+	write(t, "modified.txt", "committed\n")
+	write(t, "deleted.txt", "committed\n")
+	write(t, "renamed.txt", "committed\n")
+	commitAll(t, "seed")
+
+	write(t, "modified.txt", "edited\n")
+	if err := os.Remove("deleted.txt"); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "mv", "renamed.txt", "moved.txt")
+	write(t, "untracked.txt", "brand new\n")
+	write(t, "staged-new.txt", "brand new\n")
+	runGit(t, "add", "staged-new.txt")
+	write(t, "junk/inner.txt", "in an untracked folder\n")
+
+	before := statusByPath(t)
+	for _, want := range []struct {
+		path   string
+		status types.FileStatus
+	}{
+		{"modified.txt", types.StatusModified},
+		{"deleted.txt", types.StatusDeleted},
+		{"moved.txt", types.StatusRenamed},
+		{"untracked.txt", types.StatusUntracked},
+		{"staged-new.txt", types.StatusAdded},
+		{"junk/inner.txt", types.StatusUntracked},
+	} {
+		if got, ok := before[want.path]; !ok || got.Status != want.status {
+			t.Fatalf("fixture: %s is %v (present=%v), want %v", want.path, got.Status, ok, want.status)
+		}
+	}
+
+	for _, path := range []string{"modified.txt", "deleted.txt", "moved.txt",
+		"untracked.txt", "staged-new.txt", "junk/inner.txt"} {
+		if err := DiscardFile(before[path]); err != nil {
+			t.Fatalf("DiscardFile(%s): %v", path, err)
+		}
+	}
+
+	// Modified: back to the committed content, and unstaged with it.
+	if got := readFileString(t, "modified.txt"); got != "committed\n" {
+		t.Errorf("modified.txt = %q, want the committed content back", got)
+	}
+	// Deleted: x resurrects, it does not delete harder.
+	if got := readFileString(t, "deleted.txt"); got != "committed\n" {
+		t.Errorf("deleted.txt = %q, want the file restored", got)
+	}
+	// Renamed: BOTH halves, or the working tree keeps half a rename.
+	if !fileExists(t, "renamed.txt") {
+		t.Error("renamed.txt did not come back — the rename was only half undone")
+	}
+	if fileExists(t, "moved.txt") {
+		t.Error("moved.txt still exists — the rename was only half undone")
+	}
+	// Untracked and staged-new: nothing to restore them from, so they go.
+	for _, path := range []string{"untracked.txt", "staged-new.txt", "junk/inner.txt"} {
+		if fileExists(t, path) {
+			t.Errorf("%s still exists — an uncommitted file's discard is a delete", path)
+		}
+	}
+
+	// Nothing is left over: a clean tree is the whole point.
+	if entries, err := GetStatus(); err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("working tree still dirty after discarding everything: %+v", entries)
+	}
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func TestDiscardFileRejectsAnEmptyPath(t *testing.T) {
+	scratchRepo(t)
+	if err := DiscardFile(types.FileEntry{}); err == nil {
+		t.Error("discarding a pathless entry should fail rather than run `git restore --`")
+	}
+}
+
+// ── Revert ─────────────────────────────────────────────
+
+func TestRevertAddsACommitInsteadOfRewriting(t *testing.T) {
+	scratchRepo(t)
+	write(t, "f.txt", "one\n")
+	commitAll(t, "first")
+	write(t, "f.txt", "two\n")
+	commitAll(t, "second")
+	second := strings.TrimSpace(runGit(t, "rev-parse", "HEAD"))
+
+	if err := Revert(second); err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	if got := readFileString(t, "f.txt"); got != "one\n" {
+		t.Errorf("f.txt = %q, want the pre-commit content", got)
+	}
+	// History GREW: the reverted commit is still there, which is what makes
+	// this the push-safe path.
+	if got := commitCount(t); got != "3" {
+		t.Errorf("commit count = %s, want 3 (revert adds, never replaces)", got)
+	}
+	if !strings.Contains(runGit(t, "log", "--format=%s"), "Revert \"second\"") {
+		t.Errorf("the revert commit does not name what it undid:\n%s",
+			runGit(t, "log", "--format=%s"))
+	}
+	if strings.TrimSpace(runGit(t, "rev-parse", "HEAD~1")) != second {
+		t.Error("the reverted commit is no longer HEAD~1 — this rewrote history")
+	}
+}
+
+func TestRevertConflictAbortsBackToWhereItStarted(t *testing.T) {
+	scratchRepo(t)
+	write(t, "f.txt", "a\nb\nc\n")
+	commitAll(t, "first")
+	write(t, "f.txt", "a\nB\nc\n")
+	commitAll(t, "second")
+	second := strings.TrimSpace(runGit(t, "rev-parse", "HEAD"))
+	write(t, "f.txt", "a\nZ\nc\n")
+	commitAll(t, "third")
+	head := strings.TrimSpace(runGit(t, "rev-parse", "HEAD"))
+
+	err := Revert(second)
+	if err == nil {
+		t.Fatal("reverting a commit whose lines have since moved should conflict")
+	}
+	if conflicts := GetConflictFiles(); len(conflicts) != 1 || conflicts[0] != "f.txt" {
+		t.Fatalf("conflict files = %v, want [f.txt]", conflicts)
+	}
+	if err := RevertAbort(); err != nil {
+		t.Fatalf("RevertAbort: %v", err)
+	}
+
+	if got := strings.TrimSpace(runGit(t, "rev-parse", "HEAD")); got != head {
+		t.Errorf("HEAD = %s after the abort, want %s", got, head)
+	}
+	if got := readFileString(t, "f.txt"); got != "a\nZ\nc\n" {
+		t.Errorf("f.txt = %q — the abort left conflict markers behind", got)
+	}
+	if entries, _ := GetStatus(); len(entries) != 0 {
+		t.Errorf("working tree dirty after the abort: %+v", entries)
+	}
+}
+
+func TestRevertRejectsAnEmptySHA(t *testing.T) {
+	scratchRepo(t)
+	if err := Revert("  "); err == nil {
+		t.Error("Revert(\"\") should fail rather than revert HEAD by accident")
+	}
+}
+
+// ── Branch rename ──────────────────────────────────────
+
+func TestRenameBranchToMovesLocalBranches(t *testing.T) {
+	scratchRepo(t)
+	write(t, "f.txt", "x\n")
+	commitAll(t, "seed")
+	runGit(t, "branch", "feature")
+	runGit(t, "branch", "taken")
+
+	// A branch you are not standing on.
+	if err := RenameBranchTo("feature", "feature-2"); err != nil {
+		t.Fatalf("RenameBranchTo: %v", err)
+	}
+	if BranchExists("feature") || !BranchExists("feature-2") {
+		t.Error("the rename did not move the branch")
+	}
+
+	// The branch you are on: the checkout follows it.
+	if err := RenameBranchTo("main", "trunk"); err != nil {
+		t.Fatalf("RenameBranchTo(current): %v", err)
+	}
+	if got, _ := GetCurrentBranch(); got != "trunk" {
+		t.Errorf("current branch = %q after renaming it, want trunk", got)
+	}
+
+	// Refusals, each with something the user can act on.
+	for _, tc := range []struct {
+		name     string
+		from, to string
+		want     string
+	}{
+		{"existing name", "trunk", "taken", "already exists"},
+		{"invalid name", "trunk", "has spaces", "not a valid branch name"},
+		{"same name", "trunk", "trunk", "already called that"},
+		{"empty", "trunk", "  ", "both names"},
+	} {
+		err := RenameBranchTo(tc.from, tc.to)
+		if err == nil {
+			t.Errorf("%s: rename was allowed", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %q does not mention %q", tc.name, err, tc.want)
+		}
+	}
+	// The refusals changed nothing.
+	if !BranchExists("trunk") || !BranchExists("taken") {
+		t.Error("a refused rename moved something anyway")
+	}
+}
+
+// ── Detached HEAD ──────────────────────────────────────
+
+func TestIsDetachedHead(t *testing.T) {
+	scratchRepo(t)
+	// Unborn: on a branch that has nothing on it yet, which is NOT detached.
+	if IsDetachedHead() {
+		t.Error("a fresh repo with no commits is on a branch, not detached")
+	}
+	write(t, "f.txt", "x\n")
+	commitAll(t, "seed")
+	if IsDetachedHead() {
+		t.Error("IsDetachedHead is true on an ordinary branch")
+	}
+	if got, _ := GetCurrentBranch(); got != "main" {
+		t.Errorf("current branch = %q, want main", got)
+	}
+
+	runGit(t, "checkout", "-q", "--detach", "HEAD")
+	if !IsDetachedHead() {
+		t.Error("IsDetachedHead is false after `git checkout --detach`")
+	}
+	if got, _ := GetCurrentBranch(); got != DetachedLabel {
+		t.Errorf("current branch = %q while detached, want the %q label", got, DetachedLabel)
+	}
+	// The label is a label. Nothing may hand it to git as a ref.
+	if BranchExists(DetachedLabel) {
+		t.Error("DetachedLabel resolves as a branch name")
+	}
+}

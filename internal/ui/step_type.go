@@ -114,13 +114,7 @@ func (m Model) viewType() string {
 
 	// Help bar
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "select"},
-		{"!", "breaking"},
-		{"esc", "back"},
-		{"q", "quit"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }
@@ -208,10 +202,7 @@ func (m Model) viewCustom() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "confirm"},
-		{"esc", "back"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

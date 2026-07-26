@@ -106,19 +106,7 @@ func (m Model) viewDone() string {
 
 	// Help bar
 	b.WriteString("\n")
-	entries := []helpEntry{}
-	if m.canPushFromDone() {
-		label := "push now"
-		if m.amendMode && m.amendPushed {
-			label = "push now (force-with-lease)"
-		}
-		entries = append(entries, helpEntry{"p", label})
-	}
-	entries = append(entries,
-		helpEntry{"enter/esc", "menu"},
-		helpEntry{"q", "quit"},
-	)
-	b.WriteString(renderHelp(entries))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

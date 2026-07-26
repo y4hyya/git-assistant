@@ -28,11 +28,13 @@ An interactive TUI git dashboard built with Go and [Bubble Tea](https://github.c
 - Conventional commit types — `feat / fix / docs / refactor / style / test / chore / ci / perf / build`, plus custom types.
 - Optional `scope` inline with the subject; optional body (toggle with `tab`); `!` toggle for breaking-change commits.
 - Empty subjects are rejected with a clear inline error.
-- Undo last commit (`u`) with a confirmation prompt.
+- Discard a file's changes (`x`) with a confirmation that states exactly what is lost — and that adapts to the file's status: modified files are restored from the last commit, untracked files are deleted, renames are undone, and a **deleted** file is brought back (the key relabels itself `restore`).
+- Undo last commit (`u`) with a confirmation prompt. If the commit is already on origin the prompt offers both exits: `u` undoes anyway (rewrites history, force-push after) or `r` **reverts** instead — a new commit that undoes it, safe for pushed work. A conflicting revert aborts itself and reports that nothing changed.
 
 ### Branch manager
 Reachable from the menu, from the file selector (`b`), or directly via `git-assist branch`.
-- Switch, create, and delete branches. `main` / `master` and the current branch are protected from deletion.
+- Switch, create, rename (`r`), and delete branches. `main` / `master` and the current branch are protected from deletion.
+- Renaming discloses that `git branch -m` is local only: if the branch has an upstream, both the prompt and the result say origin still has the old name.
 - Auto-stash and restore around branch switches and pulls — **includes untracked files**. If a stash-pop conflicts, the short SHA of your stash is surfaced so you can recover with `git stash apply <sha>`.
 - Merge with `--no-ff` so the fork/merge diamond is always visible in the graph.
 - Merge target picker — choose which branch to merge **into** with a direction arrow; auto-switches to the target first if needed.
@@ -68,6 +70,8 @@ A "Connect to GitHub" recovery entry appears in the menu when an existing repo h
 - Unified commit graph on the main menu — compact one-line-per-commit on linear history, with branch / fork / merge connectors for divergence points.
 - Branch decorations colored in the graph.
 - "N behind main" warning on the dashboard.
+- Press `?` on any non-typing screen for an overlay listing exactly the keys that screen responds to — sourced from the same data the footers render, so it can never drift.
+- Detached-HEAD guard: a warning banner on the dashboard, and everything that assumes a branch (commit, amend, push, sync) is hidden until you switch to one.
 - Spinner animations during async ops; input is blocked during destructive operations.
 - Unicode symbols with automatic ASCII fallback when the terminal doesn't support them.
 - Respects `NO_COLOR=1` and the `--no-color` flag.
@@ -93,6 +97,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ```bash
 git-assist               # interactive dashboard
 git-assist branch        # jump straight into the branch manager
+git-assist --help        # usage (also -h, or `git-assist help`)
 git-assist --version     # show installed version
 git-assist --no-color    # disable color (also respects NO_COLOR=1)
 ```
@@ -105,6 +110,7 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | Key | Action |
 |-----|--------|
 | `q` | Quit (from any top-level screen) |
+| `?` | Show this screen's keys (any screen without a focused text field) |
 | `ctrl+c` | Force quit |
 | `esc` | Back / cancel (context-dependent) |
 
@@ -124,9 +130,10 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `a` | Select / deselect all |
 | `/` | Fuzzy filter |
 | `d` | Diff preview |
+| `x` | Discard this file's changes (delete if untracked, restore if deleted) |
 | `b` | Open branch manager |
 | `g` | Gitignore mode |
-| `u` | Undo last commit |
+| `u` | Undo last commit (`r` reverts instead when the commit is pushed) |
 | `enter` | Continue to commit type |
 
 ### Diff preview
@@ -157,6 +164,7 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `↑↓` | Navigate |
 | `enter` | Switch to selected branch |
 | `c` | Create branch |
+| `r` | Rename branch (local branches only) |
 | `d` | Delete branch |
 | `m` | Merge (opens target picker) |
 | `esc` | Back to menu |
@@ -196,9 +204,10 @@ internal/
   ui/
     model.go               Bubble Tea Model, step enum, async msg handlers
     layout.go, styles.go   Rendering helpers + color/symbol system
+    help.go                Per-screen key lists — footers and the ? overlay
     step_menu.go           Main menu hub with commit graph
-    step_files.go          File selector, diff, edit, gitignore, undo, filter
-    step_branch.go         Branch manager
+    step_files.go          File selector, diff, edit, gitignore, discard, undo/revert, filter
+    step_branch.go         Branch manager (switch, create, rename, delete, merge)
     step_config.go         Config editor
     step_init.go           First-run init flow
     step_sync.go           Pull / sync-with-main dialog

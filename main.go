@@ -13,11 +13,44 @@ import (
 // Defaults to "dev" for ad-hoc `go build` invocations.
 var Version = "dev"
 
+// usage is the whole command-line surface, hand-formatted. The flag package's
+// default output described none of this: the dashboard is the default action,
+// `branch` is the only subcommand, and the two flags are not registered with
+// flag at all — `git-assist --help` used to print nothing and fall through to
+// launching the TUI, which reads as the help being broken.
+const usage = `git-assist — an interactive TUI git dashboard
+
+USAGE
+  git-assist [command] [flags]
+
+COMMANDS
+  (none)      open the dashboard: commit, amend, push, branches, config
+  branch      jump straight into the branch manager
+  help        show this help
+
+FLAGS
+  -h, --help       show this help
+  -v, --version    print the version and exit
+      --no-color   disable colours (same as NO_COLOR=1 in the environment)
+
+NOTES
+  Run it anywhere inside a repository — git-assist moves to the repository root
+  itself, so paths and .gitignore resolve the way git reports them.
+
+  Run it outside a repository and it offers first-run setup (git init, connect
+  an existing GitHub repo, or create one with the gh CLI) instead of failing.
+
+  Press ? on any screen for the keys that screen responds to.
+`
+
 func main() {
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "--version", "-v":
 			fmt.Printf("git-assist %s\n", Version)
+			return
+		case "--help", "-h", "help":
+			fmt.Print(usage)
 			return
 		case "--no-color":
 			os.Setenv("NO_COLOR", "1")

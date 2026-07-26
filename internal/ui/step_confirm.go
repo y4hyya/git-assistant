@@ -250,16 +250,7 @@ func (m Model) viewConfirm() string {
 
 	// Help bar — scroll keys only when there is something to scroll.
 	b.WriteString("\n")
-	entries := []helpEntry{}
-	if len(selected) > rows {
-		entries = append(entries, helpEntry{symArrows, "scroll files"})
-	}
-	entries = append(entries,
-		helpEntry{"enter", "commit"},
-		helpEntry{"esc", "back"},
-		helpEntry{"q", "quit"},
-	)
-	b.WriteString(renderHelp(entries))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

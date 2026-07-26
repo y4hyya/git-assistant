@@ -59,6 +59,24 @@ type undoResultMsg struct {
 	err   error
 	files []types.FileEntry
 }
+
+// revertResultMsg carries the outcome of the undo prompt's OTHER exit: a new
+// commit that undoes the last one. subject is the reverted commit's subject,
+// read before the operation so the note can name what was undone.
+type revertResultMsg struct {
+	err     error
+	subject string
+	files   []types.FileEntry
+}
+
+// discardResultMsg carries the outcome of `x` on one file. entry is the entry
+// the confirmation was about — the note's wording depends on its status, and by
+// the time this lands the file list has been replaced.
+type discardResultMsg struct {
+	err   error
+	entry types.FileEntry
+	files []types.FileEntry
+}
 type saveResultMsg struct {
 	err   error
 	files []types.FileEntry
@@ -73,6 +91,16 @@ type branchSwitchResultMsg struct {
 type branchCreateResultMsg struct {
 	err       error
 	newBranch string
+}
+type branchRenameResultMsg struct {
+	err      error
+	from, to string
+	// wasCurrent decides whether m.branch has to follow the rename; hadUpstream
+	// decides whether the note has to disclose that origin still has the old
+	// name. Both are read when the prompt opens, not after the rename, when the
+	// branch they describe no longer exists.
+	wasCurrent  bool
+	hadUpstream bool
 }
 type branchDeleteResultMsg struct {
 	err error
@@ -238,14 +266,23 @@ type Model struct {
 	// branchCreating/branchDeleting block input while those ops are in
 	// flight. Without them a double-enter fired two creates (the loser
 	// reporting "already exists") and left the dying branch interactive.
-	branchCreating     bool
-	branchDeleting     bool
-	branchMergePending string
-	mergeSource        string
-	mergeTarget        string
-	mergeTargetMode    bool
-	mergeTargets       []types.BranchEntry
-	mergeTargetCursor  int
+	branchCreating bool
+	branchDeleting bool
+	// branchRename* drive `r` on a local branch: an inline input prefilled with
+	// the current name. branchRenameUpstream is read when the prompt opens —
+	// `git branch -m` is purely local, and a branch origin already has needs to
+	// say so before the rename, not after.
+	branchRenameMode     bool
+	branchRenameInput    textinput.Model
+	branchRenameFrom     string
+	branchRenameUpstream bool
+	branchRenaming       bool
+	branchMergePending   string
+	mergeSource          string
+	mergeTarget          string
+	mergeTargetMode      bool
+	mergeTargets         []types.BranchEntry
+	mergeTargetCursor    int
 
 	// Config editor
 	configCursor     int
@@ -274,6 +311,20 @@ type Model struct {
 	// read at the same moment for the same reason: viewFiles used to call
 	// git.GetLastCommitMessage() on every frame the prompt was up.
 	undoSubject string
+	// undoSHA is the commit the prompt is about, by name. The revert path needs
+	// an explicit target rather than "HEAD": a revert must undo the commit the
+	// screen described, whatever has happened since.
+	undoSHA string
+	// reverting marks `git revert` in flight — the prompt's second exit, for a
+	// commit that is already on origin.
+	reverting bool
+
+	// Discard confirmation (x on the file selector). discardEntry is the entry
+	// the prompt opened on, cached because the file list is replaced the moment
+	// the discard lands and the note still has to describe what was discarded.
+	confirmDiscard bool
+	discarding     bool
+	discardEntry   types.FileEntry
 
 	// Step 4 — push
 	hasRemote  bool
@@ -438,6 +489,17 @@ type Model struct {
 	syncAhead    int
 	syncDiverged bool
 
+	// showHelp puts the `?` overlay over the current screen. Not a step: it has
+	// no state of its own, it lists whatever keys the screen underneath
+	// responds to (see helpRows) and esc/? puts it away again.
+	showHelp bool
+
+	// detached records that HEAD is on no branch at all. m.branch still holds
+	// git.DetachedLabel for display, but that string is not a ref: every screen
+	// that would hand it to git — commit, amend, push, sync — is gated on this
+	// flag instead of on the label. Refreshed with the dashboard snapshot.
+	detached bool
+
 	// Terminal dimensions
 	width    int
 	height   int
@@ -511,6 +573,11 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	bci.CharLimit = 100
 	bci.Width = 40
 
+	bri := textinput.New()
+	bri.Placeholder = "new-name-for-this-branch"
+	bri.CharLimit = 100
+	bri.Width = 40
+
 	cfi := textinput.New()
 	cfi.Placeholder = "Enter value..."
 	cfi.CharLimit = 200
@@ -526,6 +593,7 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	m := Model{
 		step:              stepMenu,
 		branchCreateInput: bci,
+		branchRenameInput: bri,
 		configEditInput:   cfi,
 		files:             files,
 		branch:            branch,
@@ -614,6 +682,9 @@ type dashboardSnapshot struct {
 	mainRef      string
 	branchCount  int
 	hasAnyCommit bool
+	// detached: HEAD is on no branch. Read here with everything else so the
+	// dashboard's gating never depends on a git call made inside Update.
+	detached bool
 
 	files   []types.FileEntry
 	filesOK bool // false when withStatus was off, or git status failed
@@ -636,6 +707,7 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 	snap.mainRef = main.Ref
 	snap.branchCount = len(git.GetAllBranches())
 	snap.hasAnyCommit = git.HasAnyCommit()
+	snap.detached = git.IsDetachedHead()
 	if withStatus {
 		if files, err := git.GetStatus(); err == nil {
 			snap.files = files
@@ -663,6 +735,7 @@ func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.mainRef = s.mainRef
 	m.branchCount = s.branchCount
 	m.hasAnyCommit = s.hasAnyCommit
+	m.detached = s.detached
 	if s.filesOK && m.step == stepMenu {
 		m.files = s.files
 		m.cursor = 0
@@ -904,7 +977,10 @@ func (m Model) opInFlight() bool {
 		m.branchMerging ||
 		m.branchCreating ||
 		m.branchDeleting ||
+		m.branchRenaming ||
 		m.undoing ||
+		m.reverting ||
+		m.discarding ||
 		m.gitignoring ||
 		m.pulling ||
 		m.initWorking
@@ -973,6 +1049,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scopeInput.Width = min(inputWidth, 50)
 		m.filterInput.Width = min(inputWidth, 60)
 		m.branchCreateInput.Width = min(inputWidth, 50)
+		m.branchRenameInput.Width = min(inputWidth, 50)
 		m.configEditInput.Width = min(inputWidth, 50)
 		// The init inputs used to keep the fixed width setupInitModel gave them,
 		// so on a narrow terminal the URL field ran past the box border.
@@ -1007,6 +1084,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wasPushed := m.undoPushed
 		m.undoPushed = false
 		m.undoSubject = ""
+		m.undoSHA = ""
 		m.startResult()
 		if msg.err != nil {
 			m.err = msg.err
@@ -1031,6 +1109,89 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setStatusNote("Undid the last commit — its changes are back, staged and ready to re-commit")
 		// Without this the menu graph still shows the undone commit, which
 		// reads as "undo failed" and invites a second, destructive undo.
+		return m, m.requestDashboardRefresh()
+
+	case revertResultMsg:
+		m.confirmUndo = false
+		m.reverting = false
+		m.undoPushed = false
+		m.undoSubject = ""
+		m.undoSHA = ""
+		m.startResult()
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		// Deliberately NOT historyRewritten: a revert adds a commit, it does not
+		// replace one, so the next push is an ordinary push. That is the entire
+		// reason this path exists next to undo.
+		//
+		// resetWizard for the same reason undo needs it: HEAD is a different
+		// commit now, and a latched amendMode would rewrite the revert commit
+		// with the old commit's message.
+		m.resetWizard()
+		m.files = msg.files
+		m.cursor = 0
+		m.fileScroll = 0
+		subject := msg.subject
+		if subject == "" {
+			subject = "the last commit"
+		}
+		m.setStatusNote("Reverted %s — a new commit undoes it", subject)
+		return m, m.requestDashboardRefresh()
+
+	case discardResultMsg:
+		m.confirmDiscard = false
+		m.discarding = false
+		m.discardEntry = types.FileEntry{}
+		m.startResult()
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.files = msg.files
+		// The discarded entry is gone from the list, so the cursor can be past
+		// its end — the next frame indexes it for the status badge and the
+		// footer's own `x` label.
+		if m.cursor >= len(m.files) {
+			m.cursor = max(0, len(m.files)-1)
+		}
+		if m.fileScroll > m.cursor {
+			m.fileScroll = m.cursor
+		}
+		// Same switch the confirmation's wording came from, so the report and the
+		// question can never describe different operations.
+		m.setStatusNote("%s", discardActionFor(msg.entry).note)
+		return m, nil
+
+	case branchRenameResultMsg:
+		m.branchRenaming = false
+		m.startResult()
+		if msg.err != nil {
+			// Rename mode stays on so the name can be fixed in place.
+			m.err = msg.err
+			return m, nil
+		}
+		m.branchRenameMode = false
+		m.branchRenameInput.Reset()
+		m.branchRenameFrom = ""
+		m.branchRenameUpstream = false
+		if msg.wasCurrent {
+			m.branch = msg.to
+		}
+		m.branchEntries = git.GetAllBranches()
+		if m.branchCursor >= len(m.branchEntries) {
+			m.branchCursor = max(0, len(m.branchEntries)-1)
+		}
+		if msg.hadUpstream {
+			// `git branch -m` is local: the branch keeps tracking the ref it had,
+			// and origin keeps the old name until something pushes the new one.
+			m.setStatusNote("Renamed %s to %s — origin still has %s, so push when you're ready",
+				msg.from, msg.to, msg.from)
+		} else {
+			m.setStatusNote("Renamed %s to %s", msg.from, msg.to)
+		}
+		// The graph decorations and the ahead/behind chip both name the branch.
 		return m, m.requestDashboardRefresh()
 
 	case saveResultMsg:
@@ -1213,6 +1374,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// read before the post-switch refresh replaces the list.
 		carried := len(m.files)
 		m.branch = msg.newBranch
+		// Whatever HEAD was before, it is a branch now — switching away is the
+		// cure for a detached HEAD, and the menu unlocks again on this line.
+		m.detached = false
 		// The rewrite belonged to the branch we just left.
 		m.historyRewritten = false
 		m.branchEntries = git.GetAllBranches()
@@ -1262,6 +1426,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.branch = msg.newBranch
+		// `git checkout -b` leaves HEAD on the new branch, detached or not.
+		m.detached = false
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
@@ -1485,6 +1651,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Any other keypress disarms the force-quit prompt.
 		m.forceQuitArmed = false
+
+		// The `?` overlay, handled before anything else clears: it is a read-only
+		// side channel, so opening or closing it must not wipe an error banner or
+		// a status note the user is still reading, and no key of the screen
+		// underneath may fire while it is up.
+		if m.showHelp {
+			switch msg.String() {
+			case "?", "esc":
+				m.showHelp = false
+			}
+			return m, nil
+		}
+		if msg.String() == "?" && m.helpAvailable() {
+			m.showHelp = true
+			return m, nil
+		}
 		// Clear error on any keypress — except recovery errors, which carry a
 		// stash SHA the user still has to copy. An arrow key used to be enough
 		// to destroy the only in-app record of it. Those are dismissed
@@ -1548,6 +1730,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	if m.quitting {
 		return ""
+	}
+
+	// The help overlay replaces the screen it describes rather than floating
+	// over it: a TUI has no z-order, and half-covered content behind a key list
+	// is harder to read than the list alone.
+	if m.showHelp {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.viewHelp())
 	}
 
 	var content string

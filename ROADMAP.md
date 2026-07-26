@@ -91,12 +91,13 @@ These would substantially improve the tool but are not bugs.
 
 - **`--amend`** flow for fixing the last commit without losing the message
 - **Conflict resolution UI** — currently a conflict kicks the user to terminal; an in-TUI conflict-file picker + "mark resolved" + "abort" would close the loop
-- **Branch rename** — common operation, not exposed
+- ~~**Branch rename** — common operation, not exposed~~ **Built** — `r` in the branch manager, with the "origin still has the old name" disclosure
 - ~~**`--force-with-lease` push** — for rebased branches, with safety~~ **Built** — see M30; the Done screen and the dashboard route into it instead of printing the command
+- ~~**Discard a file's changes**~~ **Built** — `x` in the file selector, routed per status with a confirmation that names what is lost
 - **Stash management** — list / apply / drop entries; right now stashes created by auto-stash become orphans the user manages from the terminal
-- **Revert / cherry-pick** — useful for the target audience (git beginners)
-- **`git-assist --help`** — there's no help output for the CLI itself
-- **Detached-HEAD UI** — `GetCurrentBranch` returns `"HEAD (detached)"` but no special-case handling; most operations fail in confusing ways
+- ~~**Revert**~~ **Built** — `r` on the undo prompt when the commit is already pushed (`git revert --no-edit`, auto-aborts on conflict). **Cherry-pick** is still not exposed.
+- ~~**`git-assist --help`** — there's no help output for the CLI itself~~ **Built** — hand-formatted usage for `--help` / `-h` / `help`, plus the in-app `?` overlay
+- ~~**Detached-HEAD UI** — `GetCurrentBranch` returns `"HEAD (detached)"` but no special-case handling; most operations fail in confusing ways~~ **Built** — `git.IsDetachedHead()` drives a dashboard banner and hides every branch-assuming action; the branch manager stays open as the way out
 - **Worktree awareness** — multiple worktrees of the same repo share `.git/config` but have independent indexes; no detection
 - **Pattern syntax help in gitignore mode** — no hint about `*`, `!`, trailing `/`
 

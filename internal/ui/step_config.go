@@ -349,34 +349,12 @@ func (m Model) viewConfig() string {
 
 	// Help bar
 	b.WriteString("\n")
-	switch {
-	case m.configRemoveRemote:
-		b.WriteString(renderHelp([]helpEntry{
-			{"y", "remove"},
-			{"any", "keep"},
-		}))
-	case m.configPickMode:
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"enter", "select"},
-			{"esc", "cancel"},
-		}))
-	case m.configEditMode:
-		b.WriteString(renderHelp([]helpEntry{
-			{"enter", "save"},
-			{"tab", "scope (cancels edit)"},
-			{"esc", "cancel"},
-		}))
+	b.WriteString(renderHelpRows(m.helpRows()))
+	if m.configEditMode && !m.configPickMode && !m.configRemoveRemote {
+		// Not a key, a consequence: an empty field UNSETS the key rather than
+		// writing an empty value.
 		b.WriteString("\n")
 		b.WriteString("  " + dimStyle.Render("Clearing the field unsets the key.") + "\n")
-	default:
-		b.WriteString(renderHelp([]helpEntry{
-			{symArrows, "navigate"},
-			{"enter", "edit"},
-			{"tab", "scope"},
-			{"esc", "back"},
-			{"q", "quit"},
-		}))
 	}
 
 	return m.styledBox(b.String())

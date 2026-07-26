@@ -603,11 +603,7 @@ func (m Model) viewInitPickOption() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "select"},
-		{"q", "quit"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 
@@ -629,12 +625,7 @@ func (m Model) viewInitPickTemplate() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "continue"},
-		{"esc", "back"},
-		{"q", "quit"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 
@@ -646,10 +637,7 @@ func (m Model) viewInitInputURL() string {
 	b.WriteString("\n\n  ")
 	b.WriteString(m.initURLInput.View())
 	b.WriteString("\n\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "connect"},
-		{"esc", "back"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 
@@ -661,10 +649,7 @@ func (m Model) viewInitInputRepoName() string {
 	b.WriteString("\n\n  ")
 	b.WriteString(m.initNameInput.View())
 	b.WriteString("\n\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"enter", "continue"},
-		{"esc", "back"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 
@@ -682,12 +667,7 @@ func (m Model) viewInitPickVisibility() string {
 		b.WriteString(fmt.Sprintf("%s%s\n", cursor, name))
 	}
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{symArrows, "navigate"},
-		{"enter", "create"},
-		{"esc", "back"},
-		{"q", "quit"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 
@@ -698,11 +678,7 @@ func (m Model) viewInitConfirmGHAuth() string {
 	b.WriteString("  Run " + helpKeyStyle.Render("gh auth login --web") + " now?\n")
 	b.WriteString(dimStyle.Render("  Opens your browser. We'll resume right after.\n"))
 	b.WriteString("\n")
-	b.WriteString(renderHelp([]helpEntry{
-		{"y", "yes"},
-		{"n", "back"},
-		{"q", "quit"},
-	}))
+	b.WriteString(renderHelpRows(m.helpRows()))
 	return b.String()
 }
 

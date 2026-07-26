@@ -295,20 +295,7 @@ func (m Model) viewPush() string {
 	// step behind this one to return to. Saying so is the difference between a
 	// deliberate skip and a surprise.
 	b.WriteString("\n")
-	entries := []helpEntry{}
-	if m.pushForce {
-		entries = append(entries, helpEntry{"f", "force-push (with lease)"})
-	} else {
-		entries = append(entries, helpEntry{"enter", m.pushVerb()})
-	}
-	skip := "n/esc"
-	if m.pushReturnToMenu {
-		entries = append(entries, helpEntry{skip, "back to menu"})
-	} else {
-		entries = append(entries, helpEntry{skip, "skip — commit is already made"})
-	}
-	entries = append(entries, helpEntry{"q", "quit"})
-	b.WriteString(renderHelp(entries))
+	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
 }

@@ -3152,3 +3152,723 @@ func TestSyncDialogPointsAtTheInAppForcePush(t *testing.T) {
 		t.Errorf("the dialog does not point at the in-app path:\n%s", out)
 	}
 }
+
+// ── Discarding one file's changes (x) ──────────────────
+
+func entry(path string, status types.FileStatus) types.FileEntry {
+	return types.FileEntry{Path: path, Status: status}
+}
+
+// The prompt in front of an unrecoverable operation has to say what it costs,
+// and the four statuses cost four different things. The deleted case is the
+// sharp one: x there RESTORES, and wording it as a delete would be a lie
+// pointed at the one file the key can bring back.
+func TestDiscardPromptWordsMatchTheStatus(t *testing.T) {
+	cases := []struct {
+		name     string
+		entry    types.FileEntry
+		keyLabel string
+		want     []string
+		wantNot  []string
+	}{
+		{
+			name:     "modified",
+			entry:    entry("app.go", types.StatusModified),
+			keyLabel: "discard",
+			want:     []string{"Discard changes to app.go?", "permanently lost"},
+		},
+		{
+			name:     "untracked",
+			entry:    entry("notes.txt", types.StatusUntracked),
+			keyLabel: "delete",
+			want:     []string{"Delete notes.txt?", "never committed", "cannot be undone"},
+		},
+		{
+			name:     "untracked directory",
+			entry:    entry("vendor/", types.StatusUntracked),
+			keyLabel: "delete",
+			want:     []string{"Delete vendor/ and everything in it?"},
+		},
+		{
+			name:     "staged but never committed",
+			entry:    entry("new.go", types.StatusAdded),
+			keyLabel: "delete",
+			want:     []string{"Delete new.go?", "never committed"},
+		},
+		{
+			name:     "deleted",
+			entry:    entry("gone.go", types.StatusDeleted),
+			keyLabel: "restore",
+			want:     []string{"Restore gone.go?", "Brings the deleted file back"},
+			// Nothing on this screen may read as "delete it harder".
+			wantNot: []string{"Delete gone.go", "permanently lost", "cannot be undone"},
+		},
+		{
+			name:     "renamed",
+			entry:    types.FileEntry{Path: "new.go", OrigPath: "old.go", Status: types.StatusRenamed},
+			keyLabel: "undo rename",
+			want:     []string{"Undo the rename of old.go", "goes back to old.go"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := wizardModel(t, stepFiles, tc.entry)
+			m, _ = key(t, m, "x")
+			if !m.confirmDiscard {
+				t.Fatal("x did not open the confirmation")
+			}
+			out := m.viewFiles()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("prompt does not say %q:\n%s", want, out)
+				}
+			}
+			for _, unwanted := range tc.wantNot {
+				if strings.Contains(out, unwanted) {
+					t.Errorf("prompt says %q, which describes the wrong operation:\n%s", unwanted, out)
+				}
+			}
+			// The footer's own label for x has to agree with the prompt.
+			if got := m.discardKeyLabel(); got != tc.keyLabel {
+				t.Errorf("footer labels x %q, want %q", got, tc.keyLabel)
+			}
+		})
+	}
+}
+
+// x on an empty list must not index it, and the prompt must not fire twice.
+func TestDiscardIsSingleShotAndReportsWhatHappened(t *testing.T) {
+	m := wizardModel(t, stepFiles)
+	m, _ = key(t, m, "x")
+	if m.confirmDiscard {
+		t.Error("x opened a confirmation with no file under the cursor")
+	}
+
+	m = wizardModel(t, stepFiles, entry("a.txt", types.StatusModified), entry("b.txt", types.StatusUntracked))
+	m, _ = key(t, m, "x")
+	m, cmd := key(t, m, "y")
+	if cmd == nil || !m.discarding {
+		t.Fatal("y did not dispatch the discard")
+	}
+	// Input is blocked while it runs — a second y must not queue another one.
+	before := m
+	m, cmd = key(t, m, "y")
+	if cmd != nil || m.discarding != before.discarding {
+		t.Error("a second y dispatched a second discard")
+	}
+
+	next, _ := m.Update(discardResultMsg{
+		entry: entry("a.txt", types.StatusModified),
+		files: []types.FileEntry{entry("b.txt", types.StatusUntracked)},
+	})
+	m = next.(Model)
+	if m.discarding || m.confirmDiscard {
+		t.Error("the result did not close the prompt")
+	}
+	if len(m.files) != 1 || m.files[0].Path != "b.txt" {
+		t.Errorf("the file list was not refreshed: %+v", m.files)
+	}
+	if m.statusNote != "Discarded changes to a.txt" {
+		t.Errorf("status note = %q", m.statusNote)
+	}
+}
+
+// Cancelling is any key that is not y — n and esc among them.
+func TestDiscardCancels(t *testing.T) {
+	for _, k := range []string{"n", "esc"} {
+		m := wizardModel(t, stepFiles, entry("a.txt", types.StatusModified))
+		m, _ = key(t, m, "x")
+		m, cmd := key(t, m, k)
+		if m.confirmDiscard || m.discarding || cmd != nil {
+			t.Errorf("%q did not cancel the discard", k)
+		}
+	}
+}
+
+// A discard that lands on the last file leaves the cursor past the end of the
+// refreshed list — the next frame reads files[cursor] for the status badge and
+// for the footer's own x label.
+func TestDiscardClampsTheCursor(t *testing.T) {
+	m := wizardModel(t, stepFiles, entry("a.txt", types.StatusModified), entry("b.txt", types.StatusModified))
+	m.cursor = 1
+	next, _ := m.Update(discardResultMsg{
+		entry: entry("b.txt", types.StatusModified),
+		files: []types.FileEntry{entry("a.txt", types.StatusModified)},
+	})
+	m = next.(Model)
+	if m.cursor != 0 {
+		t.Fatalf("cursor = %d, want 0", m.cursor)
+	}
+	m.viewFiles() // must not panic
+}
+
+// ── Revert: the pushed-aware second exit from undo ─────
+
+func TestUndoPromptOffersRevertOnlyForPushedCommits(t *testing.T) {
+	t.Chdir(t.TempDir()) // not a repo: nothing forked from the prompt answers
+
+	// Unpushed: one path, and the extra keys are neither offered nor live.
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.confirmUndo = true
+	m.undoSubject = "feat: thing"
+	out := m.viewFiles()
+	if strings.Contains(out, "revert instead") {
+		t.Errorf("revert is offered for an unpushed commit:\n%s", out)
+	}
+	m2, cmd := key(t, m, "r")
+	if cmd != nil || m2.reverting {
+		t.Error("r started a revert on an unpushed commit")
+	}
+	if m2.confirmUndo {
+		t.Error("r should fall through to 'any key cancels' when revert is not on offer")
+	}
+
+	// Pushed: both exits, spelled out and both live.
+	m.undoPushed = true
+	m.undoSHA = "deadbeef"
+	out = m.viewFiles()
+	for _, want := range []string{
+		"undo anyway", "rewrites history", "force-push",
+		"revert instead", "adds a new commit that undoes it", "safe for pushed work",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the pushed prompt never says %q:\n%s", want, out)
+		}
+	}
+	if mr, cmd := key(t, m, "r"); cmd == nil || !mr.reverting || mr.confirmUndo {
+		t.Errorf("r did not start the revert (reverting=%v, cmd=%v)", mr.reverting, cmd != nil)
+	}
+	if mu, cmd := key(t, m, "u"); cmd == nil || !mu.undoing {
+		t.Errorf("u did not start the undo (undoing=%v, cmd=%v)", mu.undoing, cmd != nil)
+	}
+	// y still confirms the undo, as it always did.
+	if my, cmd := key(t, m, "y"); cmd == nil || !my.undoing {
+		t.Error("y no longer confirms the undo")
+	}
+}
+
+// A revert ADDS a commit. Marking the session as history-rewritten there would
+// offer a force-push for a branch that never diverged.
+func TestRevertReportsWithoutMarkingHistoryRewritten(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.reverting = true
+	m.confirmUndo = true
+	m.undoPushed = true
+	m.amendMode = true // a latched amend must not survive a moved HEAD
+
+	next, cmd := m.Update(revertResultMsg{
+		subject: "feat: the bad one",
+		files:   []types.FileEntry{file("b.txt")},
+	})
+	m = next.(Model)
+
+	if m.reverting || m.confirmUndo || m.undoPushed {
+		t.Error("the result did not close the prompt")
+	}
+	if m.historyRewritten {
+		t.Error("a revert marked the session as having rewritten history")
+	}
+	if m.amendMode {
+		t.Error("amend mode survived the revert — the next confirm would rewrite the revert commit")
+	}
+	if want := "Reverted feat: the bad one — a new commit undoes it"; m.statusNote != want {
+		t.Errorf("status note = %q, want %q", m.statusNote, want)
+	}
+	if cmd == nil {
+		t.Error("the dashboard was not refreshed after HEAD moved")
+	}
+	if len(m.files) != 1 || m.files[0].Path != "b.txt" {
+		t.Errorf("the file list was not refreshed: %+v", m.files)
+	}
+}
+
+func TestRevertFailureKeepsTheError(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.reverting = true
+	next, _ := m.Update(revertResultMsg{err: errors.New("revert conflict — 2 conflicting files")})
+	m = next.(Model)
+	if m.reverting {
+		t.Error("the spinner is still running after the failure")
+	}
+	if m.err == nil || !strings.Contains(m.err.Error(), "conflicting files") {
+		t.Errorf("err = %v, want the conflict reported", m.err)
+	}
+	if m.statusNote != "" {
+		t.Errorf("a failed revert reported success: %q", m.statusNote)
+	}
+}
+
+// ── Branch rename (r) ──────────────────────────────────
+
+func renameModel(t *testing.T) Model {
+	t.Helper()
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepBranch)
+	m.branchEntries = []types.BranchEntry{
+		{Name: "main", IsCurrent: true},
+		{Name: "feature"},
+		{Name: "upstream-only", IsRemote: true},
+	}
+	return m
+}
+
+func TestBranchRenameValidatesBeforeTouchingGit(t *testing.T) {
+	m := renameModel(t)
+	m.branchCursor = 1 // feature
+
+	m, _ = key(t, m, "r")
+	if !m.branchRenameMode {
+		t.Fatal("r did not open the rename input")
+	}
+	if got := m.branchRenameInput.Value(); got != "feature" {
+		t.Errorf("input prefilled with %q, want the current name", got)
+	}
+	if m.branchRenameFrom != "feature" {
+		t.Errorf("renaming %q, want feature", m.branchRenameFrom)
+	}
+
+	// Enter-through on the prefilled name is easy to hit by accident.
+	same, cmd := key(t, m, "enter")
+	if cmd != nil || same.branchRenaming {
+		t.Error("renaming a branch to its own name was dispatched")
+	}
+	if same.err == nil || !strings.Contains(same.err.Error(), "already this branch's name") {
+		t.Errorf("err = %v, want an explanation", same.err)
+	}
+
+	// A name git itself rejects.
+	bad := m
+	bad.branchRenameInput.SetValue("has spaces")
+	bad, cmd = key(t, bad, "enter")
+	if cmd != nil || bad.branchRenaming {
+		t.Error("an invalid branch name was dispatched to git")
+	}
+	if bad.err == nil || !strings.Contains(bad.err.Error(), "can't contain spaces") {
+		t.Errorf("err = %v, want the name rules", bad.err)
+	}
+
+	// A name that is already taken (main exists in the fixture repo).
+	taken := m
+	taken.branchRenameInput.SetValue("main")
+	taken, cmd = key(t, taken, "enter")
+	if cmd != nil || taken.branchRenaming {
+		t.Error("renaming onto an existing branch was dispatched")
+	}
+	if taken.err == nil || !strings.Contains(taken.err.Error(), "already exists") {
+		t.Errorf("err = %v, want the collision named", taken.err)
+	}
+
+	// A good name goes through, once.
+	ok := m
+	ok.branchRenameInput.SetValue("feature-2")
+	ok, cmd = key(t, ok, "enter")
+	if cmd == nil || !ok.branchRenaming {
+		t.Fatal("a valid rename was not dispatched")
+	}
+	blocked, cmd2 := key(t, ok, "enter")
+	if cmd2 != nil || !blocked.branchRenameMode {
+		t.Error("a second enter dispatched a second rename")
+	}
+}
+
+func TestBranchRenameRefusesRemoteOnlyBranches(t *testing.T) {
+	m := renameModel(t)
+	m.branchCursor = 2 // remote-only
+	m, _ = key(t, m, "r")
+	if m.branchRenameMode {
+		t.Error("a remote-only branch opened the rename input")
+	}
+	if m.err == nil || !strings.Contains(m.err.Error(), "only exists on origin") {
+		t.Errorf("err = %v, want an explanation", m.err)
+	}
+}
+
+func TestBranchRenameOfTheCurrentBranchFollowsThroughAndDisclosesOrigin(t *testing.T) {
+	m := renameModel(t)
+	m.branchRenaming = true
+	m.branchRenameMode = true
+	m.branchRenameFrom = "main"
+
+	next, cmd := m.Update(branchRenameResultMsg{
+		from: "main", to: "trunk", wasCurrent: true, hadUpstream: true,
+	})
+	m = next.(Model)
+
+	if m.branch != "trunk" {
+		t.Errorf("m.branch = %q, want the new name", m.branch)
+	}
+	if m.branchRenameMode || m.branchRenaming {
+		t.Error("the rename prompt is still open")
+	}
+	for _, want := range []string{"Renamed main to trunk", "origin still has main"} {
+		if !strings.Contains(m.statusNote, want) {
+			t.Errorf("note %q does not say %q", m.statusNote, want)
+		}
+	}
+	if cmd == nil {
+		t.Error("the dashboard was not refreshed after the branch changed name")
+	}
+
+	// No upstream: nothing to disclose, and the note must not invent one.
+	m2 := renameModel(t)
+	m2.branchRenaming = true
+	next, _ = m2.Update(branchRenameResultMsg{from: "feature", to: "feature-2"})
+	m2 = next.(Model)
+	if m2.statusNote != "Renamed feature to feature-2" {
+		t.Errorf("note = %q", m2.statusNote)
+	}
+	if m2.branch == "feature-2" {
+		t.Error("renaming another branch moved the current-branch label")
+	}
+}
+
+func TestBranchRenameFailureStaysInTheInput(t *testing.T) {
+	m := renameModel(t)
+	m.branchRenameMode = true
+	m.branchRenaming = true
+	m.branchRenameFrom = "feature"
+	next, _ := m.Update(branchRenameResultMsg{err: errors.New("boom"), from: "feature", to: "x"})
+	m = next.(Model)
+	if !m.branchRenameMode {
+		t.Error("a failed rename closed the input, losing the typed name")
+	}
+	if m.err == nil {
+		t.Error("the failure was swallowed")
+	}
+	if out := m.viewBranch(); !strings.Contains(out, "boom") {
+		t.Errorf("the rename screen does not render its error:\n%s", out)
+	}
+}
+
+func TestBranchRenameScreenDisclosesThatOriginKeepsTheOldName(t *testing.T) {
+	m := renameModel(t)
+	m.branchRenameMode = true
+	m.branchRenameFrom = "feature"
+	m.branchRenameUpstream = true
+	out := m.viewBranch()
+	for _, want := range []string{"Rename", "feature", "origin still has feature", "local only"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the rename screen never says %q:\n%s", want, out)
+		}
+	}
+}
+
+// ── The ? overlay ──────────────────────────────────────
+
+// helpScreens enumerates one model per screen the overlay can appear on, so the
+// parity check below covers all of them rather than the two that are easy.
+func helpScreens(t *testing.T) []struct {
+	name string
+	m    Model
+} {
+	t.Helper()
+	mk := func(s step, f func(m *Model)) Model {
+		m := wizardModel(t, s, file("a.txt"))
+		m.width = 200
+		m.height = 60
+		if f != nil {
+			f(&m)
+		}
+		return m
+	}
+	return []struct {
+		name string
+		m    Model
+	}{
+		{"menu", mk(stepMenu, nil)},
+		{"menu with remote work", mk(stepMenu, func(m *Model) {
+			m.hasRemote, m.behindOrigin, m.behindMain, m.mainRef = true, 2, 1, "origin/main"
+		})},
+		{"files", mk(stepFiles, nil)},
+		{"files deleted entry", mk(stepFiles, func(m *Model) {
+			m.files = []types.FileEntry{entry("gone.go", types.StatusDeleted)}
+		})},
+		{"files gitignore", mk(stepFiles, func(m *Model) {
+			m.gitignoreMode = true
+			m.removeIgnored = map[string]bool{}
+		})},
+		{"files undo prompt", mk(stepFiles, func(m *Model) { m.confirmUndo = true })},
+		{"files undo prompt pushed", mk(stepFiles, func(m *Model) {
+			m.confirmUndo, m.undoPushed = true, true
+		})},
+		{"files discard prompt", mk(stepFiles, func(m *Model) {
+			m.confirmDiscard = true
+			m.discardEntry = entry("a.txt", types.StatusModified)
+		})},
+		{"diff", mk(stepFiles, func(m *Model) {
+			m.showDiff, m.diffContent, m.diffFile = true, "@@ -1 +1 @@\n-a\n+b\n", "a.txt"
+		})},
+		{"diff binary", mk(stepFiles, func(m *Model) {
+			m.showDiff, m.diffFile = true, "a.bin"
+		})},
+		{"branch", mk(stepBranch, func(m *Model) {
+			m.branchEntries = []types.BranchEntry{{Name: "main", IsCurrent: true}}
+		})},
+		{"branch standalone", mk(stepBranch, func(m *Model) {
+			m.branchStandalone = true
+			m.branchEntries = []types.BranchEntry{{Name: "main", IsCurrent: true}}
+		})},
+		{"branch delete", mk(stepBranch, func(m *Model) {
+			m.branchEntries = []types.BranchEntry{{Name: "main", IsCurrent: true}}
+			m.branchDeleteMode = true
+		})},
+		{"branch force delete", mk(stepBranch, func(m *Model) {
+			m.branchForceDeleteMode, m.branchForceDeleteName = true, "feature"
+		})},
+		{"branch merge target", mk(stepBranch, func(m *Model) {
+			m.mergeTargetMode, m.mergeSource = true, "feature"
+		})},
+		{"branch merge confirm", mk(stepBranch, func(m *Model) {
+			m.branchMergeMode, m.mergeSource, m.mergeTarget = true, "feature", "main"
+		})},
+		{"config", mk(stepConfig, func(m *Model) { m.loadConfigItems() })},
+		{"config pick", mk(stepConfig, func(m *Model) {
+			m.loadConfigItems()
+			m.configCursor = 2
+			m.configPickMode = true
+			m.configPickItems = []string{"main"}
+		})},
+		{"config remove remote", mk(stepConfig, func(m *Model) {
+			m.loadConfigItems()
+			m.configRemoveRemote = true
+		})},
+		{"type", mk(stepType, nil)},
+		{"confirm", mk(stepConfirm, func(m *Model) { m.files[0].Selected = true })},
+		{"push", mk(stepPush, func(m *Model) {
+			m.pushHasUpstream, m.pushOutgoingTotal = true, 2
+		})},
+		{"push force", mk(stepPush, func(m *Model) { m.pushForce = true })},
+		{"push from menu", mk(stepPush, func(m *Model) { m.pushReturnToMenu = true })},
+		{"done", mk(stepDone, func(m *Model) { m.hasRemote = true })},
+		{"sync", mk(stepSync, func(m *Model) {
+			m.syncPullCurrent, m.syncSyncMain, m.syncMainBranchName = true, true, "main"
+		})},
+		{"init", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickOption })},
+		{"init template", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickTemplate })},
+		{"init visibility", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickVisibility })},
+		{"init gh auth", mk(stepInit, func(m *Model) { m.initPhase = initPhaseConfirmGHAuth })},
+	}
+}
+
+// The overlay and the footer are the same list, on every screen. A second
+// hand-maintained key list is the thing this refactor exists to prevent, so the
+// test asserts the footer the screen draws IS the rows helpRows returns, and
+// that the overlay lists every one of them.
+func TestHelpOverlayMirrorsTheFooterOnEveryScreen(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	for _, tc := range helpScreens(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.m
+			rows := m.helpRows()
+			if len(rows) == 0 {
+				t.Fatalf("%s has no keys at all", tc.name)
+			}
+			// Row by row: the box pads every line to its own width, so the
+			// joined footer is not contiguous in the rendered output — each
+			// row is.
+			view := m.View()
+			for i, row := range rows {
+				if bar := renderHelp(row); !strings.Contains(view, bar) {
+					t.Errorf("footer row %d on screen is not the one helpRows returns:\nwant %q\nin:\n%s", i, bar, view)
+				}
+			}
+
+			m.showHelp = true
+			overlay := m.View()
+			if !strings.Contains(overlay, m.screenName()) {
+				t.Errorf("the overlay does not name the screen (%s)", m.screenName())
+			}
+			for _, e := range m.helpEntries() {
+				if !strings.Contains(overlay, helpKeyStyle.Render(padKey(e.key))) {
+					t.Errorf("the overlay omits the %q key", e.key)
+				}
+				if !strings.Contains(overlay, helpStyle.Render(e.desc)) {
+					t.Errorf("the overlay omits %q (the %q key)", e.desc, e.key)
+				}
+			}
+			if !strings.Contains(overlay, "close") {
+				t.Errorf("the overlay does not say how to close itself:\n%s", overlay)
+			}
+		})
+	}
+}
+
+func TestHelpOverlayTogglesAndSwallowsKeys(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepMenu)
+	m.statusNote = "Merged feature into main"
+	m.menuCursor = 0
+
+	m, _ = key(t, m, "?")
+	if !m.showHelp {
+		t.Fatal("? did not open the overlay")
+	}
+	// It is a read-only side channel: the note underneath survives it.
+	if m.statusNote == "" {
+		t.Error("opening the overlay cleared the status note")
+	}
+	// No key of the screen underneath fires while it is up.
+	m, _ = key(t, m, "down")
+	if m.menuCursor != 0 {
+		t.Error("a key reached the menu through the overlay")
+	}
+	m, _ = key(t, m, "?")
+	if m.showHelp {
+		t.Error("? did not close the overlay")
+	}
+	m, _ = key(t, m, "?")
+	m, _ = key(t, m, "esc")
+	if m.showHelp {
+		t.Error("esc did not close the overlay")
+	}
+}
+
+// On a screen with a focused text field, `?` is a character. Eating it would
+// make the key unavailable in branch names and commit subjects.
+func TestHelpOverlayStaysOutOfTextFields(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	cases := []struct {
+		name string
+		m    Model
+	}{
+		{"commit subject", wizardModel(t, stepMessage, file("a.txt"))},
+		{"custom type", wizardModel(t, stepCustom, file("a.txt"))},
+		{"file filter", func() Model {
+			m := wizardModel(t, stepFiles, file("a.txt"))
+			m.filterMode = true
+			m.filterInput.Focus()
+			return m
+		}()},
+		{"branch create", func() Model {
+			m := wizardModel(t, stepBranch)
+			m.branchCreateMode = true
+			m.branchCreateInput.Focus()
+			return m
+		}()},
+		{"branch rename", func() Model {
+			m := wizardModel(t, stepBranch)
+			m.branchRenameMode = true
+			m.branchRenameInput.Focus()
+			return m
+		}()},
+		{"config edit", func() Model {
+			m := wizardModel(t, stepConfig)
+			m.loadConfigItems()
+			m.configEditMode = true
+			m.configEditInput.Focus()
+			return m
+		}()},
+		{"init url", func() Model {
+			m := wizardModel(t, stepInit)
+			m.initPhase = initPhaseInputURL
+			m.initURLInput.Focus()
+			return m
+		}()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := key(t, tc.m, "?")
+			if m.showHelp {
+				t.Error("? opened the overlay instead of typing a question mark")
+			}
+		})
+	}
+}
+
+// Covering a spinner with a key list hides the one thing the user is waiting on.
+func TestHelpOverlayStaysClosedDuringAnOperation(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.undoing = true
+	m, _ = key(t, m, "?")
+	if m.showHelp {
+		t.Error("? opened the overlay over an in-flight operation")
+	}
+}
+
+// ── Detached HEAD ──────────────────────────────────────
+
+func TestDetachedHeadMenuOffersOnlyTheWayOut(t *testing.T) {
+	m := wizardModel(t, stepMenu, file("a.txt"))
+	m.hasRemote = true
+	m.hasAnyCommit = true
+	m.aheadOrigin = 3
+	m.behindMain = 2
+	m.mainRef = "origin/main"
+	m.behindOrigin = 1
+	m.branch = git.DetachedLabel
+	m.detached = true
+
+	names := []string{}
+	for _, item := range m.menuItems() {
+		names = append(names, item.name)
+	}
+	if len(names) != 2 || names[0] != "Branch" || names[1] != "Config" {
+		t.Fatalf("menu = %v, want just Branch and Config", names)
+	}
+	if desc := m.menuItems()[0].desc; !strings.Contains(desc, "switch to a branch") {
+		t.Errorf("the Branch entry does not point at the way out: %q", desc)
+	}
+	if m.canPush() {
+		t.Errorf("Push is offered while detached — it would try to publish a branch called %q", m.branch)
+	}
+	if m.canSyncMain() {
+		t.Error("Sync is offered while detached")
+	}
+
+	out := m.viewMenu()
+	for _, want := range []string{"detached HEAD", "not on any branch", "can be lost", "switch to a branch"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the dashboard never says %q:\n%s", want, out)
+		}
+	}
+	// The keys that assume a branch are gone from the footer too.
+	if strings.Contains(renderHelpRows(m.helpRows()), "sync") {
+		t.Error("the sync shortcut is still advertised while detached")
+	}
+	if strings.Contains(renderHelpRows(m.helpRows()), "pull") {
+		t.Error("the pull shortcut is still advertised while detached")
+	}
+
+	// And "p" does nothing rather than opening a dialog about a branch we are
+	// not on.
+	m2, cmd := key(t, m, "p")
+	if cmd != nil || m2.step != stepMenu {
+		t.Error("p opened the sync dialog while detached")
+	}
+	// Enter on Branch still works: that is the cure.
+	m.menuCursor = 0
+	m3, _ := key(t, m, "enter")
+	if m3.step != stepBranch {
+		t.Errorf("enter on Branch went to step %v, want the branch manager", m3.step)
+	}
+}
+
+func TestSwitchingBranchClearsTheDetachedFlag(t *testing.T) {
+	m := wizardModel(t, stepBranch)
+	m.detached = true
+	m.branch = git.DetachedLabel
+	next, _ := m.Update(branchSwitchResultMsg{newBranch: "main"})
+	m = next.(Model)
+	if m.detached {
+		t.Error("switching to a branch left the detached flag set")
+	}
+	if m.branch != "main" {
+		t.Errorf("branch = %q, want main", m.branch)
+	}
+}
+
+func TestDashboardSnapshotCarriesDetachedState(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	gitRun(t, "checkout", "-q", "--detach", "HEAD")
+	snap := readDashboard(git.DetachedLabel, false)
+	if !snap.detached {
+		t.Fatal("the snapshot missed a detached HEAD")
+	}
+	m := wizardModel(t, stepMenu)
+	m.applyDashboard(snap)
+	if !m.detached {
+		t.Error("applyDashboard did not carry the flag onto the model")
+	}
+}
