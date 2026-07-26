@@ -815,8 +815,10 @@ func formatError(err error) string {
 		hint = "Check file or repository permissions."
 	case strings.Contains(msg, "rm --cached failed"):
 		hint = "Some files could not be untracked. Check paths."
-	case strings.Contains(msg, "staging failed"):
-		hint = "Files could not be staged. Check paths and permissions."
+	case strings.Contains(msg, "could not stage"), strings.Contains(msg, "staging failed"):
+		hint = "Nothing was committed. Refresh the file list (esc, then enter) and try again."
+	case strings.Contains(msg, "nothing to undo"):
+		hint = "Use Amend from the menu to change the first commit instead."
 	case strings.Contains(msg, "saved in stash"):
 		hint = "Your changes are safe. Switch back to the original branch and run: git stash pop"
 	case strings.Contains(msg, "invalid branch name"):

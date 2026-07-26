@@ -227,7 +227,13 @@ func renderGraphLine(gl graphLine, maxWidth int) string {
 	return visual.String() + " " + msg
 }
 
-func formatAheadBehind(ahead, behind int) string {
+// formatAheadBehind renders the sync state of a branch. hasUpstream is
+// distinct from 0/0: a branch that tracks nothing has never been compared to
+// anything, and calling that "up to date" hides that it exists only locally.
+func formatAheadBehind(ahead, behind int, hasUpstream bool) string {
+	if !hasUpstream {
+		return "no upstream"
+	}
 	if ahead == 0 && behind == 0 {
 		return "up to date"
 	}

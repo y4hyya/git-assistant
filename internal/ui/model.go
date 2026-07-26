@@ -357,8 +357,8 @@ func NewBranchModel(branch string) Model {
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
 	m.localGraph = git.GetUnifiedGraph(15)
-	a, b := git.GetAheadBehind(branch)
-	m.aheadBehind = formatAheadBehind(a, b)
+	a, b, up := git.GetAheadBehind(branch)
+	m.aheadBehind = formatAheadBehind(a, b, up)
 	return m
 }
 
@@ -367,8 +367,8 @@ func NewBranchModel(branch string) Model {
 // `git branch` / `git rev-parse` on every keypress.
 func (m *Model) RefreshGraphs() {
 	m.localGraph = git.GetUnifiedGraph(15)
-	a, b := git.GetAheadBehind(m.branch)
-	m.aheadBehind = formatAheadBehind(a, b)
+	a, b, up := git.GetAheadBehind(m.branch)
+	m.aheadBehind = formatAheadBehind(a, b, up)
 	m.behindOrigin = b
 	m.behindMain = git.GetBehindMain(m.branch)
 	m.branchCount = len(git.GetAllBranches())

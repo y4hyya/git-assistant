@@ -226,10 +226,11 @@ func (m *Model) populateSyncDialog() bool {
 	main := git.ResolveMainBranch()
 	m.syncMainBranchName = main
 
-	// Pull current: current branch is behind origin/<current>
-	ahead, behind := git.GetAheadBehind(m.branch)
+	// Pull current: current branch is behind its upstream. A branch with no
+	// upstream has nothing to pull.
+	ahead, behind, hasUpstream := git.GetAheadBehind(m.branch)
 	_ = ahead
-	pullCurrent := behind > 0
+	pullCurrent := hasUpstream && behind > 0
 	var incomingCurr []string
 	if pullCurrent {
 		incomingCurr = git.GetIncomingCommits(m.branch, "origin/"+m.branch, 10)

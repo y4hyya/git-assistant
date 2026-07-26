@@ -30,18 +30,27 @@ func (s FileStatus) Symbol() string {
 }
 
 // FileEntry represents a changed file in the repository.
+// OrigPath is set only for renamed/copied entries and holds the path the
+// file had before the rename. Staging a rename requires both halves (the
+// deletion of OrigPath and the addition of Path) or the commit records the
+// new file while leaving the old one tracked.
 type FileEntry struct {
 	Path       string
+	OrigPath   string
 	Status     FileStatus
 	Selected   bool
 	Gitignored bool
 }
 
 // BranchEntry represents a git branch.
+// CheckedOutElsewhere marks branches git reports with a "+ " prefix: they are
+// checked out in another worktree, so they can't be switched to or deleted
+// from here.
 type BranchEntry struct {
-	Name      string
-	IsCurrent bool
-	IsRemote  bool
+	Name                string
+	IsCurrent           bool
+	IsRemote            bool
+	CheckedOutElsewhere bool
 }
 
 // CommitType represents a conventional commit type.

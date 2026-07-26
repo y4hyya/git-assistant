@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
+	"git-assist/internal/types"
 )
 
 // focus tracks which input field is active in the message step.
@@ -156,9 +157,9 @@ func (m Model) buildCommitMessage(subject string) string {
 	return msg
 }
 
-func doCommit(paths []string, cachedPaths []string, message string) tea.Cmd {
+func doCommit(files []types.FileEntry, cachedPaths []string, message string) tea.Cmd {
 	return func() tea.Msg {
-		err := git.Commit(paths, cachedPaths, message)
+		err := git.Commit(files, cachedPaths, message)
 		return commitResultMsg{err: err}
 	}
 }
@@ -167,9 +168,9 @@ func doCommit(paths []string, cachedPaths []string, message string) tea.Cmd {
 // the last commit with a new message. Reuses commitResultMsg — the handler
 // in model.go branches on m.amendMode to skip the push step and route
 // straight to Done.
-func doAmend(paths []string, message string) tea.Cmd {
+func doAmend(files []types.FileEntry, message string) tea.Cmd {
 	return func() tea.Msg {
-		err := git.Amend(paths, message)
+		err := git.Amend(files, message)
 		return commitResultMsg{err: err}
 	}
 }

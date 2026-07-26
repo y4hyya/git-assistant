@@ -33,6 +33,19 @@ func main() {
 		}
 	}
 
+	// Every path git reports (status, diff, add pathspecs) is relative to the
+	// worktree root, and .gitignore lives there too. Launched from a
+	// subdirectory those paths resolve against the wrong cwd, so the
+	// dashboard shows a clean tree and file operations misfire. Move to the
+	// root up front; if this isn't a repo the call fails and we leave cwd
+	// alone for the init flow below.
+	if root, err := git.RepoToplevel(); err == nil {
+		if err := os.Chdir(root); err != nil {
+			fmt.Printf("✗ Cannot enter repository root %s: %v\n", root, err)
+			os.Exit(1)
+		}
+	}
+
 	// Non-git directory → launch first-run init flow instead of exiting.
 	// The branch subcommand still requires an existing repo, so skip init
 	// for that case and error clearly.

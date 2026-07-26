@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"git-assist/internal/git"
+	"git-assist/internal/types"
 )
 
 // ── Update ──────────────────────────────────────────────
@@ -28,16 +29,18 @@ func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.committing = true
 		val := strings.TrimSpace(m.msgInput.Value())
 		fullMsg := m.buildCommitMessage(val)
-		var paths []string
+		// Pass whole entries, not paths: a rename needs its original path
+		// staged alongside the new one.
+		var selected []types.FileEntry
 		for _, f := range m.files {
 			if f.Selected {
-				paths = append(paths, f.Path)
+				selected = append(selected, f)
 			}
 		}
 		if m.amendMode {
-			return m, tea.Batch(doAmend(paths, fullMsg), m.spinner.Tick)
+			return m, tea.Batch(doAmend(selected, fullMsg), m.spinner.Tick)
 		}
-		return m, tea.Batch(doCommit(paths, m.gitignoreCached, fullMsg), m.spinner.Tick)
+		return m, tea.Batch(doCommit(selected, m.gitignoreCached, fullMsg), m.spinner.Tick)
 	case "esc":
 		m.step = stepMessage
 		m.bodyFocused = false

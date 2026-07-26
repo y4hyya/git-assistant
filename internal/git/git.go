@@ -18,6 +18,22 @@ func IsGitRepo() bool {
 	return exec.Command("git", "rev-parse", "--is-inside-work-tree").Run() == nil
 }
 
+// RepoToplevel returns the absolute path of the working tree root. Every path
+// git reports is relative to that root, so callers launched from a
+// subdirectory must chdir there before any status/add/diff work. Errors when
+// the cwd isn't inside a working tree (bare repo or no repo at all).
+func RepoToplevel() (string, error) {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", err
+	}
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		return "", errors.New("git rev-parse --show-toplevel returned no path")
+	}
+	return root, nil
+}
+
 // InitRepo runs `git init` in the current working directory. When
 // defaultBranch is non-empty, it also sets the initial branch via
 // `-b <name>` so the first commit lands on the desired branch name.
@@ -139,31 +155,49 @@ func GetCurrentBranch() (string, error) {
 }
 
 // GetStatus returns the list of changed files.
+//
+// Uses the NUL-separated porcelain format: in -z mode git never quotes or
+// C-escapes paths, so filenames with spaces, quotes or non-ASCII characters
+// come through verbatim (plain `--porcelain` renders them as `"d\303\266k.md"`,
+// which then fails every downstream pathspec). `--untracked-files=all` lists
+// the individual files inside untracked directories instead of a single
+// `dir/` record that can't be diffed.
 func GetStatus() ([]types.FileEntry, error) {
-	out, err := exec.Command("git", "status", "--porcelain").Output()
+	out, err := exec.Command("git", "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
 	if err != nil {
 		return nil, err
 	}
+	return parseStatusZ(string(out)), nil
+}
 
-	output := strings.TrimSpace(string(out))
-	if output == "" {
-		return nil, nil
-	}
-
-	lines := strings.Split(output, "\n")
+// parseStatusZ turns `git status --porcelain=v1 -z` output into file entries.
+// Records are NUL-terminated. A record is `XY <path>`; for renames and copies
+// (X or Y is R/C) the record is `XY <new>\0<old>\0`, i.e. the following field
+// is the original path and belongs to the same entry.
+func parseStatusZ(data string) []types.FileEntry {
+	records := strings.Split(data, "\x00")
 	var files []types.FileEntry
 
-	for _, line := range lines {
-		if len(line) < 3 {
+	for i := 0; i < len(records); i++ {
+		rec := records[i]
+		// "XY " + at least one path character
+		if len(rec) < 4 {
 			continue
 		}
 
-		xy := line[:2]
-		path := line[3:]
+		xy := rec[:2]
+		path := rec[3:]
 
-		// Handle renamed files: "old -> new"
-		if idx := strings.Index(path, " -> "); idx != -1 {
-			path = path[idx+4:]
+		// Rename/copy records carry the original path in the next field.
+		// Consume it regardless of how the status is classified below —
+		// e.g. "RD" (renamed in index, deleted in worktree) is reported as
+		// a deletion but still has two path fields.
+		var origPath string
+		if xy != "??" && (xy[0] == 'R' || xy[1] == 'R' || xy[0] == 'C' || xy[1] == 'C') {
+			if i+1 < len(records) {
+				origPath = records[i+1]
+				i++
+			}
 		}
 
 		var status types.FileStatus
@@ -180,20 +214,17 @@ func GetStatus() ([]types.FileEntry, error) {
 			status = types.StatusModified
 		}
 
-		// Skip phantom entries: not on disk and not a deletion
-		if status != types.StatusDeleted {
-			if _, err := os.Stat(path); err != nil {
-				continue
-			}
-		}
-
+		// No on-disk filter here: git is the authority on what changed.
+		// A stat-based filter silently swallowed broken symlinks (stat
+		// follows the link) and every path the old quoting bug mangled.
 		files = append(files, types.FileEntry{
-			Path:   path,
-			Status: status,
+			Path:     path,
+			OrigPath: origPath,
+			Status:   status,
 		})
 	}
 
-	return files, nil
+	return files
 }
 
 // GetBranches returns available branches for pushing.
@@ -206,6 +237,13 @@ func GetBranches(currentBranch string) []string {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			branch := strings.TrimSpace(line)
 			if branch == "" || strings.Contains(branch, "->") {
+				continue
+			}
+			// Only origin is addressable: every push/checkout built from this
+			// list hardcodes `origin`, so an `upstream/main` entry would turn
+			// into `git push origin HEAD:upstream/main` and create a junk
+			// branch on the user's own remote.
+			if !strings.HasPrefix(branch, "origin/") {
 				continue
 			}
 			branch = strings.TrimPrefix(branch, "origin/")
@@ -237,10 +275,46 @@ func Fetch() error {
 	return nil
 }
 
+// isStageable reports whether `git add` can act on a path: it either still
+// exists on disk or git has it in the index. `git add` fails with "pathspec
+// did not match any files" on a path that is in neither — the normal state of
+// a rename's original path when the rename is already staged.
+func isStageable(path string) bool {
+	if _, err := os.Lstat(path); err == nil {
+		return true
+	}
+	return exec.Command("git", "ls-files", "--error-unmatch", "--", path).Run() == nil
+}
+
+// stagePaths returns the pathspecs that must be staged for one entry. A
+// rename needs both halves: `git add <new>` alone records the addition and
+// leaves the old path tracked, so the commit would contain half a rename and
+// a dangling `D <old>` in the working tree.
+func stagePaths(f types.FileEntry) []string {
+	if f.Status == types.StatusRenamed && f.OrigPath != "" && isStageable(f.OrigPath) {
+		return []string{f.OrigPath, f.Path}
+	}
+	return []string{f.Path}
+}
+
+// stageEntries stages every entry, collecting failures instead of stopping at
+// the first one. Returns the paths that could not be staged plus git's last
+// error output, so callers can refuse to commit a partial selection.
+func stageEntries(files []types.FileEntry) (failed []string, lastErr string) {
+	for _, f := range files {
+		args := append([]string{"add", "--"}, stagePaths(f)...)
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			failed = append(failed, f.Path)
+			lastErr = strings.TrimSpace(string(out))
+		}
+	}
+	return failed, lastErr
+}
+
 // Commit stages the selected files and creates a commit.
 // cachedPaths are files that were gitignored and need git rm --cached
 // re-applied after the staging reset.
-func Commit(filePaths []string, cachedPaths []string, message string) error {
+func Commit(files []types.FileEntry, cachedPaths []string, message string) error {
 	// Reset staging area so only the user's selected files are committed.
 	// `git reset` fails on repos with no commits yet (no HEAD to reset to);
 	// skip the call there. For repos with commits, propagate the error so
@@ -256,18 +330,13 @@ func Commit(filePaths []string, cachedPaths []string, message string) error {
 		return err
 	}
 
-	// Stage selected files individually — skip any that fail
-	staged := 0
-	var lastErr string
-	for _, p := range filePaths {
-		if out, err := exec.Command("git", "add", "--", p).CombinedOutput(); err != nil {
-			lastErr = strings.TrimSpace(string(out))
-			continue
-		}
-		staged++
-	}
-	if staged == 0 && len(filePaths) > 0 {
-		return fmt.Errorf("staging failed: %s", lastErr)
+	// Stage the selection. If any file fails to stage we commit nothing —
+	// silently committing the survivors while the confirm screen promised
+	// all of them is worse than an error the user can act on.
+	failed, lastErr := stageEntries(files)
+	if len(failed) > 0 {
+		return fmt.Errorf("could not stage %s (nothing committed): %s",
+			strings.Join(failed, ", "), lastErr)
 	}
 
 	// Commit
@@ -330,11 +399,11 @@ func IsLastCommitPushed() bool {
 // re-runs the last commit with the given message. Unlike Commit, we don't
 // `git reset` first — the whole point of amend is to keep what's already
 // in HEAD and layer additional changes (if any) into the same commit.
-func Amend(filePaths []string, message string) error {
-	for _, p := range filePaths {
-		if out, err := exec.Command("git", "add", "--", p).CombinedOutput(); err != nil {
-			return fmt.Errorf("staging %s: %s", p, strings.TrimSpace(string(out)))
-		}
+func Amend(files []types.FileEntry, message string) error {
+	failed, lastErr := stageEntries(files)
+	if len(failed) > 0 {
+		return fmt.Errorf("could not stage %s (commit not amended): %s",
+			strings.Join(failed, ", "), lastErr)
 	}
 	out, err := exec.Command("git", "commit", "--amend", "-m", message).CombinedOutput()
 	if err != nil {
@@ -345,6 +414,12 @@ func Amend(filePaths []string, message string) error {
 
 // UndoLastCommit performs a soft reset, keeping changes staged.
 func UndoLastCommit() error {
+	// On a single-commit repo HEAD~1 doesn't resolve and git answers with a
+	// raw "fatal: ambiguous argument 'HEAD~1'". Check first and say what the
+	// user can actually do about it.
+	if exec.Command("git", "rev-parse", "--verify", "--quiet", "HEAD~1").Run() != nil {
+		return errors.New("nothing to undo — this is the repository's first commit (use Amend to change it)")
+	}
 	out, err := exec.Command("git", "reset", "--soft", "HEAD~1").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("undo failed: %s", strings.TrimSpace(string(out)))
@@ -368,7 +443,36 @@ func Push(currentBranch, targetBranch string) error {
 	return nil
 }
 
+// ignoreKey normalizes a .gitignore line for duplicate detection so that
+// "/x", "./x" and "x" (and their trailing-slash variants) compare equal.
+func ignoreKey(entry string) string {
+	e := strings.TrimSpace(entry)
+	e = strings.TrimPrefix(e, "./")
+	e = strings.TrimPrefix(e, "/")
+	return strings.TrimSuffix(e, "/")
+}
+
+// anchorIgnorePattern turns a repo-relative path into an anchored .gitignore
+// pattern. A slash-less pattern like `config.json` matches at every depth, so
+// ignoring one root file would also hide `deploy/config.json` — and ignored
+// files never show up in git status, leaving no way to notice. A leading "/"
+// pins the pattern to the repo root, which is exactly what the picker meant.
+// Negations and comments are passed through untouched.
+func anchorIgnorePattern(entry string) string {
+	e := strings.TrimSpace(entry)
+	if e == "" || strings.HasPrefix(e, "#") || strings.HasPrefix(e, "!") {
+		return e
+	}
+	e = strings.TrimPrefix(e, "./")
+	if strings.HasPrefix(e, "/") {
+		return e
+	}
+	return "/" + e
+}
+
 // AddToGitignore appends the given paths to .gitignore, skipping duplicates.
+// Paths are repo-relative (they come from git status), so they are written
+// anchored to the repo root.
 func AddToGitignore(paths []string) error {
 	if len(paths) == 0 {
 		return nil
@@ -378,15 +482,24 @@ func AddToGitignore(paths []string) error {
 	content, err := os.ReadFile(".gitignore")
 	if err == nil {
 		for _, line := range strings.Split(string(content), "\n") {
-			existing[strings.TrimSpace(line)] = true
+			if line = strings.TrimSpace(line); line != "" {
+				existing[ignoreKey(line)] = true
+			}
 		}
 	}
 
 	var toAdd []string
 	for _, p := range paths {
-		if !existing[p] {
-			toAdd = append(toAdd, p)
+		pattern := anchorIgnorePattern(p)
+		if pattern == "" {
+			continue
 		}
+		key := ignoreKey(pattern)
+		if existing[key] {
+			continue
+		}
+		existing[key] = true // dedupe within this batch too
+		toAdd = append(toAdd, pattern)
 	}
 
 	if len(toAdd) == 0 {
@@ -491,11 +604,45 @@ func GetCommitStats() string {
 	return ""
 }
 
+// maxPreviewBytes caps how much of an untracked file we read for the diff
+// view. The read happens synchronously inside Update(), and the rendered copy
+// costs another 2-3x in memory, so anything larger freezes the UI instead of
+// being useful.
+const maxPreviewBytes = 2 << 20 // 2 MiB
+
+// stripCR removes carriage returns from content headed for the TUI. Lip Gloss
+// measures \r as zero-width but the terminal acts on it, returning the cursor
+// to column 0 so the box padding and right border overwrite the line.
+func stripCR(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	return strings.ReplaceAll(s, "\r", "")
+}
+
 // GetFileDiff returns the diff output for a single file.
 // Routes by FileStatus to avoid guessing from empty diff output.
 func GetFileDiff(path string, status types.FileStatus) (string, error) {
 	switch status {
 	case types.StatusUntracked:
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", fmt.Errorf("read file: %w", err)
+		}
+		switch {
+		case info.IsDir():
+			// git reports embedded repos as a single directory entry; there
+			// is no file to read.
+			return "(directory — no preview available)\n", nil
+		case info.Mode()&os.ModeSymlink != 0:
+			target, linkErr := os.Readlink(path)
+			if linkErr != nil {
+				return "(symlink)\n", nil
+			}
+			return "(new symlink)\n+ → " + stripCR(target) + "\n", nil
+		case info.Size() > maxPreviewBytes:
+			return fmt.Sprintf("(file too large to preview — %d KB)\n", info.Size()/1024), nil
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return "", fmt.Errorf("read file: %w", err)
@@ -505,7 +652,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 		}
 		var b strings.Builder
 		b.WriteString("(new file)\n")
-		for _, line := range strings.Split(strings.TrimRight(string(content), "\n"), "\n") {
+		for _, line := range strings.Split(strings.TrimRight(stripCR(string(content)), "\n"), "\n") {
 			b.WriteString("+ " + line + "\n")
 		}
 		return b.String(), nil
@@ -518,7 +665,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 			if err != nil {
 				return "(deleted file)\n", nil
 			}
-			result := strings.TrimSpace(string(out))
+			result := stripCR(strings.TrimSpace(string(out)))
 			if result != "" {
 				return result, nil
 			}
@@ -529,7 +676,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 		}
 		var b strings.Builder
 		b.WriteString("(deleted file)\n")
-		for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		for _, line := range strings.Split(strings.TrimRight(stripCR(string(out)), "\n"), "\n") {
 			b.WriteString("- " + line + "\n")
 		}
 		return b.String(), nil
@@ -538,7 +685,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 		// Modified, Added, Renamed — try diff against HEAD, then cached
 		out, err := exec.Command("git", "diff", "HEAD", "--", path).CombinedOutput()
 		if err == nil {
-			result := strings.TrimSpace(string(out))
+			result := stripCR(strings.TrimSpace(string(out)))
 			if result != "" {
 				if strings.Contains(result, "Binary files") {
 					return "", ErrBinaryFile
@@ -549,7 +696,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 		// Fallback: staged changes not yet committed
 		out, err = exec.Command("git", "diff", "--cached", "--", path).CombinedOutput()
 		if err == nil {
-			result := strings.TrimSpace(string(out))
+			result := stripCR(strings.TrimSpace(string(out)))
 			if result != "" {
 				if strings.Contains(result, "Binary files") {
 					return "", ErrBinaryFile
@@ -560,7 +707,7 @@ func GetFileDiff(path string, status types.FileStatus) (string, error) {
 		// Fallback: unstaged changes only
 		out, err = exec.Command("git", "diff", "--", path).CombinedOutput()
 		if err == nil {
-			result := strings.TrimSpace(string(out))
+			result := stripCR(strings.TrimSpace(string(out)))
 			if result != "" {
 				if strings.Contains(result, "Binary files") {
 					return "", ErrBinaryFile
@@ -680,19 +827,35 @@ func GetUnifiedGraph(limit int) string {
 	return strings.TrimRight(string(out), "\n")
 }
 
-// GetAheadBehind returns how many commits the local branch is ahead/behind the remote.
-func GetAheadBehind(branch string) (ahead, behind int) {
-	out, err := exec.Command("git", "rev-list", "--left-right", "--count",
-		branch+"...origin/"+branch).Output()
+// GetAheadBehind returns how many commits the local branch is ahead/behind its
+// upstream. hasUpstream is false when the branch tracks nothing (never pushed,
+// or the tracking ref is gone) — callers must not render that case as 0/0,
+// which reads identically to a fully synced branch.
+func GetAheadBehind(branch string) (ahead, behind int, hasUpstream bool) {
+	if branch == "" {
+		return 0, 0, false
+	}
+	upOut, err := exec.Command("git", "rev-parse", "--abbrev-ref",
+		branch+"@{upstream}").Output()
 	if err != nil {
-		return 0, 0
+		return 0, 0, false
+	}
+	upstream := strings.TrimSpace(string(upOut))
+	if upstream == "" {
+		return 0, 0, false
+	}
+
+	out, err := exec.Command("git", "rev-list", "--left-right", "--count",
+		branch+"..."+upstream).Output()
+	if err != nil {
+		return 0, 0, false
 	}
 	parts := strings.Fields(strings.TrimSpace(string(out)))
 	if len(parts) == 2 {
 		fmt.Sscanf(parts[0], "%d", &ahead)
 		fmt.Sscanf(parts[1], "%d", &behind)
 	}
-	return ahead, behind
+	return ahead, behind, true
 }
 
 // ── Branch operations ──────────────────────────────────
@@ -713,15 +876,20 @@ func GetAllBranches() []types.BranchEntry {
 				continue
 			}
 			isCurrent := strings.HasPrefix(line, "* ")
-			name := strings.TrimPrefix(line, "* ")
+			// "+ name" marks a branch checked out in another worktree.
+			// Without stripping it the name becomes "+ name" and every
+			// checkout/delete/merge built from it fails on a bad pathspec.
+			elsewhere := strings.HasPrefix(line, "+ ")
+			name := strings.TrimPrefix(strings.TrimPrefix(line, "* "), "+ ")
 			name = strings.TrimSpace(name)
-			if strings.HasPrefix(name, "(HEAD detached") {
+			if name == "" || strings.HasPrefix(name, "(HEAD detached") {
 				continue
 			}
 			localNames[name] = true
 			entries = append(entries, types.BranchEntry{
-				Name:      name,
-				IsCurrent: isCurrent,
+				Name:                name,
+				IsCurrent:           isCurrent,
+				CheckedOutElsewhere: elsewhere,
 			})
 		}
 	}
@@ -732,6 +900,12 @@ func GetAllBranches() []types.BranchEntry {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.Contains(line, "->") {
+				continue
+			}
+			// Only origin: switching to a remote-only branch runs
+			// `git checkout -b <n> origin/<n>`, so an `upstream/foo` entry
+			// would resolve to the nonexistent ref origin/upstream/foo.
+			if !strings.HasPrefix(line, "origin/") {
 				continue
 			}
 			// Strip origin/ prefix for dedup check
