@@ -38,10 +38,11 @@ func doSwitchBranch(name string, isRemote bool) tea.Cmd {
 			if popErr := git.StashPop(); popErr != nil {
 				git.CleanupFailedStashPop()
 				return branchSwitchResultMsg{
-					stashRef: stashRef,
+					stashRef:      stashRef,
+					stashOrphaned: true,
 					err: recoveryError{fmt.Errorf(
-						"could not switch to %s (%v), and restoring your uncommitted changes also failed — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s",
-						name, err, stashRef, stashRef)},
+						"could not switch to %s (%v), and restoring your uncommitted changes also failed — the working tree was reset clean and nothing was lost. %s",
+						name, err, stashRecoveryHint(stashRef))},
 				}
 			}
 			return branchSwitchResultMsg{err: fmt.Errorf(
@@ -134,12 +135,13 @@ func doMergeBranch(name string) tea.Cmd {
 			if popErr := git.StashPop(); popErr != nil {
 				git.CleanupFailedStashPop()
 				return branchMergeResultMsg{
-					source:   name,
-					merged:   true,
-					upToDate: upToDate,
+					source:        name,
+					merged:        true,
+					upToDate:      upToDate,
+					stashOrphaned: true,
 					err: recoveryError{fmt.Errorf(
-						"merged %s, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s",
-						name, stashRef, stashRef)},
+						"merged %s, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s",
+						name, stashRecoveryHint(stashRef))},
 				}
 			}
 			return branchMergeResultMsg{source: name, merged: true, upToDate: upToDate, stashRestored: true}
@@ -447,6 +449,14 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mergeTargetCursor = defaultIdx
 		m.mergeTargetMode = true
+		return m, nil
+	case "S":
+		// A switch or a merge that could not restore its auto-stash leaves its
+		// recovery banner on THIS screen, and the banner says "press S". Without
+		// the key here that instruction would be a lie two thirds of the time.
+		if m.stashAvailable() {
+			m.enterStash()
+		}
 		return m, nil
 	case "esc":
 		if m.branchStandalone {

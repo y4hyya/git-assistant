@@ -23,10 +23,14 @@ func (m Model) menuItems() []menuItem {
 	// against. One way out is offered instead — the branch manager, where
 	// switching to a branch is the cure.
 	if m.detached {
-		return []menuItem{
+		items := []menuItem{
 			{"Branch", "switch to a branch to continue"},
-			{"Config", "git settings"},
 		}
+		// Stash is the exception to "every entry needs a branch": a stash
+		// belongs to no branch, and a detached HEAD is precisely the state
+		// where uncommitted work most needs a way back out.
+		items = append(items, m.stashMenuItem()...)
+		return append(items, menuItem{"Config", "git settings"})
 	}
 
 	changeCount := 0
@@ -54,16 +58,27 @@ func (m Model) menuItems() []menuItem {
 	if m.canPush() {
 		items = append(items, menuItem{"Push", m.pushMenuDesc()})
 	}
-	items = append(items,
-		menuItem{"Branch", fmt.Sprintf("%d branches", m.branchCount)},
-		menuItem{"Config", "git settings"},
-	)
+	items = append(items, menuItem{"Branch", fmt.Sprintf("%d branches", m.branchCount)})
+	items = append(items, m.stashMenuItem()...)
+	items = append(items, menuItem{"Config", "git settings"})
 	// Recovery entry: when this local repo has no remote and `gh` is
 	// available, offer to create the GitHub repo from here.
 	if m.canConnectGH() {
 		items = append(items, menuItem{"Connect to GitHub", "create repo + set origin via gh"})
 	}
 	return items
+}
+
+// stashMenuItem is the Stash entry, or nothing. Returned as a slice so both
+// menuItems branches splice it in at the right place without repeating the
+// condition — which is stashAvailable, the same one the `S` key and both help
+// rows use. Hidden at zero on purpose: a beginner who has never stashed
+// anything should not be asked to wonder what the word means.
+func (m Model) stashMenuItem() []menuItem {
+	if !m.stashAvailable() {
+		return nil
+	}
+	return []menuItem{{"Stash", fmt.Sprintf("%d stashed", m.stashCount)}}
 }
 
 // isConventionalType reports whether s can be a conventional-commit type:
@@ -349,6 +364,9 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.branchScroll = 0
 			m.branchStandalone = false
 			m.step = stepBranch
+		case "Stash":
+			m.enterStash()
+			return m, nil
 		case "Config":
 			m.configCursor = 0
 			m.configGlobal = false
@@ -385,6 +403,15 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.branchMerging = true
 			return m, tea.Batch(doMergeBranch(m.mainRef), m.spinner.Tick)
 		}
+	case "S":
+		// The loop-closer. Every recovery banner this app raises about an
+		// orphaned auto-stash ends with "press S to open the stash manager", and
+		// this is that key. Capital, because lowercase s already syncs with main
+		// and both are live on this screen.
+		if m.stashAvailable() {
+			m.enterStash()
+		}
+		return m, nil
 	case "p":
 		// Manual pull fallback. Opens the sync dialog if there's anything
 		// to pull — user may have skipped the startup dialog, or new

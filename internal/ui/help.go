@@ -47,6 +47,8 @@ func (m Model) helpRows() [][]helpEntry {
 		return m.syncHelp()
 	case stepInit:
 		return m.initHelp()
+	case stepStash:
+		return m.stashHelp()
 	}
 	return nil
 }
@@ -111,6 +113,13 @@ func (m Model) menuHelp() [][]helpEntry {
 	}
 	if m.canSyncMain() {
 		entries = append(entries, helpEntry{"s", "sync"})
+	}
+	// Capital S, because lowercase s is the sync shortcut above and the two are
+	// live on this screen at the same time. Listed only when there is something
+	// to open — the recovery banners that send people here say "press S", and
+	// the key answers under exactly the same condition.
+	if m.stashAvailable() {
+		entries = append(entries, helpEntry{"S", "stash"})
 	}
 	// The dashboard is where the `?` overlay is discovered; every other screen
 	// answers it too, and the overlay itself says so.
@@ -239,17 +248,58 @@ func (m Model) branchHelp() [][]helpEntry {
 	if m.branchStandalone {
 		exit = helpEntry{"q", "quit"}
 	}
+	first := []helpEntry{
+		{symArrows, "navigate"},
+		{"enter", "switch"},
+		{"c", "create"},
+	}
+	// A failed auto-stash pop from a switch or a merge lands its recovery banner
+	// on THIS screen, and the banner says "press S". Same key, same gate as the
+	// dashboard's — on the shorter row, so the second one does not wrap.
+	if m.stashAvailable() {
+		first = append(first, helpEntry{"S", "stash"})
+	}
 	return [][]helpEntry{
-		{
-			{symArrows, "navigate"},
-			{"enter", "switch"},
-			{"c", "create"},
-		},
+		first,
 		{
 			{"r", "rename"},
 			{"d", "delete"},
 			{"m", "merge"},
 			exit,
+		},
+	}
+}
+
+// stashHelp mirrors viewStash's dispatch: the confirmation and the preview each
+// short-circuit the list, and an empty stack has no per-entry keys at all.
+func (m Model) stashHelp() [][]helpEntry {
+	switch {
+	case m.stashConfirmDrop:
+		return oneRow(helpEntry{"y", "delete"}, helpEntry{"any", "cancel"})
+	case m.stashShowDiff:
+		return oneRow(
+			helpEntry{symArrows, "scroll"},
+			helpEntry{"d/enter/esc", "back"},
+			helpEntry{"q", "quit"},
+		)
+	}
+	if len(m.stashEntries) == 0 {
+		return oneRow(helpEntry{"esc", "menu"}, helpEntry{"q", "quit"})
+	}
+	// Two rows, grouped by what they do — move and look, then act on the entry
+	// under the cursor. Five keys with their honest labels do not fit one
+	// 80-column line, and a wrapped bar costs the list a whole row.
+	return [][]helpEntry{
+		{
+			{symArrows, "navigate"},
+			{"enter/d", "preview"},
+			{"esc", "menu"},
+			{"q", "quit"},
+		},
+		{
+			{"a", "apply (keep)"},
+			{"p", "pop (apply + delete)"},
+			{"x", "delete"},
 		},
 	}
 }
@@ -507,6 +557,14 @@ func (m Model) screenName() string {
 		return "Remote sync"
 	case stepInit:
 		return "Setup"
+	case stepStash:
+		switch {
+		case m.stashConfirmDrop:
+			return "Delete stash"
+		case m.stashShowDiff:
+			return "Stash preview"
+		}
+		return "Stash manager"
 	}
 	return "git-assist"
 }

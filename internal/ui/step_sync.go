@@ -51,9 +51,10 @@ func doPullCurrent(branch string) tea.Cmd {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err: recoveryError{fmt.Errorf("pulled, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s", stashRef, stashRef)},
+					err: recoveryError{fmt.Errorf("pulled, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s", stashRecoveryHint(stashRef))},
 					// Already handled here — don't let the handler pop twice.
-					kind: pullKindCurrent,
+					kind:          pullKindCurrent,
+					stashOrphaned: true,
 				}
 			}
 		}
@@ -97,8 +98,9 @@ func doSyncMain(mainBranch string) tea.Cmd {
 			if err := git.StashPop(); err != nil {
 				git.CleanupFailedStashPop()
 				return pullResultMsg{
-					err:  recoveryError{fmt.Errorf("merged, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. Your changes are in stash %s; recover with: git stash apply %s", stashRef, stashRef)},
-					kind: pullKindMain,
+					err:           recoveryError{fmt.Errorf("merged, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s", stashRecoveryHint(stashRef))},
+					kind:          pullKindMain,
+					stashOrphaned: true,
 				}
 			}
 		}

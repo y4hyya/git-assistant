@@ -35,10 +35,19 @@ An interactive TUI git dashboard built with Go and [Bubble Tea](https://github.c
 Reachable from the menu, from the file selector (`b`), or directly via `git-assist branch`.
 - Switch, create, rename (`r`), and delete branches. `main` / `master` and the current branch are protected from deletion.
 - Renaming discloses that `git branch -m` is local only: if the branch has an upstream, both the prompt and the result say origin still has the old name.
-- Auto-stash and restore around branch switches and pulls — **includes untracked files**. If a stash-pop conflicts, the short SHA of your stash is surfaced so you can recover with `git stash apply <sha>`.
+- Auto-stash and restore around branch switches and pulls — **includes untracked files**. If a stash-pop conflicts, the short SHA of your stash is surfaced and `S` opens the stash manager right there — no trip to another terminal.
 - Merge with `--no-ff` so the fork/merge diamond is always visible in the graph.
 - Merge target picker — choose which branch to merge **into** with a direction arrow; auto-switches to the target first if needed.
 - Conflicting merges auto-abort with a clear file count, never leaving the repo half-merged.
+
+### Stash manager
+Appears on the menu (and answers `S`) only once there is something stashed — from the menu or from the branch manager, including on top of the "your changes are safe in stash …" banner an auto-stash failure raises.
+- Every entry as `abc1234  2h ago  on feat — message`, newest first, scrollable.
+- `enter` / `d` previews the full patch, **untracked files included**, with the same colouring and scrolling as the file diff viewer.
+- `a` applies and keeps the entry, `p` pops (applies and removes it), `x` deletes after a confirmation that states the cost — stashed changes are in no commit, and git cannot bring them back.
+- Results are reported in plain words: *"Applied stash abc1234 — 3 files restored to the working tree; the entry is still in the stash list."*
+- A conflicted apply or pop is described truthfully: which files now hold conflict markers, that the stash itself was kept, and how to either resolve or cancel. Nothing is auto-aborted behind your back.
+- Entries are always addressed by their stable SHA, re-resolved just before every operation — a `stash@{N}` read a moment ago can name a different entry after a drop.
 
 ### Remote sync
 - Sync dialog auto-shows on startup when the current branch is behind origin or behind main.
@@ -121,6 +130,7 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `enter` | Open selected screen |
 | `p` | Pull current branch (visible when behind origin) |
 | `s` | Sync with `origin/main` (visible when behind main) |
+| `S` | Open the stash manager (visible when something is stashed) |
 
 ### Files
 | Key | Action |
@@ -167,6 +177,17 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `r` | Rename branch (local branches only) |
 | `d` | Delete branch |
 | `m` | Merge (opens target picker) |
+| `S` | Open the stash manager (visible when something is stashed) |
+| `esc` | Back to menu |
+
+### Stash manager
+| Key | Action |
+|-----|--------|
+| `↑↓` or `j/k` | Navigate |
+| `enter` or `d` | Toggle the patch preview (`↑↓` scrolls it, `esc` closes it) |
+| `a` | Apply — restores the changes, keeps the entry |
+| `p` | Pop — restores the changes and removes the entry |
+| `x` | Delete the entry (asks first; there is no undo) |
 | `esc` | Back to menu |
 
 ### Config editor
@@ -200,6 +221,7 @@ Builds embed the current `git describe --tags --always --dirty` output as the ve
 main.go                    Entry, flag and subcommand parsing
 internal/
   git/                     Pure git operations — no TUI dependencies
+                           (git.go, stash.go, gitignore_templates.go)
   types/                   Shared types (FileEntry, BranchEntry, …)
   ui/
     model.go               Bubble Tea Model, step enum, async msg handlers
@@ -208,6 +230,7 @@ internal/
     step_menu.go           Main menu hub with commit graph
     step_files.go          File selector, diff, edit, gitignore, discard, undo/revert, filter
     step_branch.go         Branch manager (switch, create, rename, delete, merge)
+    step_stash.go          Stash manager (list, preview, apply, pop, delete)
     step_config.go         Config editor
     step_init.go           First-run init flow
     step_sync.go           Pull / sync-with-main dialog

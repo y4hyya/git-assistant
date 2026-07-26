@@ -25,6 +25,7 @@ var (
 	symHRule      = "─"
 	symMidDot     = "·"
 	symBullet     = "•"
+	symEmDash     = "—"
 
 	// Commit-graph glyphs. git emits `*`, `|`, `/`, `\`, `_`, `-` and `.`;
 	// these are the display forms. `-` and `.` only ever show up on octopus
@@ -53,6 +54,7 @@ func init() {
 		symHRule = "-"
 		symMidDot = "-"
 		symBullet = "*"
+		symEmDash = "--"
 		symGraphVert = "|"
 		symGraphDash = "-"
 		symGraphCorner = "."

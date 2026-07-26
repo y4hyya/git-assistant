@@ -1211,6 +1211,21 @@ func formatErrorCtx(err error, historyRewritten bool) string {
 	}
 
 	switch {
+	// The two stash cases lead, ahead of the generic CONFLICT and
+	// "would be overwritten by merge" branches below: git's stash output
+	// contains both of those words, and both generic hints answer the wrong
+	// question here ("before committing" — there is no commit in progress).
+	//
+	// Traced against real git before it was written: `git checkout -- .` alone
+	// does NOT cancel a conflicted apply — it fails with "path 'x' is unmerged".
+	// The two-step is what works, and it costs unrelated uncommitted edits, so
+	// the hint says so rather than promising a free undo.
+	case strings.Contains(msg, "conflict markers"):
+		hint = "Fix the marked sections and `git add` them to keep the stashed work.\n" +
+			"  To cancel the apply instead: `git reset HEAD` then `git checkout -- .`\n" +
+			"  (that also discards any other uncommitted edits). The stash is still in the list."
+	case strings.Contains(msg, "cover the same files"):
+		hint = "Commit or stash your current changes first, then retry."
 	case strings.Contains(msg, "nothing to commit"):
 		hint = "Go back and select at least one file."
 	case strings.Contains(msg, "CONFLICT"):

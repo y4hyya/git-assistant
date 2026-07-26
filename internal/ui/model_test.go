@@ -2044,6 +2044,25 @@ func TestFormatErrorHints(t *testing.T) {
 			msg:  "error: Your local changes to the following files would be overwritten by merge:",
 			want: "stash",
 		},
+		{
+			// git's stash output contains the word CONFLICT, and the generic
+			// hint for that ("before committing") answers a question nobody
+			// asked — there is no commit in progress on the stash screen.
+			// Traced against real git: `git checkout -- .` alone fails on
+			// unmerged paths, so the cancel advice has to be the two-step.
+			name:    "conflicted stash apply",
+			msg:     "applying stash abc1234 conflicted — conflict markers are now in a.txt, and the stash itself was kept, so nothing is lost",
+			want:    "git reset HEAD` then `git checkout -- .",
+			wantNot: "before committing",
+		},
+		{
+			// Same trap the other way: git's refusal literally says "would be
+			// overwritten by merge", but nothing is merging here.
+			name:    "stash refused by a dirty tree",
+			msg:     "could not restore stash abc1234 — uncommitted changes in your working tree cover the same files, so git stopped before touching anything",
+			want:    "Commit or stash your current changes first, then retry.",
+			wantNot: "the merge would overwrite them",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3580,6 +3599,14 @@ func helpScreens(t *testing.T) []struct {
 		{"menu with remote work", mk(stepMenu, func(m *Model) {
 			m.hasRemote, m.behindOrigin, m.behindMain, m.mainRef = true, 2, 1, "origin/main"
 		})},
+		// S joins the footer only when there is a stack to open, so both
+		// states need covering — on the dashboard and on the branch manager,
+		// which is where a failed auto-stash pop leaves its banner.
+		{"menu with a stash", mk(stepMenu, func(m *Model) { m.stashCount = 2 })},
+		{"branch with a stash", mk(stepBranch, func(m *Model) {
+			m.branchEntries = []types.BranchEntry{{Name: "main", IsCurrent: true}}
+			m.stashCount = 1
+		})},
 		{"files", mk(stepFiles, nil)},
 		{"files deleted entry", mk(stepFiles, func(m *Model) {
 			m.files = []types.FileEntry{entry("gone.go", types.StatusDeleted)}
@@ -3648,6 +3675,16 @@ func helpScreens(t *testing.T) []struct {
 		{"init template", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickTemplate })},
 		{"init visibility", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickVisibility })},
 		{"init gh auth", mk(stepInit, func(m *Model) { m.initPhase = initPhaseConfirmGHAuth })},
+		{"stash list", mk(stepStash, func(m *Model) { *m = stashModel(t, 2) })},
+		{"stash empty", mk(stepStash, func(m *Model) { *m = stashModel(t, 0) })},
+		{"stash preview", mk(stepStash, func(m *Model) {
+			*m = stashModel(t, 1)
+			m.stashShowDiff, m.stashDiff = true, "@@ -1 +1 @@\n-a\n+b\n"
+		})},
+		{"stash delete", mk(stepStash, func(m *Model) {
+			*m = stashModel(t, 1)
+			m.stashConfirmDrop = true
+		})},
 	}
 }
 

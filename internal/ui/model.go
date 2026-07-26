@@ -35,6 +35,7 @@ const (
 	stepDone                // success screen
 	stepSync                // sync dialog (pull current / merge origin/main)
 	stepInit                // first-run setup when cwd is not a git repo
+	stepStash               // stash manager: list, preview, apply, pop, delete
 )
 
 // Async result messages
@@ -87,6 +88,12 @@ type branchSwitchResultMsg struct {
 	newBranch     string
 	stashConflict bool
 	stashRef      string // short SHA of the stash entry, surfaced when pop fails
+	// stashOrphaned says an auto-stash was pushed and could not be popped, so
+	// the stack is one entry longer than the last dashboard snapshot recorded.
+	// The handler bumps stashCount off this rather than waiting for the async
+	// refresh: the banner it raises tells the user to press S, and the key is
+	// gated on that count.
+	stashOrphaned bool
 }
 type branchCreateResultMsg struct {
 	err       error
@@ -128,6 +135,9 @@ type branchMergeResultMsg struct {
 	stashed       bool
 	stashRef      string
 	stashRestored bool
+	// stashOrphaned: the pop this command performed failed, so the entry is
+	// still in the stack. See branchSwitchResultMsg.
+	stashOrphaned bool
 }
 type fetchResultMsg struct{ err error }
 
@@ -152,6 +162,9 @@ type pullResultMsg struct {
 	// switch and the branch merge do — uncommitted work disappearing and
 	// reappearing around a pull is exactly what a beginner needs told.
 	stashRestored bool
+	// stashOrphaned: the pop this command performed failed, so the entry is
+	// still in the stack. See branchSwitchResultMsg.
+	stashOrphaned bool
 	// upToDate: git answered "Already up to date" — nothing arrived.
 	upToDate bool
 }
@@ -283,6 +296,22 @@ type Model struct {
 	mergeTargetMode      bool
 	mergeTargets         []types.BranchEntry
 	mergeTargetCursor    int
+
+	// Stash manager. stashEntries is re-read on entry and replaced wholesale by
+	// every mutation result — stash@{N} is positional, so a list kept across a
+	// drop names the wrong entries (see doStashApply). stashCount is the
+	// dashboard's copy, refreshed with the rest of the snapshot, and it is what
+	// the menu entry and the `S` key are gated on.
+	stashEntries     []git.StashEntry
+	stashCursor      int
+	stashScroll      int
+	stashCount       int
+	stashShowDiff    bool
+	stashDiff        string
+	stashDiffScroll  int
+	stashConfirmDrop bool
+	stashApplying    bool // apply or pop in flight (blocks re-dispatch)
+	stashDropping    bool
 
 	// Config editor
 	configCursor     int
@@ -682,6 +711,10 @@ type dashboardSnapshot struct {
 	mainRef      string
 	branchCount  int
 	hasAnyCommit bool
+	// stashCount decides whether the dashboard offers the Stash entry and the
+	// `S` key at all. Read here with everything else — the menu must never fork
+	// `git stash list` from a View func or a keypress.
+	stashCount int
 	// detached: HEAD is on no branch. Read here with everything else so the
 	// dashboard's gating never depends on a git call made inside Update.
 	detached bool
@@ -707,6 +740,7 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 	snap.mainRef = main.Ref
 	snap.branchCount = len(git.GetAllBranches())
 	snap.hasAnyCommit = git.HasAnyCommit()
+	snap.stashCount = git.StashCount()
 	snap.detached = git.IsDetachedHead()
 	if withStatus {
 		if files, err := git.GetStatus(); err == nil {
@@ -736,6 +770,12 @@ func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.branchCount = s.branchCount
 	m.hasAnyCommit = s.hasAnyCommit
 	m.detached = s.detached
+	// Not while the manager is on screen: it holds the authoritative list (it
+	// re-reads on entry and after every mutation), and a snapshot taken before
+	// a pop would put the entry back in the count.
+	if m.step != stepStash {
+		m.stashCount = s.stashCount
+	}
 	if s.filesOK && m.step == stepMenu {
 		m.files = s.files
 		m.cursor = 0
@@ -903,8 +943,11 @@ func (m *Model) appendNoteClause(clause string) {
 // The file selector is on the list because the two operations it owns — the
 // .gitignore apply and the undo — both finish there. Their notes used to wait
 // for the user to walk back to the dashboard before saying anything at all.
+// The stash manager is on the list for the same reason: an apply, a pop and a
+// delete all finish there, and the user stays to work on the rest of the stack.
 func (m Model) rendersStatusNote() bool {
-	return m.step == stepMenu || m.step == stepBranch || m.step == stepFiles
+	return m.step == stepMenu || m.step == stepBranch ||
+		m.step == stepFiles || m.step == stepStash
 }
 
 // isNavKey reports whether a keypress only moves a cursor. Status notes
@@ -983,8 +1026,21 @@ func (m Model) opInFlight() bool {
 		m.discarding ||
 		m.gitignoring ||
 		m.pulling ||
+		m.stashApplying ||
+		m.stashDropping ||
 		m.initWorking
 }
+
+// noteOrphanedStash records that an auto-stash was pushed and could not be
+// popped: the stack now holds exactly one more entry than the last dashboard
+// snapshot counted. Arithmetic, not a guess — this app pushed that entry and
+// just watched the pop fail.
+//
+// It matters because the banner raised alongside it says "press S to open the
+// stash manager", and both that key and the menu entry are gated on the count.
+// Waiting for the async refresh would leave the instruction dead for as long as
+// the refresh takes, on precisely the screen where it is the only way forward.
+func (m *Model) noteOrphanedStash() { m.stashCount++ }
 
 // clearForceQuitPrompt disarms the force-quit confirmation and drops its
 // warning banner. Called from every async result handler: once the operation
@@ -1139,6 +1195,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setStatusNote("Reverted %s — a new commit undoes it", subject)
 		return m, m.requestDashboardRefresh()
+
+	case stashApplyResultMsg:
+		return m.handleStashApplyResult(msg)
+
+	case stashDropResultMsg:
+		return m.handleStashDropResult(msg)
 
 	case discardResultMsg:
 		m.confirmDiscard = false
@@ -1358,6 +1420,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case branchSwitchResultMsg:
 		m.branchSwitching = false
 		m.startResult()
+		if msg.stashOrphaned {
+			m.noteOrphanedStash()
+		}
 		if msg.err != nil {
 			m.err = msg.err
 			if m.branchMergePending != "" {
@@ -1389,11 +1454,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				pendingNote = fmt.Sprintf(" Pending merge of %s was cancelled.", m.branchMergePending)
 			}
 			m.branchMergePending = ""
+			m.noteOrphanedStash()
 			// Describe the state CleanupFailedStashPop actually leaves behind:
 			// the working tree was reset clean, so there are no conflict
 			// markers to resolve anywhere. The changes only exist in the stash.
-			m.err = recoveryError{fmt.Errorf("switched to %s, but your stashed changes did not apply here — the working tree was reset clean and nothing was lost.%s Your changes are in stash %s; recover with: git stash apply %s",
-				msg.newBranch, pendingNote, msg.stashRef, msg.stashRef)}
+			m.err = recoveryError{fmt.Errorf("switched to %s, but your stashed changes did not apply here — the working tree was reset clean and nothing was lost.%s %s",
+				msg.newBranch, pendingNote, stashRecoveryHint(msg.stashRef))}
 			return m, refresh
 		}
 		// A switch on a dirty tree stashes, checks out and pops — silently, so
@@ -1506,6 +1572,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pullResultMsg:
 		m.pulling = false
 		m.startResult()
+		if msg.stashOrphaned {
+			m.noteOrphanedStash()
+		}
 		if msg.err != nil {
 			verb := "pull"
 			if msg.kind == pullKindMain {
@@ -1528,8 +1597,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.stashed {
 				if popErr := git.StashPop(); popErr != nil {
 					git.CleanupFailedStashPop()
-					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean — they are safe in stash %s; recover with: git stash apply %s",
-						m.err, msg.stashRef, msg.stashRef)}
+					m.noteOrphanedStash()
+					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean. %s",
+						m.err, stashRecoveryHint(msg.stashRef))}
 				} else {
 					m.err = fmt.Errorf("%v. Your uncommitted changes were restored", m.err)
 				}
@@ -1579,6 +1649,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchMerging = false
 		m.branchMergeMode = false
 		m.startResult()
+		if msg.stashOrphaned {
+			m.noteOrphanedStash()
+		}
 		if msg.err != nil && !msg.merged {
 			conflicts := msg.conflictFiles
 			if len(conflicts) > 0 {
@@ -1599,8 +1672,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.stashed {
 				if popErr := git.StashPop(); popErr != nil {
 					git.CleanupFailedStashPop()
-					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean — they are safe in stash %s; recover with: git stash apply %s",
-						m.err, msg.stashRef, msg.stashRef)}
+					m.noteOrphanedStash()
+					m.err = recoveryError{fmt.Errorf("%v. Restoring your uncommitted changes also failed, so the working tree was reset clean. %s",
+						m.err, stashRecoveryHint(msg.stashRef))}
 				} else {
 					m.err = fmt.Errorf("%v. Your uncommitted changes were stashed and restored", m.err)
 				}
@@ -1722,6 +1796,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateSync(msg)
 	case stepInit:
 		return m.updateInit(msg)
+	case stepStash:
+		return m.updateStash(msg)
 	}
 
 	return m, nil
@@ -1765,6 +1841,8 @@ func (m Model) View() string {
 		content = m.viewSync()
 	case stepInit:
 		content = m.viewInit()
+	case stepStash:
+		content = m.viewStash()
 	}
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
