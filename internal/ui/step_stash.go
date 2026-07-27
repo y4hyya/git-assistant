@@ -35,6 +35,20 @@ func stashRecoveryHint(ref string) string {
 	return fmt.Sprintf("Your changes are safe in stash %s — press S to open the stash manager.", ref)
 }
 
+// stashLockedByMergeErr is what apply, pop and delete refuse with while a merge
+// is being resolved. Advisory, not a failure — nothing broke, the entry simply
+// belongs to an operation that is not finished.
+//
+// The resolver parks the auto-stash a conflicting merge took and restores it
+// itself once the merge is committed or aborted. Mutating the stack underneath
+// it is how the two halves of this feature used to destroy work: dropping the
+// parked entry sent the resolver's pop after somebody else's stash, and popping
+// it made the resolver's pop fail on an entry that no longer existed. Looking is
+// still allowed — the preview is read-only.
+func stashLockedByMergeErr() error {
+	return fmt.Errorf("%s finish or abort the merge first — the resolver is holding a parked stash, and it restores it for you. Open \"Resolve conflicts\"", symWarn)
+}
+
 // ── Async results ───────────────────────────────────────
 
 // stashApplyResultMsg carries the outcome of `a` (apply) or `p` (pop).
@@ -263,6 +277,10 @@ func (m Model) updateStash(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
+		if m.mergeInProgress {
+			m.err = stashLockedByMergeErr()
+			return m, nil
+		}
 		m.stashApplying = true
 		return m, tea.Batch(doStashApply(e.SHA, false), m.spinner.Tick)
 	case "p":
@@ -270,10 +288,18 @@ func (m Model) updateStash(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
+		if m.mergeInProgress {
+			m.err = stashLockedByMergeErr()
+			return m, nil
+		}
 		m.stashApplying = true
 		return m, tea.Batch(doStashApply(e.SHA, true), m.spinner.Tick)
 	case "x":
 		if _, ok := m.stashSelected(); !ok {
+			return m, nil
+		}
+		if m.mergeInProgress {
+			m.err = stashLockedByMergeErr()
 			return m, nil
 		}
 		m.stashConfirmDrop = true
@@ -426,6 +452,14 @@ func (m Model) viewStash() string {
 	b.WriteString("\n")
 	b.WriteString(stepStyle.Render("  Stash Manager"))
 	b.WriteString("\n\n")
+
+	// Mid-merge the stack is frozen (see stashLockedByMergeErr). Said up front,
+	// because a key that refuses is only honest if the screen has already
+	// explained why before it is pressed.
+	if m.mergeInProgress {
+		b.WriteString("  " + modifiedStyle.Render(symWarn+" A merge is being resolved — this list is read-only until it is done") + "\n")
+		b.WriteString("  " + dimStyle.Render("The resolver is holding one of these entries and puts it back itself.") + "\n\n")
+	}
 
 	// ── Delete confirmation ────────────────────────────
 	// Named, and costed: a dropped stash is not in any commit, so there is no

@@ -9,6 +9,18 @@ const (
 	StatusDeleted
 	StatusRenamed
 	StatusUntracked
+	// StatusConflicted is an UNMERGED index entry — the seven porcelain codes
+	// git documents as such (UU, AA, DD, AU, UA, DU, UD). It is not a flavour
+	// of "modified": the file on disk holds conflict markers, and plain
+	// `git commit` refuses to record it at all ("you have unmerged files").
+	//
+	// It exists because the wizard's staging sequence (reset → add → commit)
+	// removes git's own guard, so without a status of its own a conflicted file
+	// arrived in the picker as an ordinary "M" and committed the raw
+	// <<<<<<< / ======= / >>>>>>> block under an innocent subject. A stash pop
+	// that conflicts leaves exactly that state with NO MERGE_HEAD, so nothing
+	// keyed on a merge being in progress can see it either.
+	StatusConflicted
 )
 
 // Symbol returns the short status indicator.
@@ -24,6 +36,9 @@ func (s FileStatus) Symbol() string {
 		return "R"
 	case StatusUntracked:
 		return "?"
+	case StatusConflicted:
+		// "U" for unmerged, as git spells it in the porcelain codes.
+		return "U"
 	default:
 		return "?"
 	}

@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"git-assist/internal/git"
@@ -43,21 +46,62 @@ import (
 // restored at exactly two points, both of which return the tree to a state a
 // stash can apply onto:
 //
-//	continue:   git commit --no-edit   →   git stash pop
-//	abort:      git merge --abort      →   git stash pop
+//	continue:   git commit --no-edit   →   pop the parked entry
+//	abort:      git merge --abort      →   pop the parked entry
 //
 // Either way the pop is last, and a failed pop takes the same recoveryError /
 // stash-manager path every other auto-stash failure in this app takes — the
 // entry stays in the stack and the banner says which SHA it is.
 //
+// ── Addressing the parked entry ─────────────────────────
+//
+// BY SHA, never `git stash pop` (which means stash@{0}, whatever is on top
+// right now). The resolver deliberately lets the user leave — esc goes back to
+// the dashboard, and the stash manager is one keypress from there — so the
+// stack can be mutated in the middle of a resolution. Traced in a scratch repo,
+// both halves of that were real damage:
+//
+//   - the parked entry dropped from the manager, and the positional pop then
+//     restored an unrelated week-old stash INTO the merged tree, reporting it
+//     as "your uncommitted changes were restored";
+//   - the parked entry popped from the manager (which succeeds once every
+//     conflict is staged), and the positional pop then failed with "No stash
+//     entries found" — whereupon CleanupFailedStashPop's `git checkout -- .`
+//     destroyed the changes that had just been restored, under a banner saying
+//     nothing was lost.
+//
+// So: StashRefForSHA immediately before the pop (the same rule the stash
+// manager follows), ErrNoSuchStash means SKIP — the entry was already applied
+// or deleted, and there is nothing left to restore — and CleanupFailedStashPop
+// runs ONLY for a genuinely conflicted apply of the right entry, which is the
+// one case where git wrote markers and kept the stash. The stash manager's
+// mutating keys are additionally locked while a merge is in progress (see
+// updateStash), because the least confusing version of this is the one where
+// the stack cannot move under the resolver in the first place.
+//
 // The consequence the screen has to own: while conflicts are open, the user's
 // uncommitted work is NOT in the working tree. The header says so, because
 // otherwise a beginner sees their edits missing and assumes the merge ate them.
+//
+// ── Surviving a quit ────────────────────────────────────
 //
 // Quitting mid-resolution leaves the merge on disk (and the stash in the
 // stack). That is why NewModel checks git.MergeInProgress() and opens here —
 // which also picks up a merge started outside git-assist entirely, where the
 // labels come from MERGE_MSG instead of from the operation that started it.
+//
+// The parked stash cannot survive in memory, though, and a recovered merge that
+// finishes without restoring it breaks the previous session's on-screen promise
+// ("your changes come back when this finishes") without a word. So the
+// association is written to a small file next to git's own merge state —
+// `.git/git-assist-conflict-stash`, holding the stash SHA and the two branch
+// labels. `.git` is the right home for exactly the reasons MERGE_HEAD lives
+// there: it is repo-scoped, it survives a relaunch, it is never committed, and
+// it disappears with the repository. It is written when the merge parks a
+// stash, honoured by the startup recovery path, and deleted when the merge is
+// finished or aborted. Every access is best-effort: a repository that will not
+// give up its git directory still resolves conflicts, it just cannot remember
+// the stash across a restart.
 
 // conflictOrigin records what stopped, so the header can name it. The wording
 // differs enough to matter: "merging feat into main" and "pulling origin/main"
@@ -126,7 +170,11 @@ type conflictFinishResultMsg struct {
 	target        string
 	stashRestored bool
 	stashOrphaned bool
-	stashRef      string
+	// stashMissing: the parked entry was not in the stack any more, so there was
+	// nothing to pop. Reported rather than inferred — silence here reads as "the
+	// merge restored my work" on a tree where nothing came back.
+	stashMissing bool
+	stashRef     string
 }
 
 // conflictAbortResultMsg is `a`: the abort, then the stash.
@@ -134,6 +182,7 @@ type conflictAbortResultMsg struct {
 	err           error
 	stashRestored bool
 	stashOrphaned bool
+	stashMissing  bool
 	stashRef      string
 }
 
@@ -187,6 +236,60 @@ func doConflictSave(path, content string) tea.Cmd {
 	}
 }
 
+// parkedStashOutcome is what restoring the merge's parked auto-stash did. Four
+// outcomes, and they are genuinely different states of the repository — see
+// restoreParkedStash.
+type parkedStashOutcome struct {
+	restored bool
+	missing  bool
+	orphaned bool
+	err      error
+}
+
+// restoreParkedStash pops the entry this merge parked, addressed by its SHA.
+//
+// done names what has already happened ("the merge is committed"), because
+// every message below has to start by saying that the merge itself is over —
+// the stash is the part that may not have worked.
+//
+// The three failure paths are deliberately NOT the same:
+//
+//   - gone: the entry is not in the stack, so nothing is restored and nothing
+//     is cleaned up. This is a normal outcome — the user can have applied it
+//     from the stash manager — and it is reported, not treated as an error.
+//   - conflicted: git wrote markers and KEPT the entry, so the working tree is
+//     reset clean and the banner points at the stash manager. The only path
+//     that may run CleanupFailedStashPop.
+//   - refused: git stopped before touching anything. The tree and the stash are
+//     exactly as they were, so cleaning up here would destroy work git did not.
+func restoreParkedStash(sha, done string) parkedStashOutcome {
+	ref, err := git.StashRefForSHA(sha)
+	if err != nil {
+		if errors.Is(err, git.ErrNoSuchStash) {
+			return parkedStashOutcome{missing: true}
+		}
+		// The stack could not be read at all. Nothing was touched, and guessing
+		// at stash@{0} is exactly the guess this function exists to remove.
+		return parkedStashOutcome{orphaned: true, err: recoveryError{fmt.Errorf(
+			"%s, but the stash list could not be read, so your uncommitted changes were left parked. %s",
+			done, stashRecoveryHint(sha))}}
+	}
+	popErr := git.StashPopRef(ref)
+	switch {
+	case popErr == nil:
+		return parkedStashOutcome{restored: true}
+	case errors.Is(popErr, git.ErrStashConflict):
+		git.CleanupFailedStashPop()
+		return parkedStashOutcome{orphaned: true, err: recoveryError{fmt.Errorf(
+			"%s, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s",
+			done, stashRecoveryHint(sha))}}
+	default:
+		return parkedStashOutcome{orphaned: true, err: recoveryError{fmt.Errorf(
+			"%s, but your uncommitted changes could not be restored: %v — nothing in your working tree was changed. %s",
+			done, popErr, stashRecoveryHint(sha))}}
+	}
+}
+
 // doConflictFinish commits the merge and only then restores the auto-stash.
 // See the ordering note at the top of this file: the pop is impossible before
 // the commit, and the commit is what makes the tree stash-appliable again.
@@ -199,15 +302,11 @@ func doConflictFinish(resolved int, source, target string, stashed bool, stashRe
 			resolved: resolved, source: source, target: target, stashRef: stashRef,
 		}
 		if stashed {
-			if err := git.StashPop(); err != nil {
-				git.CleanupFailedStashPop()
-				msg.stashOrphaned = true
-				msg.err = recoveryError{fmt.Errorf(
-					"the merge is committed, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s",
-					stashRecoveryHint(stashRef))}
-				return msg
-			}
-			msg.stashRestored = true
+			out := restoreParkedStash(stashRef, "the merge is committed")
+			msg.stashRestored = out.restored
+			msg.stashMissing = out.missing
+			msg.stashOrphaned = out.orphaned
+			msg.err = out.err
 		}
 		return msg
 	}
@@ -222,18 +321,100 @@ func doConflictAbort(stashed bool, stashRef string) tea.Cmd {
 		}
 		msg := conflictAbortResultMsg{stashRef: stashRef}
 		if stashed {
-			if err := git.StashPop(); err != nil {
-				git.CleanupFailedStashPop()
-				msg.stashOrphaned = true
-				msg.err = recoveryError{fmt.Errorf(
-					"the merge was aborted, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s",
-					stashRecoveryHint(stashRef))}
-				return msg
-			}
-			msg.stashRestored = true
+			out := restoreParkedStash(stashRef, "the merge was aborted")
+			msg.stashRestored = out.restored
+			msg.stashMissing = out.missing
+			msg.stashOrphaned = out.orphaned
+			msg.err = out.err
 		}
 		return msg
 	}
+}
+
+// ── The parked-stash association on disk ────────────────
+
+// conflictStateName is the file, inside the git directory, that remembers which
+// stash a merge in progress parked. See "Surviving a quit" at the top of this
+// file for why it lives there and not in a config directory.
+const conflictStateName = "git-assist-conflict-stash"
+
+// conflictStateSep separates the record's three fields. A tab cannot appear in
+// a branch name (git refuses the ref) or in a short SHA.
+const conflictStateSep = "\t"
+
+// conflictStatePath resolves the file's location. `.git` is normally a
+// directory in the working tree root — the app chdirs there at startup — but a
+// linked worktree and a submodule both have a `.git` FILE holding
+// "gitdir: <path>", and the merge state of those lives at the far end of it.
+func conflictStatePath() (string, error) {
+	root, err := git.RepoToplevel()
+	if err != nil {
+		return "", err
+	}
+	dot := filepath.Join(root, ".git")
+	info, err := os.Stat(dot)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return filepath.Join(dot, conflictStateName), nil
+	}
+	data, err := os.ReadFile(dot)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return "", fmt.Errorf("%s is neither a git directory nor a gitdir pointer", dot)
+	}
+	dir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	return filepath.Join(dir, conflictStateName), nil
+}
+
+// writeConflictState records the stash a merge parked, plus the labels the
+// header needs, so a relaunch can pick all three up. Best-effort: failing to
+// write it costs the association across a restart, nothing else.
+func writeConflictState(stashRef, source, target string) {
+	if stashRef == "" {
+		return
+	}
+	path, err := conflictStatePath()
+	if err != nil {
+		return
+	}
+	record := strings.Join([]string{stashRef, source, target}, conflictStateSep) + "\n"
+	_ = os.WriteFile(path, []byte(record), 0o644)
+}
+
+// readConflictState returns what a previous process parked, or empty strings.
+func readConflictState() (stashRef, source, target string) {
+	path, err := conflictStatePath()
+	if err != nil {
+		return "", "", ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", ""
+	}
+	fields := strings.Split(strings.TrimSpace(string(data)), conflictStateSep)
+	if len(fields) < 3 || fields[0] == "" {
+		return "", "", ""
+	}
+	return fields[0], fields[1], fields[2]
+}
+
+// clearConflictState drops the association. Called when the merge is over,
+// however it ended — an entry left behind would have the NEXT recovered merge
+// claim a stash that belongs to nothing.
+func clearConflictState() {
+	path, err := conflictStatePath()
+	if err != nil {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // ── Entry ───────────────────────────────────────────────
@@ -248,6 +429,11 @@ func (m *Model) beginConflicts(origin conflictOrigin, source, target string, sta
 	m.conflictTarget = target
 	m.conflictStashed = stashed
 	m.conflictStashRef = stashRef
+	if stashed {
+		// The promise this screen makes ("your changes come back when this
+		// finishes") has to outlive the process that made it.
+		writeConflictState(stashRef, source, target)
+	}
 	m.loadConflicts()
 }
 
@@ -258,7 +444,17 @@ func (m *Model) beginConflicts(origin conflictOrigin, source, target string, sta
 func (m *Model) openConflicts() bool {
 	if !git.MergeInProgress() {
 		m.mergeInProgress = false
+		// A merge that is over cannot have a parked stash waiting on it, and a
+		// record left behind would be claimed by the next one.
+		clearConflictState()
 		return false
+	}
+	// A merge this process did not start knows nothing about the stash it
+	// parked, and finishing without restoring it — silently — is how the
+	// previous session's promise gets broken. Recover the association first,
+	// since it also carries better labels than MERGE_MSG does.
+	if !m.conflictStashed && m.conflictStashRef == "" {
+		m.recoverParkedStash()
 	}
 	// Labels are only re-derived when we have none: a merge this session
 	// started already knows both sides, and MERGE_MSG's "into <target>" is
@@ -271,6 +467,33 @@ func (m *Model) openConflicts() bool {
 	}
 	m.loadConflicts()
 	return true
+}
+
+// recoverParkedStash re-associates the stash a previous process parked for the
+// merge that is still on disk.
+//
+// The entry is verified before it is adopted: a stash the user has since popped
+// from the manager is gone, and carrying "your uncommitted changes are parked"
+// on the header over an empty stack is the same lie in the other direction.
+func (m *Model) recoverParkedStash() {
+	sha, source, target := readConflictState()
+	if sha == "" {
+		return
+	}
+	if _, err := git.StashRefForSHA(sha); err != nil {
+		// Already applied or deleted. The record is stale either way.
+		clearConflictState()
+		return
+	}
+	m.conflictStashed = true
+	m.conflictStashRef = sha
+	m.conflictOrigin = conflictFromRecovered
+	if m.conflictSource == "" {
+		m.conflictSource = source
+	}
+	if m.conflictTarget == "" {
+		m.conflictTarget = target
+	}
 }
 
 // loadConflicts reads the unmerged list and puts the screen up. The list is
@@ -577,6 +800,22 @@ func (m Model) updateConflicts(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// ── "throw the whole merge away" confirmation ──────
+	//
+	// `a` is select-all in the file selector and apply in the stash manager —
+	// two screens that look exactly like this one — and it used to abort here on
+	// the first press, discarding every resolution with no undo. Every other
+	// destructive key in the app asks first; this one asks too, and states what
+	// it costs.
+	if m.conflictConfirmAbort {
+		m.conflictConfirmAbort = false
+		if keyMsg.String() == "y" {
+			m.conflictAborting = true
+			return m, tea.Batch(doConflictAbort(m.conflictStashed, m.conflictStashRef), m.spinner.Tick)
+		}
+		return m, nil
+	}
+
 	// ── "markers are still in there" confirmation ──────
 	if m.conflictMarkWarn {
 		path := m.conflictMarkPath
@@ -642,8 +881,8 @@ func (m Model) updateConflicts(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.conflictStashed, m.conflictStashRef),
 			m.spinner.Tick)
 	case "a":
-		m.conflictAborting = true
-		return m, tea.Batch(doConflictAbort(m.conflictStashed, m.conflictStashRef), m.spinner.Tick)
+		m.conflictConfirmAbort = true
+		return m, nil
 	case "esc":
 		// The merge stays in progress, deliberately: the dashboard carries a
 		// permanent "Resolve conflicts" entry while it does, and the user may
@@ -783,8 +1022,14 @@ func (m Model) handleConflictFinish(msg conflictFinishResultMsg) (tea.Model, tea
 			// "0 conflicts resolved" reads as a failure.
 			m.setStatusNote("Merged %s into %s", msg.source, msg.target)
 		}
-		if msg.stashRestored {
+		switch {
+		case msg.stashRestored:
 			m.appendNoteClause("your uncommitted changes were stashed and restored")
+		case msg.stashMissing:
+			// Reported, never inferred: the entry was gone before the pop (the
+			// user applied or deleted it from the stash manager), so nothing
+			// came back HERE and the tree is not missing anything either.
+			m.appendNoteClause("your parked stash was already applied or deleted — nothing extra was restored")
 		}
 	}
 	return m, m.returnToMenu()
@@ -811,9 +1056,16 @@ func (m Model) handleConflictAbort(msg conflictAbortResultMsg) (tea.Model, tea.C
 	if msg.err != nil {
 		m.err = msg.err
 	} else {
-		m.setStatusNote("Merge aborted — nothing changed")
-		if msg.stashRestored {
+		// "nothing changed" is only true of the repository's committed state.
+		// The abort discards every resolution the user made, which is exactly
+		// what the confirmation warned about, so the note says what happened
+		// rather than reassuring past it.
+		m.setStatusNote("Merge aborted — the repository is back to before the merge")
+		switch {
+		case msg.stashRestored:
 			m.appendNoteClause("your uncommitted changes were restored")
+		case msg.stashMissing:
+			m.appendNoteClause("your parked stash was already applied or deleted — nothing extra was restored")
 		}
 	}
 	return m, m.returnToMenu()
@@ -821,7 +1073,8 @@ func (m Model) handleConflictAbort(msg conflictAbortResultMsg) (tea.Model, tea.C
 
 // clearConflicts drops everything about a merge that is over. The stash fields
 // go with it: leaving conflictStashed set would make the NEXT conflict try to
-// pop an entry this one already restored.
+// pop an entry this one already restored — and so does the record on disk, for
+// the same reason one process later.
 func (m *Model) clearConflicts() {
 	m.mergeInProgress = false
 	m.conflictRows = nil
@@ -833,10 +1086,12 @@ func (m *Model) clearConflicts() {
 	m.conflictStashRef = ""
 	m.conflictMarkWarn = false
 	m.conflictMarkPath = ""
+	m.conflictConfirmAbort = false
 	m.conflictEditPath = ""
 	m.editMode = false
 	m.editDirty = false
 	m.confirmExit = false
+	clearConflictState()
 }
 
 // ── View ────────────────────────────────────────────────
@@ -869,6 +1124,28 @@ func (m Model) viewConflicts() string {
 		b.WriteString("  " + dimStyle.Render("Your uncommitted changes are parked in a stash and come back when this finishes.") + "\n")
 	}
 	b.WriteString("\n")
+
+	// ── The abort confirmation ─────────────────────────
+	// Costed in the two currencies the user has spent: the decisions they made,
+	// and the uncommitted work the merge parked.
+	if m.conflictConfirmAbort {
+		b.WriteString("  " + modifiedStyle.Render("Undo the whole merge?") + "\n\n")
+		if n := m.conflictResolvedCount(); n > 0 {
+			b.WriteString("  " + dimStyle.Render(fmt.Sprintf(
+				"%s you have already decided go back to conflicted — git merge --abort throws",
+				plural(n, "file", "files"))) + "\n")
+			b.WriteString("  " + dimStyle.Render("every resolution away, and there is no undo for it.") + "\n")
+		} else {
+			b.WriteString("  " + dimStyle.Render("The merge is abandoned and the repository goes back to how it was") + "\n")
+			b.WriteString("  " + dimStyle.Render("before it started.") + "\n")
+		}
+		if m.conflictStashed {
+			b.WriteString("  " + dimStyle.Render("Your parked uncommitted changes are restored afterwards.") + "\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(renderHelpRows(m.helpRows()))
+		return m.styledBox(b.String())
+	}
 
 	// ── The marker confirmation ────────────────────────
 	if m.conflictMarkWarn {

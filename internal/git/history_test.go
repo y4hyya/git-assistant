@@ -18,16 +18,23 @@ func rec(sha, age, author, parents, refs, subject string) string {
 // The subject is the one field a user controls completely. It is LAST in the
 // format for exactly this reason: everything after the fifth separator belongs
 // to it, whatever it contains.
+//
+// want is what the row shows, which is the subject verbatim for every shape of
+// TEXT. A control character is the one exception: it is dropped, because a row
+// is one line of printable characters and 0x1f/ESC in a cloned repository's
+// subject is a rendering attack surface, not content. It no longer has anything
+// to do with the parse — see historyFieldSep.
 func TestParseHistoryPageKeepsExoticSubjects(t *testing.T) {
 	cases := []struct {
 		name    string
 		subject string
+		want    string
 	}{
-		{"a unit separator", "fix: split on \x1f and survive"},
-		{"braces and parens", "feat: handle {a} (b) [c]"},
-		{"non-ASCII", "fix: düzeltme — çalışıyor ✓"},
-		{"a colon-heavy prose subject", "Update the README: add badges: really"},
-		{"leading dash", "-fix: not a flag"},
+		{"a unit separator", "fix: split on \x1f and survive", "fix: split on  and survive"},
+		{"braces and parens", "feat: handle {a} (b) [c]", "feat: handle {a} (b) [c]"},
+		{"non-ASCII", "fix: düzeltme — çalışıyor ✓", "fix: düzeltme — çalışıyor ✓"},
+		{"a colon-heavy prose subject", "Update the README: add badges: really", "Update the README: add badges: really"},
+		{"leading dash", "-fix: not a flag", "-fix: not a flag"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -36,8 +43,8 @@ func TestParseHistoryPageKeepsExoticSubjects(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("parsed %d entries, want 1", len(got))
 			}
-			if got[0].Subject != tc.subject {
-				t.Errorf("subject = %q, want %q", got[0].Subject, tc.subject)
+			if got[0].Subject != tc.want {
+				t.Errorf("subject = %q, want %q", got[0].Subject, tc.want)
 			}
 			if got[0].SHA != "abc1234" {
 				t.Errorf("sha = %q, want abc1234", got[0].SHA)
@@ -93,6 +100,81 @@ func TestParseHistoryPageDropsMalformedRecords(t *testing.T) {
 	got := parseHistoryPage(data)
 	if len(got) != 1 || got[0].Subject != "good" {
 		t.Fatalf("parsed %v, want just the well-formed record", got)
+	}
+}
+
+// An ident is NOT a safe field, whatever the old comment claimed. git strips
+// control characters only from the ENDS of a configured name, so
+// `git -c user.name=$'Evil\x1fName' commit` is accepted and %an emits the byte
+// raw. Against a 0x1f-separated record that shifted every field after it: the
+// parent SHA arrived as a ref badge and the real decorations were glued onto
+// the subject. The separator is a NEWLINE for exactly this reason — git cannot
+// put one inside an ident, a ref name or a folded subject.
+func TestParseHistoryPageSurvivesAHostileAuthorName(t *testing.T) {
+	data := rec("abc1234", "2 hours ago", "Evil\x1fName", "def5678",
+		"HEAD -> main", "ident test") + "\x00"
+	got := parseHistoryPage(data)
+	if len(got) != 1 {
+		t.Fatalf("parsed %d entries, want 1", len(got))
+	}
+	e := got[0]
+	if e.Subject != "ident test" {
+		t.Errorf("subject = %q — the decorations shifted into it", e.Subject)
+	}
+	if len(e.Refs) != 1 || e.Refs[0] != "HEAD -> main" {
+		t.Errorf("refs = %v, want [HEAD -> main] (a parent SHA rendered as a badge?)", e.Refs)
+	}
+	if e.IsMerge {
+		t.Error("IsMerge was read out of a shifted field")
+	}
+	// The name survives whole, minus the control byte itself: a raw 0x1f in a
+	// list row costs the column its alignment and has no meaning to show.
+	if e.Author != "EvilName" {
+		t.Errorf("author = %q, want %q", e.Author, "EvilName")
+	}
+}
+
+// The same thing end to end, because the claim being tested is about what git
+// really emits, not about what this parser is fed.
+func TestHistoryPageSurvivesAHostileAuthorNameFromGit(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "chore: base")
+	runGit(t, "-c", "user.name=Evil\x1fName", "commit", "-q", "--allow-empty", "-m", "ident test")
+
+	page, err := HistoryPage("main", 0, 10)
+	if err != nil {
+		t.Fatalf("HistoryPage: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("HistoryPage returned %d commits, want 2", len(page))
+	}
+	e := page[0]
+	if e.Subject != "ident test" {
+		t.Errorf("subject = %q, want %q", e.Subject, "ident test")
+	}
+	if e.Author != "EvilName" {
+		t.Errorf("author = %q, want %q", e.Author, "EvilName")
+	}
+	for _, r := range e.Refs {
+		if !strings.Contains(r, "main") {
+			t.Errorf("refs = %v — something that is not a ref became a badge", e.Refs)
+		}
+	}
+	if e.IsMerge {
+		t.Error("a single-parent commit was reported as a merge")
+	}
+
+	detail, err := GetCommitDetail(e.SHA)
+	if err != nil {
+		t.Fatalf("GetCommitDetail: %v", err)
+	}
+	if detail.Author != "EvilName" || detail.Subject != "ident test" {
+		t.Errorf("detail author/subject = %q / %q, want %q / %q",
+			detail.Author, detail.Subject, "EvilName", "ident test")
+	}
+	if detail.Email != "test@example.invalid" {
+		t.Errorf("detail email = %q — the fields shifted", detail.Email)
 	}
 }
 

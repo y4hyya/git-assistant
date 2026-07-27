@@ -754,6 +754,33 @@ func TestGetUnifiedGraphSeparatesSubjectFromDecorations(t *testing.T) {
 	}
 }
 
+// The panel is `--all`, and --all includes refs/stash. With one auto-stash in
+// the stack — the state the stash manager exists for, and one this app creates
+// on its own — the graph grew a "WIP on main" / "index on main" / "untracked
+// files on main" triple the user never committed, drawn as a multi-parent
+// diamond above the real history and reading as "my uncommitted work is already
+// committed".
+func TestGetUnifiedGraphHidesStashEntries(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "a\n")
+	commitAll(t, "chore: base")
+	write(t, "a.txt", "edited\n")
+	write(t, "untracked.txt", "u\n")
+	// --include-untracked is what StashChanges uses, and it is what adds the
+	// third leg of the phantom diamond.
+	runGit(t, "stash", "push", "-q", "--include-untracked")
+
+	graph := GetUnifiedGraph(20)
+	for _, phantom := range []string{"WIP on", "index on", "untracked files on", "refs/stash"} {
+		if strings.Contains(graph, phantom) {
+			t.Errorf("a stash entry rendered as a commit (%q):\n%s", phantom, graph)
+		}
+	}
+	if !strings.Contains(graph, "chore: base") {
+		t.Fatalf("the real history is missing from the graph:\n%s", graph)
+	}
+}
+
 func TestGetUnifiedGraphIsEmptyWithoutCommits(t *testing.T) {
 	scratchRepo(t)
 	if got := GetUnifiedGraph(10); got != "" {
@@ -996,6 +1023,44 @@ func TestMergeFromOriginLeavesAConflictInProgressUntilAborted(t *testing.T) {
 	}
 }
 
+// Merging origin/<x> is LOCAL: the tracking ref was written by an earlier
+// fetch, and the merge itself opens no socket. It used to run under the 60s
+// network deadline, which SIGKILLed a big-but-healthy merge mid-write and told
+// the user to check their connection.
+//
+// The network latch is the sharpest way to ask which side of the line a
+// function is on: after CancelNetworkOps every runNetwork call fails
+// immediately with ErrNetworkCancelled, so a MergeFromOrigin that still works
+// is a MergeFromOrigin that is not on the network path. (The latch is
+// process-global and one-way by design — ResetNetworkOps re-arms it for the
+// rest of the binary.)
+func TestMergeFromOriginIsLocalAndOutlivesTheNetworkLatch(t *testing.T) {
+	scratchRepo(t)
+	origin := seedRemote(t, "main")
+	runGit(t, "remote", "add", "origin", origin)
+	runGit(t, "fetch", "-q", "origin")
+	runGit(t, "checkout", "-q", "-B", "main", "origin/main")
+	pushNewCommitTo(t, origin, "main", "remote.txt", "x\n", "remote work")
+	runGit(t, "fetch", "-q", "origin")
+
+	CancelNetworkOps()
+	defer ResetNetworkOps()
+
+	// Proof the latch is really thrown: a genuine remote command fails fast.
+	if err := Fetch(); !errors.Is(err, ErrNetworkCancelled) {
+		t.Fatalf("Fetch() = %v with the latch thrown, want ErrNetworkCancelled — the test proves nothing", err)
+	}
+
+	before := commitCount(t)
+	upToDate, err := MergeFromOrigin("main", false)
+	if err != nil {
+		t.Fatalf("MergeFromOrigin: %v — a local merge is still on the network wrapper", err)
+	}
+	if upToDate || commitCount(t) == before {
+		t.Fatal("nothing was merged")
+	}
+}
+
 func TestMergeAbortWithNoMergeFails(t *testing.T) {
 	scratchRepo(t)
 	write(t, "a.txt", "a\n")
@@ -1023,6 +1088,30 @@ func TestStashConflictErrorNamesItsFiles(t *testing.T) {
 	}
 	if withFiles.Is(ErrStashDirtyTree) {
 		t.Fatal("a conflict error matched the dirty-tree sentinel")
+	}
+}
+
+// The third one has to be distinguishable from the other two, and its wording
+// has to change with the one fact that changes the advice.
+func TestStashDuringMergeErrorNamesTheRightBlocker(t *testing.T) {
+	midMerge := &StashDuringMergeError{Files: []string{"s.txt"}, Merge: true}
+	if !strings.Contains(midMerge.Error(), "abort the merge first") {
+		t.Errorf("Error() = %q, want the merge named as the blocker", midMerge.Error())
+	}
+	if !strings.Contains(midMerge.Error(), "s.txt") {
+		t.Errorf("Error() = %q, want the unmerged path", midMerge.Error())
+	}
+
+	leftovers := &StashDuringMergeError{Files: []string{"s.txt"}}
+	if strings.Contains(leftovers.Error(), "merge is in progress") {
+		t.Errorf("Error() = %q names a merge that does not exist", leftovers.Error())
+	}
+
+	if !midMerge.Is(ErrStashDuringMerge) {
+		t.Fatal("errors.Is against ErrStashDuringMerge failed")
+	}
+	if midMerge.Is(ErrStashConflict) || midMerge.Is(ErrStashDirtyTree) {
+		t.Fatal("a merge-blocked restore matched one of the other sentinels")
 	}
 }
 

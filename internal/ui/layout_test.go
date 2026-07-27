@@ -84,6 +84,71 @@ func TestParseLineSplitsOnUnitSeparator(t *testing.T) {
 	}
 }
 
+// A commit subject CAN carry the separator — `git commit -m $'evil\x1fsubject'`
+// round-trips the byte through %s. Splitting at the FIRST 0x1f then cut the row
+// in half and threw the decoration away: the candidate no longer started with
+// "(", cleanDecoration returned nil, and the HEAD -> main marker vanished off
+// the dashboard. The decoration is the LAST field and a ref name cannot contain
+// a control character, so the split is anchored from the RIGHT.
+func TestParseLineSurvivesASeparatorInTheSubject(t *testing.T) {
+	gl := parseLine("* evil" + sep + "subject (fake)" + sep + " (HEAD -> main, origin/main)")
+
+	var refs []string
+	for _, r := range gl.refs {
+		refs = append(refs, r.name)
+	}
+	if strings.Join(refs, ",") != "main,origin/main" {
+		t.Errorf("refs = %v, want [main origin/main] — the real decoration was dropped", refs)
+	}
+	// The subject survives whole, minus the control byte: a raw 0x1f in a graph
+	// row is a rendering hazard and means nothing to a reader.
+	if gl.message != "evilsubject (fake)" {
+		t.Errorf("message = %q, want %q", gl.message, "evilsubject (fake)")
+	}
+}
+
+// And against real git output, since the premise being tested is what git
+// emits, not what this parser is handed.
+func TestUnifiedGraphKeepsDecorationsOnAHostileSubject(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", isolatedGitConfig(t))
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t.invalid")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t.invalid")
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"commit", "-q", "--allow-empty", "-m", "evil" + sep + "subject (fake)"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	raw := git.GetUnifiedGraph(10)
+	if raw == "" {
+		t.Fatal("GetUnifiedGraph returned nothing")
+	}
+	gl := parseLine(strings.Split(raw, "\n")[0])
+	var refs []string
+	for _, r := range gl.refs {
+		refs = append(refs, r.name)
+	}
+	if strings.Join(refs, ",") != "main" {
+		t.Errorf("refs = %v, want [main] — the current-branch marker was blanked off the graph", refs)
+	}
+	if strings.ContainsRune(gl.message, graphFieldSep) {
+		t.Errorf("separator leaked into the message: %q", gl.message)
+	}
+	if !strings.Contains(gl.message, "subject (fake)") {
+		t.Errorf("message = %q — the subject was truncated at the separator", gl.message)
+	}
+}
+
 // ── cleanDecoration ────────────────────────────────────
 
 func TestCleanDecoration(t *testing.T) {

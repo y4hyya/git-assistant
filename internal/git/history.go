@@ -63,12 +63,33 @@ type CommitPatchInfo struct {
 // string like DetachedLabel, or anything that would arrive as a flag.
 var ErrBadRevision = errors.New("not a usable revision")
 
-// historyFieldSep separates the fields of one record — the same discipline the
-// stash list uses (see stashListFormat). A control character cannot occur in a
-// ref name or in an ident line, git strips them from the subject, and the one
-// genuinely free-text field is LAST so that even a message carrying a separator
-// cannot shift the parse.
-const historyFieldSep = "\x1f"
+// historyFieldSep separates the fields of one record. Records themselves are
+// NUL-terminated (-z), which is what frees this byte up.
+//
+// It is a NEWLINE, and that is the whole safety argument — the unit separator
+// this used to use is NOT safe here, whatever the old comment claimed. git
+// strips control characters only from the ENDS of a configured ident, so
+// `git -c user.name=$'Evil\x1fName' commit` is accepted and %an emits the byte
+// raw; against a 0x1f-separated record every field after the author shifted one
+// place, which put the parent SHA in the list as a ref badge and glued the real
+// decorations onto the subject. Any repository can be cloned with a crafted
+// ident, so this is reachable without doing anything unusual locally.
+//
+// A newline cannot appear in ANY of the non-final fields, and each of those is
+// a rule of git's own:
+//
+//   - idents (%an, %ae): an ident line is "Name <email> time tz", so git drops
+//     '\n', '<' and '>' from both halves — verified, not assumed;
+//   - refs (%D): check-ref-format forbids every byte below 0x20;
+//   - %h/%H/%p are hex, %cr is git's own prose, %ad is our own date format.
+//
+// The one field that may contain anything is LAST in both formats (%s, %B), so
+// SplitN's final element absorbs whatever it holds — including newlines, which
+// is exactly what %B is made of.
+//
+// The discipline for anyone adding a field: it goes BEFORE the free-text one,
+// and only if git cannot emit a newline inside it.
+const historyFieldSep = "\n"
 
 const (
 	historyListFormat = "%h" + historyFieldSep + // abbreviated hash
@@ -138,7 +159,10 @@ func parseHistoryPage(data string) []CommitEntry {
 			continue
 		}
 		// The free-text field is last, so SplitN's final element absorbs
-		// anything the subject contains — including another separator.
+		// anything the subject contains — and no earlier field can contain the
+		// separator at all (see historyFieldSep). Both halves of that are
+		// load-bearing: with a separator git CAN emit mid-record, a hostile
+		// author name shifted every field after it.
 		fields := strings.SplitN(rec, historyFieldSep, historyListFields)
 		if len(fields) < historyListFields {
 			continue
@@ -150,7 +174,7 @@ func parseHistoryPage(data string) []CommitEntry {
 		entries = append(entries, CommitEntry{
 			SHA:     sha,
 			Age:     compactAge(strings.TrimSpace(fields[1])),
-			Author:  strings.TrimSpace(fields[2]),
+			Author:  stripControl(strings.TrimSpace(fields[2])),
 			IsMerge: len(strings.Fields(fields[3])) > 1,
 			Refs:    parseRefNames(fields[4]),
 			Subject: flattenSubject(fields[5]),
@@ -192,19 +216,24 @@ func parseCommitDetail(data string) (CommitDetail, bool) {
 	}
 	// %B is the raw message: subject, blank line, body. Cut at the first
 	// newline rather than reformatting — this pane is the one place the commit
-	// message is shown exactly as it was written.
+	// message is shown exactly as it was written. It is also why %B has to be
+	// LAST: it is the one field of the record that legitimately contains the
+	// separator, over and over.
+	//
+	// The body keeps whatever it holds; the single-row fields (author, email,
+	// subject) do not — see stripControl.
 	msg := strings.TrimRight(stripCR(fields[8]), "\n")
 	subject, body, _ := strings.Cut(msg, "\n")
 	return CommitDetail{
 		SHA:     sha,
 		FullSHA: strings.TrimSpace(fields[1]),
-		Author:  strings.TrimSpace(fields[2]),
-		Email:   strings.TrimSpace(fields[3]),
+		Author:  stripControl(strings.TrimSpace(fields[2])),
+		Email:   stripControl(strings.TrimSpace(fields[3])),
 		Date:    strings.TrimSpace(fields[4]),
 		Age:     compactAge(strings.TrimSpace(fields[5])),
 		IsMerge: len(strings.Fields(fields[6])) > 1,
 		Refs:    parseRefNames(fields[7]),
-		Subject: strings.TrimSpace(subject),
+		Subject: flattenSubject(subject),
 		Body:    strings.Trim(body, "\n"),
 	}, true
 }
@@ -332,11 +361,30 @@ func parseRefNames(raw string) []string {
 // flattenSubject makes one list row out of a subject. git collapses the first
 // paragraph into a single line for %s, but a message written with a control
 // character in it would still cost the list its alignment — one row, one line,
-// no exceptions.
+// printable text, no exceptions. A newline becomes a space (the words either
+// side of it are two words); everything else control-shaped is dropped.
 func flattenSubject(s string) string {
-	s = stripCR(s)
 	if strings.ContainsRune(s, '\n') {
 		s = strings.ReplaceAll(s, "\n", " ")
 	}
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(stripControl(s))
+}
+
+// stripControl drops the C0 control characters and DEL from a value headed for
+// a single-row display.
+//
+// git can be made to emit them: only the ENDS of a configured ident are
+// cleaned, so a name carries whatever was put in the middle of it, and a commit
+// message keeps what it was given. None of them is text a reader wanted — 0x1f
+// costs the row its alignment, and an ESC hands a cloned repository control of
+// the terminal's colours. The parse no longer depends on this (the separator is
+// a byte git cannot emit inside these fields), so it is purely about what
+// reaches the screen.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }

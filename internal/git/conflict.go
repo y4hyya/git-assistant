@@ -84,6 +84,15 @@ func (f ConflictFile) KeepsFile(side ConflictSide) bool {
 	return true
 }
 
+// isUnmergedCode reports whether a two-letter porcelain code is one of the
+// seven git documents as unmerged. The status parser and the conflict list
+// share this so a code can never be unmerged on one screen and modified on
+// another.
+func isUnmergedCode(code string) bool {
+	_, ok := conflictKindFor(code)
+	return ok
+}
+
 // conflictKindFor maps a porcelain unmerged code to a kind. Only the seven
 // codes git documents as unmerged reach it.
 func conflictKindFor(code string) (ConflictKind, bool) {

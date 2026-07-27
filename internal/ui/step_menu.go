@@ -371,10 +371,12 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.menuCursor > 0 {
 			m.menuCursor--
 		}
+		m.followMenuCursor(len(items))
 	case "down", "j":
 		if m.menuCursor < len(items)-1 {
 			m.menuCursor++
 		}
+		m.followMenuCursor(len(items))
 	case "enter":
 		if m.menuCursor >= len(items) {
 			return m, nil
@@ -505,7 +507,11 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.detached || m.mergeInProgress {
 			return m, nil
 		}
-		if m.populateSyncDialog() && m.syncPullCurrent {
+		// syncRewriteHold opens the dialog with no pull on it: "behind" there
+		// means origin is holding the commit this session removed, and the
+		// dialog is where that gets explained. Doing nothing instead would make
+		// `p` a dead key on a dashboard that is showing a behind badge.
+		if m.populateSyncDialog() && (m.syncPullCurrent || m.syncRewriteHold) {
 			m.syncReturnStep = stepMenu
 			m.step = stepSync
 		}
@@ -518,16 +524,20 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── View ────────────────────────────────────────────────
+// ── The dashboard's own list geometry ───────────────────
+//
+// The menu was the last list in the app with no scroll window. v1.3 grew it
+// from four entries to nine (Resolve conflicts, Commit, Amend, Push, Branch,
+// Stash, History, Config, Connect to GitHub) and styledBox simply cut whatever
+// did not fit: at 24 rows with an error banner up, the bottom entries were
+// invisible while `down` walked the cursor onto them and `enter` opened a
+// screen nobody could see it had selected. Every other list here windows itself
+// with "N more" markers; so does this one now.
 
-// viewMenu renders the dashboard within the rows styledBox will actually
-// draw. Sections are assembled as whole blocks against a measured budget so
-// that overflow drops a section, never the box's own bottom border — the old
-// fixed "m.height - 14" guess ignored the fifth menu item, the error banner
-// and the sync spinner, and the box lost its floor exactly when an error was
-// on screen.
-func (m Model) viewMenu() string {
-	// ── Header ───────────────────────────────────────
+// menuChrome returns the blocks that sit around the item list — above it and
+// below it — plus the footer. View and the row budget below both read it, so
+// the two cannot disagree about how much room the list has.
+func (m Model) menuChrome() (above, below []string, help string) {
 	var head strings.Builder
 	head.WriteString(titleStyle.Render(" git-assist "))
 	head.WriteString("  ")
@@ -551,14 +561,13 @@ func (m Model) viewMenu() string {
 		// error, and it retries on the next return to the menu.
 		head.WriteString("  " + dimStyle.Render("(offline — sync info may be stale)"))
 	}
-
-	blocks := []string{head.String()}
+	above = []string{head.String()}
 
 	// Detached HEAD. Loud, and above everything else on the screen: a commit
 	// made here belongs to no branch and the next checkout leaves it reachable
 	// only through the reflog. The menu below is already down to its one exit.
 	if m.detached {
-		blocks = append(blocks,
+		above = append(above,
 			"  "+errorStyle.Render(symWarn+" detached HEAD — you're not on any branch; commits made here can be lost")+
 				"\n  "+dimStyle.Render("Open Branch and switch to a branch to carry on."))
 	}
@@ -566,20 +575,135 @@ func (m Model) viewMenu() string {
 	// One-shot success banner from the init flow. Cleared on next keypress
 	// by the main Update handler, same lifecycle as m.err.
 	if m.initSuccessMsg != "" {
-		blocks = append(blocks, "  "+successStyle.Render(symDone+" "+m.initSuccessMsg))
+		above = append(above, "  "+successStyle.Render(symDone+" "+m.initSuccessMsg))
 	}
 
 	// What the last operation did — merge, pull, delete, stashed switch,
 	// .gitignore edit. All of those used to finish in complete silence.
 	if note := m.renderStatusNote(); note != "" {
-		blocks = append(blocks, note)
+		above = append(above, note)
 	}
+
+	// Spinner for sync
+	if m.branchMerging {
+		below = append(below, "  "+m.spinner.View()+" "+dimStyle.Render("Syncing with "+m.mainLabel()+"..."))
+	}
+
+	// Error. Below the list, and its rows are RESERVED before the list is sized
+	// (see menuListRows): it used to be appended after a full-height list and
+	// clipped away, so pressing enter on a dimmed entry produced no visible
+	// feedback at all on a short terminal.
+	if m.err != nil {
+		below = append(below, "  "+formatError(m.err))
+	}
+
+	return above, below, renderHelpRows(m.helpRows())
+}
+
+// menuListRows is how many terminal rows the item list may occupy, indicators
+// included. Everything else on the screen is reserved first — feedback is not
+// what a short terminal should lose.
+func (m Model) menuListRows() int {
+	above, below, help := m.menuChrome()
+	used := 0
+	for _, blk := range above {
+		used += lipgloss.Height(blk)
+	}
+	for _, blk := range below {
+		used += lipgloss.Height(blk)
+	}
+	// One separator line per block boundary, and the footer's own blank line.
+	used += len(above) + len(below)
+	if help != "" {
+		used += lipgloss.Height(help) + 1
+	}
+	rows := m.contentHeight() - used
+	if rows < 1 {
+		rows = 1
+	}
+	return rows
+}
+
+// menuWindow picks the visible slice of the item list. maxLines is the whole
+// budget, "N more" markers included — each costs a row, so a list that needs
+// both shows two fewer entries.
+func menuWindow(total, cursor, scroll, maxLines int) (start, end int) {
+	if maxLines < 1 {
+		maxLines = 1
+	}
+	if total <= maxLines {
+		return 0, total
+	}
+	rows := maxLines - 1 // at least one marker is going to be drawn
+	if rows < 1 {
+		rows = 1
+	}
+	fit := func(rows int) (int, int) {
+		s := scroll
+		// The cursor is never off-window: a menu whose highlighted row is not
+		// drawn is one where enter opens something the user cannot see.
+		if cursor < s {
+			s = cursor
+		}
+		if cursor >= s+rows {
+			s = cursor - rows + 1
+		}
+		if s > total-rows {
+			s = total - rows
+		}
+		if s < 0 {
+			s = 0
+		}
+		return s, min(total, s+rows)
+	}
+	start, end = fit(rows)
+	if start > 0 && end < total && maxLines > 2 {
+		// Both markers are needed, so the list gets one row less.
+		start, end = fit(maxLines - 2)
+	}
+	return start, end
+}
+
+// followMenuCursor keeps the scroll offset on the window the view will draw.
+func (m *Model) followMenuCursor(total int) {
+	start, _ := menuWindow(total, m.menuCursor, m.menuScroll, m.menuListRows())
+	m.menuScroll = start
+}
+
+// ── View ────────────────────────────────────────────────
+
+// viewMenu renders the dashboard within the rows styledBox will actually
+// draw. Sections are assembled as whole blocks against a measured budget so
+// that overflow drops a section, never the box's own bottom border — the old
+// fixed "m.height - 14" guess ignored the fifth menu item, the error banner
+// and the sync spinner, and the box lost its floor exactly when an error was
+// on screen.
+func (m Model) viewMenu() string {
+	above, below, help := m.menuChrome()
+	blocks := above
 
 	// ── Menu items ───────────────────────────────────
 	items := m.menuItems()
 	cursorIdx := clampMenuCursor(m.menuCursor, len(items))
+	budget := m.menuListRows()
+	start, end := menuWindow(len(items), cursorIdx, m.menuScroll, budget)
+	// Markers cost a row each and menuWindow has already left room for them —
+	// except on a budget too small to hold even one, where the row the cursor is
+	// on wins. Spending the last row on "3 more" would be reporting the clipping
+	// instead of avoiding it.
+	spare := budget - (end - start)
+	showUp := start > 0 && spare > 0
+	if showUp {
+		spare--
+	}
+	showDown := end < len(items) && spare > 0
+
 	rows := make([]string, 0, len(items))
-	for i, item := range items {
+	if showUp {
+		rows = append(rows, dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowUp, start)))
+	}
+	for i := start; i < end; i++ {
+		item := items[i]
 		cursor := "  "
 		if i == cursorIdx {
 			cursor = cursorStyle.Render(symCursor + " ")
@@ -605,20 +729,14 @@ func (m Model) viewMenu() string {
 
 		rows = append(rows, fmt.Sprintf("%s%-12s %s", cursor, name, desc))
 	}
+	if showDown {
+		rows = append(rows, dimStyle.Render(fmt.Sprintf("  %s %d more", symArrowDown, len(items)-end)))
+	}
 	blocks = append(blocks, strings.Join(rows, "\n"))
-
-	// Spinner for sync
-	if m.branchMerging {
-		blocks = append(blocks, "  "+m.spinner.View()+" "+dimStyle.Render("Syncing with "+m.mainLabel()+"..."))
-	}
-
-	// Error
-	if m.err != nil {
-		blocks = append(blocks, "  "+formatError(m.err))
-	}
+	blocks = append(blocks, below...)
 
 	// ── Fit the blocks to the rows we have ───────────
-	budget := m.contentHeight()
+	budget = m.contentHeight()
 	used := 0
 	for _, blk := range blocks {
 		used += lipgloss.Height(blk)
@@ -634,7 +752,7 @@ func (m Model) viewMenu() string {
 
 	// Help bar: a blank line plus its row(s), dropped whole when they don't fit.
 	// The keys come from menuHelp, which the `?` overlay renders too.
-	if help := renderHelpRows(m.helpRows()); help != "" {
+	if help != "" {
 		if cost := lipgloss.Height(help) + 1; used+cost <= budget {
 			out += "\n\n" + help
 			used += cost

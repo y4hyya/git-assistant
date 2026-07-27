@@ -134,10 +134,15 @@ func (m Model) renderGraphSection(maxLines int) string {
 // ── Graph transformation ──────────────────────────────
 
 // graphFieldSep is the byte GetUnifiedGraph puts between the subject and the
-// ref decorations (git's %x1f). git strips control characters out of header
-// lines, so it cannot appear inside a subject — which is the whole point: the
-// old " (" heuristic could not tell "fix: handle (edge case)" apart from a
-// real branch decoration and painted the subject's own parenthetical cyan.
+// ref decorations (git's %x1f). It exists because the old " (" heuristic could
+// not tell "fix: handle (edge case)" apart from a real branch decoration and
+// painted the subject's own parenthetical cyan.
+//
+// A subject CAN contain it — `git commit -m $'a\x1fb'` is accepted and %s emits
+// the byte raw, so the "git strips control characters" story this used to tell
+// was simply wrong. The decorations cannot: %d is built from ref names, and
+// check-ref-format forbids every byte below 0x20. That asymmetry is what makes
+// the parse safe, and it only holds from the RIGHT — see parseLine.
 const graphFieldSep = '\x1f'
 
 // minDecoWidth is the narrowest decoration worth drawing: "(a…)" and a spare
@@ -229,17 +234,39 @@ func parseLine(line string) graphLine {
 	}
 
 	rest := line[graphEnd:]
-	sep := strings.IndexByte(rest, graphFieldSep)
+	// LastIndexByte, not IndexByte: the separator git emitted is always the
+	// FINAL one, because the decorations that follow it cannot contain the byte
+	// while the subject before it can. Anchored from the left, a subject
+	// carrying a 0x1f cut the row in half — the decoration candidate then no
+	// longer started with "(", cleanDecoration returned nil, and the current
+	// branch's marker silently vanished from the dashboard graph.
+	sep := strings.LastIndexByte(rest, graphFieldSep)
 	if sep < 0 {
 		// No separator — output from something other than GetUnifiedGraph.
 		// Treat every byte as subject rather than guessing where a decoration
 		// might start; a guess here is what invented phantom branches.
-		gl.message = strings.TrimSpace(rest)
+		gl.message = stripControl(strings.TrimSpace(rest))
 		return gl
 	}
-	gl.message = strings.TrimSpace(rest[:sep])
+	// The subject keeps everything it holds except the control bytes: one of
+	// them is the separator itself, and none of them is text — an ESC out of a
+	// cloned repository would repaint the panel.
+	gl.message = stripControl(strings.TrimSpace(rest[:sep]))
 	gl.refs = cleanDecoration(rest[sep+1:])
 	return gl
+}
+
+// stripControl drops the C0 control characters and DEL from a graph row's
+// subject. internal/git does the same to the fields the history browser shows
+// (see stripControl there); the graph reads its own git output, so it does its
+// own cleaning rather than importing a rendering decision from the data layer.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // cleanDecoration turns git's %d field — " (HEAD -> main, tag: v1.2.0,

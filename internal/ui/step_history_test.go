@@ -823,3 +823,60 @@ func TestHistorySpinnerTicksOnlyWhileSomethingIsBeingRead(t *testing.T) {
 		})
 	}
 }
+
+// ── An abandoned patch request ─────────────────────────
+
+// Input is deliberately not blocked while a read is out, so `p` on a large
+// commit, esc back to the list and enter on the SAME commit used to let the
+// abandoned patch land: the guard only asked which commit it was about, not
+// whether a patch was still wanted. The patch pane then opened itself over the
+// detail pane the user had just asked for, while that detail was still loading.
+func TestAnAbandonedPatchDoesNotOpenItselfLater(t *testing.T) {
+	m := historyModel(t, 3)
+	m.historyShowDetail = true
+	m.historyDetailSHA = "abc1234"
+	m.historyPatchLoading = true // p was pressed on abc1234
+
+	// esc: the request is abandoned, everything about the pane is dropped.
+	m, _ = key(t, m, "esc")
+	if m.historyPatchLoading || m.historyShowDetail {
+		t.Fatal("esc did not close the detail pane")
+	}
+
+	// The user opens the same commit again — detail only, still loading.
+	m.historyShowDetail = true
+	m.historyDetailSHA = "abc1234"
+	m.historyDetailLoading = true
+
+	next, _ := m.Update(historyPatchMsg{
+		sha:  "abc1234",
+		info: git.CommitPatchInfo{Patch: "@@ -1 +1 @@\n-a\n+b\n"},
+	})
+	after := next.(Model)
+	if after.historyShowPatch {
+		t.Error("the abandoned patch opened its pane over the detail the user asked for")
+	}
+	if after.historyPatchLoaded {
+		t.Error("the abandoned patch was cached as this pane's content")
+	}
+	if !after.historyDetailLoading {
+		t.Error("the detail request was disturbed by the stale result")
+	}
+}
+
+// A patch that IS still wanted opens, as it always did.
+func TestAPatchThatIsStillWantedOpens(t *testing.T) {
+	m := historyModel(t, 3)
+	m.historyShowDetail = true
+	m.historyDetailSHA = "abc1234"
+	m.historyPatchLoading = true
+
+	next, _ := m.Update(historyPatchMsg{
+		sha:  "abc1234",
+		info: git.CommitPatchInfo{Patch: "@@ -1 +1 @@\n-a\n+b\n"},
+	})
+	after := next.(Model)
+	if !after.historyShowPatch || !after.historyPatchLoaded {
+		t.Error("the patch the user is waiting for did not open")
+	}
+}

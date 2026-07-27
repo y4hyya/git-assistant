@@ -426,7 +426,14 @@ func (m Model) handleHistoryDetail(msg historyDetailMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleHistoryPatch(msg historyPatchMsg) (tea.Model, tea.Cmd) {
-	if msg.sha != m.historyDetailSHA {
+	// Both halves of the guard matter. The SHA says this patch is about the
+	// commit on screen; historyPatchLoading says the patch is still WANTED.
+	// Input is never blocked during a read, so `p` then esc then enter on the
+	// same commit used to let the abandoned result through — and it opens the
+	// patch pane, over the detail pane the user had just asked for and while
+	// that detail was still loading. closeHistoryDetail clears the flag, so
+	// this is exactly "the request that opened this pane is still out".
+	if msg.sha != m.historyDetailSHA || !m.historyPatchLoading {
 		return m, nil
 	}
 	m.historyPatchLoading = false

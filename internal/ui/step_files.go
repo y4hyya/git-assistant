@@ -26,9 +26,33 @@ func fileStatusStyle(s types.FileStatus) lipgloss.Style {
 		return renamedStyle
 	case types.StatusUntracked:
 		return untrackedStyle
+	case types.StatusConflicted:
+		// Red, like a deletion and unlike the yellow of an ordinary edit: this
+		// file holds conflict markers, and committing it is a mistake rather
+		// than a choice.
+		return errorStyle
 	default:
 		return modifiedStyle
 	}
+}
+
+// conflictedMark is the tail the file list draws on an unmerged entry. The
+// status letter alone ("U") means nothing to someone meeting their first
+// conflict — the word does, and so does the reason it is worth a colour.
+const conflictedMark = "!! conflicted"
+
+// selectedConflicted returns the selected paths that still hold conflict
+// markers. `git commit` would refuse these outright; the wizard stages with
+// reset → add → commit, which takes that refusal away, so the check has to
+// happen here (see types.StatusConflicted).
+func (m Model) selectedConflicted() []string {
+	var out []string
+	for _, f := range m.files {
+		if f.Selected && f.Status == types.StatusConflicted {
+			out = append(out, f.Path)
+		}
+	}
+	return out
 }
 
 // ── List geometry ───────────────────────────────────────
@@ -277,6 +301,14 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.confirmUndo {
 		switch keyMsg.String() {
 		case "y":
+			// On a PUSHED commit there is no plain yes: the prompt offers two
+			// different operations (u rewrites history, r adds a commit that
+			// undoes it) and the footer says any other key cancels. `y` used to
+			// fire the rewrite anyway, so the app-wide "y confirms" habit walked
+			// straight past the one decision this screen exists to force.
+			if m.undoPushed {
+				break
+			}
 			m.confirmUndo = false
 			m.undoing = true
 			return m, tea.Batch(doUndo(), m.spinner.Tick)
@@ -303,6 +335,18 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.undoPushed = false
 		m.undoSubject = ""
 		m.undoSHA = ""
+		return m, nil
+	}
+
+	// Handle the "these files still hold conflict markers" gate. `a` never
+	// selects them, so getting here takes a deliberate space on a red row —
+	// which is allowed, because a file can legitimately be edited clean and left
+	// unstaged. What is not allowed is walking into it silently.
+	if m.confirmConflictedCommit {
+		m.confirmConflictedCommit = false
+		if keyMsg.String() == "y" {
+			return m.advanceFromFiles()
+		}
 		return m, nil
 	}
 
@@ -642,14 +686,23 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.removeIgnored = make(map[string]bool)
 		m.gitignoreMode = true
 	case "a":
+		// Conflicted entries are out of "all": a bulk key must never sweep a
+		// file full of <<<<<<< markers into a commit. They can still be picked
+		// one at a time with space, behind the confirmation above.
 		allSelected := true
 		for _, f := range m.files {
+			if f.Status == types.StatusConflicted {
+				continue
+			}
 			if !f.Selected {
 				allSelected = false
 				break
 			}
 		}
 		for i := range m.files {
+			if m.files[i].Status == types.StatusConflicted {
+				continue
+			}
 			m.files[i].Selected = !allSelected
 		}
 	case "x":
@@ -690,16 +743,11 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("%s nothing selected yet — press space to select a file, a to select all", symWarn)
 			return m, nil
 		}
-		if m.amendMode {
-			m.step = m.firstAmendStep()
-			if m.step == stepMessage {
-				m.msgInput.Focus()
-				m.msgInput.CursorEnd()
-			}
-		} else {
-			m.step = stepType
+		if len(m.selectedConflicted()) > 0 {
+			m.confirmConflictedCommit = true
+			return m, nil
 		}
-		m.cursor = 0
+		return m.advanceFromFiles()
 	case "esc":
 		// Abandoning the wizard: drop every field it filled in (an abandoned
 		// amend used to leave the old commit's message pre-loaded for the
@@ -714,6 +762,22 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Adjust scroll to keep cursor visible
 	m.followCursor(len(m.files), m.fileListRows())
 
+	return m, nil
+}
+
+// advanceFromFiles leaves the file selector for the next wizard step. Split out
+// because two keys reach it now: enter, and the y of the conflicted-files gate.
+func (m Model) advanceFromFiles() (tea.Model, tea.Cmd) {
+	if m.amendMode {
+		m.step = m.firstAmendStep()
+		if m.step == stepMessage {
+			m.msgInput.Focus()
+			m.msgInput.CursorEnd()
+		}
+	} else {
+		m.step = stepType
+	}
+	m.cursor = 0
 	return m, nil
 }
 
@@ -897,6 +961,12 @@ func (m Model) viewFiles() string {
 		if i == m.cursor {
 			path = highlightStyle.Render(f.Path)
 		}
+		// An unmerged entry says so on its own row. A stash pop that conflicted
+		// leaves these with no merge in progress at all, so nothing else on the
+		// screen would hint that the file is full of markers.
+		if f.Status == types.StatusConflicted {
+			path += "  " + errorStyle.Render(conflictedMark)
+		}
 
 		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", cursor, check, status, path))
 	}
@@ -1011,6 +1081,23 @@ func (m Model) viewFiles() string {
 				highlightStyle.Render("revert instead") + " " +
 				dimStyle.Render("— adds a new commit that undoes it; safe for pushed work") + "\n")
 		}
+		b.WriteString("\n")
+		b.WriteString(renderHelpRows(m.helpRows()))
+		return m.styledBox(b.String())
+	}
+
+	// Conflicted-files gate. Named, because "some files are conflicted" leaves
+	// the user hunting a red row on a list they have just scrolled past.
+	if m.confirmConflictedCommit {
+		conflicted := m.selectedConflicted()
+		b.WriteString("\n  " + modifiedStyle.Render(fmt.Sprintf("%s %s still holds conflict markers",
+			symWarn, plural(len(conflicted), "selected file", "selected files"))) + "\n")
+		for _, p := range conflicted {
+			b.WriteString("    " + dimStyle.Render(symBullet) + " " + filePathStyle.Render(p) + "\n")
+		}
+		b.WriteString("\n  " + dimStyle.Render("These contain conflict markers from a stash restore — the <<<<<<< / =======") + "\n")
+		b.WriteString("  " + dimStyle.Render("/ >>>>>>> lines go into the commit exactly as they are. Resolve before") + "\n")
+		b.WriteString("  " + dimStyle.Render("committing: press d to see the file, e to edit it, then come back.") + "\n")
 		b.WriteString("\n")
 		b.WriteString(renderHelpRows(m.helpRows()))
 		return m.styledBox(b.String())
@@ -1235,6 +1322,11 @@ func formatErrorCtx(err error, historyRewritten bool) string {
 	// last fetch saw it, and it moved — someone else pushed.
 	case strings.Contains(msg, "stale info"):
 		hint = "Someone else pushed to origin since your last fetch, so the force was refused\n  and nothing was overwritten. Pull first (p on the menu), then push again."
+	// Must precede the generic "rejected" case: an unrelated-histories refusal
+	// also contains "refusing", and the pull-first advice is exactly wrong for
+	// it — there is no sequence of pulls that merges two unrelated roots here.
+	case strings.Contains(msg, "unrelated histories"):
+		hint = "This repository and the remote don't share any history.\n  Push and pull cannot work between them — clone the remote instead, or connect an empty one."
 	case strings.Contains(msg, "rejected"), strings.Contains(msg, "non-fast-forward"):
 		if historyRewritten {
 			hint = "You rewrote a pushed commit (amend/undo) — origin still has the old one.\n  Press f to replace it with a force-with-lease (the safe force)."

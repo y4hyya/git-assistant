@@ -212,3 +212,119 @@ func TestSyncDivergedViewPointsAtTheForcePush(t *testing.T) {
 		t.Fatalf("view does not point at the safe way out:\n%s", out)
 	}
 }
+
+// ── Back to the push screen after a pull ───────────────
+//
+// The push screen states exactly what the push will send, and enterPush reads
+// every number on it once. A pull run from the dialog it opens invalidates all
+// of them, and the return used to be a bare step assignment: the screen came
+// back warning about commits it had just pulled, offering to pull them again,
+// with an outgoing count that predated the merge commit — and pushCheckDone
+// already true, so the very next enter pushed instead of offering anything.
+func TestAPullFromThePrePushCheckRefreshesThePushScreen(t *testing.T) {
+	origin := tempRepoWithOrigin(t, "chore: seed")
+
+	// Origin moves ahead by two, the way a colleague's push looks locally.
+	clone := t.TempDir()
+	gitRun(t, "clone", "-q", origin, clone)
+	for _, subject := range []string{"feat: theirs one", "feat: theirs two"} {
+		writeFileIn(t, clone, "theirs.txt", subject+"\n")
+		gitRunIn(t, clone, "add", "-A")
+		gitRunIn(t, clone, "commit", "-q", "-m", subject)
+	}
+	gitRunIn(t, clone, "push", "-q", "origin", "main")
+	gitRun(t, "fetch", "-q", "origin")
+
+	// And we have one of our own to send.
+	writeFile(t, "ours.txt", "ours\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: ours")
+
+	m := wizardModel(t, stepPush)
+	m.hasRemote = true
+	m.hasAnyCommit = true
+	m.enterPush(true)
+	if m.pushBehind != 2 || m.pushAhead != 1 {
+		t.Fatalf("fixture: ahead = %d, behind = %d", m.pushAhead, m.pushBehind)
+	}
+	if !strings.Contains(m.viewPush(), "you don't have yet") {
+		t.Fatal("fixture: the behind warning is not on the screen")
+	}
+
+	// enter opens the pre-push check, which is the sync dialog.
+	m, _ = key(t, m, "enter")
+	if m.step != stepSync || m.syncReturnStep != stepPush {
+		t.Fatalf("step = %v, return = %v", m.step, m.syncReturnStep)
+	}
+
+	// p pulls for real, and the result routes back here.
+	m2, cmd := key(t, m, "p")
+	if cmd == nil {
+		t.Fatal("p dispatched nothing")
+	}
+	back := runAll(t, m2, cmd)
+	if back.err != nil {
+		t.Fatalf("the pull failed: %v", back.err)
+	}
+	if back.step != stepPush {
+		t.Fatalf("landed on %v, want the push screen", back.step)
+	}
+	if back.pushBehind != 0 {
+		t.Errorf("pushBehind = %d after pulling — the screen is showing the pre-pull world", back.pushBehind)
+	}
+	if back.pushOutgoingTotal < 2 {
+		t.Errorf("pushOutgoingTotal = %d, want our commit plus the merge the pull made", back.pushOutgoingTotal)
+	}
+	out := back.viewPush()
+	if strings.Contains(out, "you don't have yet") || strings.Contains(out, "offer to pull them in first") {
+		t.Errorf("the push screen still claims we are behind:\n%s", out)
+	}
+	// The offer has been answered; enter must push rather than re-open it.
+	if !back.pushCheckDone {
+		t.Error("the pre-push check would fire a second time")
+	}
+}
+
+// Declining the offer returns to a freshly read screen too — and still does not
+// bounce back into the dialog.
+func TestSkippingThePrePushCheckDoesNotBounceBack(t *testing.T) {
+	tempRepoWithOrigin(t, "chore: seed")
+	writeFile(t, "ours.txt", "ours\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: ours")
+
+	m := wizardModel(t, stepPush)
+	m.hasRemote = true
+	m.enterPush(true)
+	m.syncReturnStep = stepPush
+	m.step = stepSync
+	m.syncPullCurrent = true
+
+	back, _ := key(t, m, "enter") // skip
+	if back.step != stepPush {
+		t.Fatalf("skip landed on %v", back.step)
+	}
+	if !back.pushCheckDone {
+		t.Fatal("the check would re-fire, making the push unreachable")
+	}
+	pushing, cmd := key(t, back, "enter")
+	if cmd == nil || !pushing.pushing {
+		t.Error("enter did not push after the offer was declined")
+	}
+}
+
+// Every screen's footer lists q, and this one exits the app.
+func TestSyncFooterListsTheKeysThatLeave(t *testing.T) {
+	m := syncModel(t)
+	footer := renderHelpRows(m.helpRows())
+	for _, want := range []string{"q", "quit", "enter/esc", "skip"} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("footer = %q, want %q listed", footer, want)
+		}
+	}
+	// And q really does quit, which is why it has to be on the bar.
+	after, cmd := key(t, m, "q")
+	if !after.quitting || cmd == nil {
+		t.Error("q no longer quits — the footer would be lying the other way")
+	}
+}

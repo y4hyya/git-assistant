@@ -163,6 +163,20 @@ func (m Model) exitSyncDialog() (Model, tea.Cmd) {
 		cmd := m.returnToMenu()
 		return m, cmd
 	}
+	if m.syncReturnStep == stepPush {
+		// The push screen states exactly what the push will send, and every
+		// number on it was read by enterPush before the dialog opened. A pull
+		// invalidates all of them at once — behind goes to zero, the merge
+		// commit it may have created joins the outgoing list, the lease moves —
+		// so re-read rather than re-render: the screen used to come back
+		// warning about commits it had just pulled and offering to pull them
+		// again, on a step whose next enter pushed immediately.
+		m.enterPush(m.pushReturnToMenu)
+		// The offer has been made and answered, whichever way. Re-running it
+		// would bounce a declined pull straight back into this dialog.
+		m.pushCheckDone = true
+		return m, nil
+	}
 	m.step = m.syncReturnStep
 	return m, nil
 }
@@ -176,6 +190,7 @@ func (m Model) exitSyncDialog() (Model, tea.Cmd) {
 func (m *Model) clearSyncDialog() {
 	m.syncPullCurrent = false
 	m.syncSyncMain = false
+	m.syncRewriteHold = false
 	m.syncIncomingCurr = nil
 	m.syncIncomingMain = nil
 	m.syncCurrTotal = 0
@@ -198,7 +213,9 @@ func (m Model) viewSync() string {
 	b.WriteString("\n\n")
 
 	// Heading
-	if m.syncDiverged {
+	if m.syncRewriteHold {
+		b.WriteString("  " + highlightStyle.Render("origin/"+m.branch+" still has the commit you rewrote") + "\n\n")
+	} else if m.syncDiverged {
 		b.WriteString("  " + highlightStyle.Render("Your branch and origin/"+m.branch+" have diverged") + "\n\n")
 	} else if m.syncPullCurrent && m.syncSyncMain {
 		b.WriteString("  " + highlightStyle.Render("Your branch is out of sync") + "\n\n")
@@ -206,6 +223,18 @@ func (m Model) viewSync() string {
 		b.WriteString("  " + highlightStyle.Render("origin/"+m.branch+" has new commits") + "\n\n")
 	} else if m.syncSyncMain {
 		b.WriteString("  " + highlightStyle.Render(m.syncMainBranchName+" has new commits") + "\n\n")
+	}
+
+	// The rewrite hold: no pull on offer, and the reason spelled out. Silence
+	// here would read as "there is nothing to do", on a screen the user opened
+	// precisely because the dashboard said they were behind.
+	if m.syncRewriteHold {
+		b.WriteString("  " + modifiedStyle.Render(fmt.Sprintf("%s pulling would bring back the commit you amended or undid",
+			symWarn)) + "\n")
+		b.WriteString("  " + dimStyle.Render("origin/"+m.branch+" is \"ahead\" only because it still holds that commit, so a") + "\n")
+		b.WriteString("  " + dimStyle.Render("pull here silently undoes the rewrite. It is not offered.") + "\n\n")
+		b.WriteString("  " + dimStyle.Render("Open Push from the menu instead: it offers a force-with-lease, which") + "\n")
+		b.WriteString("  " + dimStyle.Render("replaces origin's copy only if nobody else has pushed meanwhile.") + "\n\n")
 	}
 
 	// Diverged — pulling would undo a history rewrite
@@ -287,8 +316,23 @@ func (m *Model) populateSyncDialog() bool {
 		}
 	}
 
+	// A rewrite this session made, that origin is still holding the other half
+	// of: pulling here re-merges the commit the user deliberately amended or
+	// undid, and on the pure-deletion case (undo a pushed commit, don't
+	// re-commit) it fast-forwards it straight back with no divergence warning to
+	// even hint at what happened. The pull is not offered at all in that state —
+	// the force-with-lease on the push screen is the operation that means what
+	// the user asked for.
+	rewriteHold := pullCurrent && m.historyRewritten && m.rewriteBaseSHA != "" &&
+		git.RemoteTrackingSHA(m.branch) == m.rewriteBaseSHA
+	if rewriteHold {
+		pullCurrent = false
+		incomingCurr = nil
+	}
+
 	m.syncPullCurrent = pullCurrent
 	m.syncSyncMain = syncMain
+	m.syncRewriteHold = rewriteHold
 	m.syncIncomingCurr = incomingCurr
 	m.syncIncomingMain = incomingMain
 	m.syncCurrTotal = behind
@@ -297,10 +341,11 @@ func (m *Model) populateSyncDialog() bool {
 	// Ahead AND behind at once: the branch forked from its upstream, or its
 	// history was rewritten under it (amend/undo of a pushed commit). Pulling
 	// merges the pre-rewrite commits back in — the exact thing the rewrite
-	// was undoing — so the offer needs a warning attached.
-	m.syncDiverged = hasUpstream && ahead > 0 && behind > 0
+	// was undoing — so the offer needs a warning attached. Under the hold there
+	// is no pull to warn about; the hold's own block says more, and precisely.
+	m.syncDiverged = !rewriteHold && hasUpstream && ahead > 0 && behind > 0
 
-	return pullCurrent || syncMain
+	return pullCurrent || syncMain || rewriteHold
 }
 
 // renderIncoming writes one "↓ <ref> (N new):" section with up to

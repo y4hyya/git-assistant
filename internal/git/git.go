@@ -91,19 +91,54 @@ func runNetworkTimeout(timeout time.Duration, name string, args ...string) ([]by
 	return runNetworkCtx(networkContext(), timeout, name, args...)
 }
 
+// networkWaitDelay bounds how long Wait may go on copying output after the
+// deadline (or a cancellation) has already killed the command. See
+// runNetworkCtx: the kill alone does not unblock the read.
+const networkWaitDelay = 3 * time.Second
+
 // runNetworkCtx is runNetworkTimeout with the parent context spelled out, so
 // the cancellation path is reachable from a test without cancelling the
 // package-level netCtx for the rest of the process.
+//
+// Killing the command is NOT enough to make the deadline fire, and that was the
+// whole bug this now guards against. git does not talk to a remote itself: an
+// https fetch runs git-remote-https, an ssh one runs ssh, and those children
+// inherit the stdout/stderr pipes CombinedOutput reads. SIGKILL on git leaves
+// the transport holding the write end, and the read blocks until IT exits —
+// which for the stalled-ssh case the timeout exists for is never. The 60s
+// message never appeared and the input-blocking spinner ran forever.
+//
+// Two mechanisms, because neither covers the other's case:
+//
+//  1. the child gets its own process group and the cancel kills the GROUP, so
+//     the transport dies with git instead of being orphaned onto a repository
+//     it is still writing to;
+//  2. WaitDelay bounds the wait regardless — on a platform with no process
+//     groups, or against anything that escapes the group kill, Wait stops
+//     copying, closes the parent's pipe ends and returns.
 func runNetworkCtx(parent context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = networkWaitDelay
+
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		switch {
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
 			return out, ErrNetworkTimeout
 		case errors.Is(ctx.Err(), context.Canceled):
 			return out, ErrNetworkCancelled
+		}
+		// The command itself finished cleanly and something it spawned kept the
+		// pipe open past WaitDelay — an ssh ControlPersist master is the common
+		// one. That is not a failed push, and reporting it as one would send the
+		// user to re-push work that is already on the remote.
+		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			return out, nil
 		}
 	}
 	return out, err
@@ -339,6 +374,13 @@ func parseStatusZ(data string) []types.FileEntry {
 		switch {
 		case xy == "??":
 			status = types.StatusUntracked
+		// Unmerged FIRST, or the codes get swallowed by the arms below: AA and
+		// AU read as "added", DD/DU/UD as "deleted", and UU as plain modified —
+		// which is how a file full of conflict markers used to reach the commit
+		// wizard as an ordinary "M". conflictKindFor is the single list of the
+		// seven codes git calls unmerged (see conflict.go).
+		case isUnmergedCode(xy):
+			status = types.StatusConflicted
 		case xy[0] == 'A' || xy[1] == 'A':
 			status = types.StatusAdded
 		case xy[0] == 'D' || xy[1] == 'D':
@@ -1309,11 +1351,21 @@ func GetRemoteURL() string {
 // decorations so the renderer can tell them apart. With a bare "%s%d" the two
 // are only separated by " (", which is also legal inside a subject — a commit
 // titled "fix: handle (edge case)" then rendered "(edge case)" as if it were a
-// branch. git strips control characters from header lines, so 0x1f cannot
-// occur inside a subject and the split is unambiguous.
+// branch. A subject CAN carry a 0x1f of its own (`git commit -m $'a\x1fb'` is
+// accepted and %s emits the byte raw), so the renderer anchors the split on the
+// LAST separator: the decorations are the final field and a ref name cannot
+// contain a control character. See parseLine in internal/ui/layout.go.
+//
+// --exclude=refs/stash is not optional and has to come BEFORE --all (an exclude
+// applies to the ref-collecting option that FOLLOWS it). --all includes
+// refs/stash, and this app manufactures stashes on its own — every branch
+// switch, merge and pull auto-stashes a dirty tree. One entry drew a
+// three-parent "WIP on main" / "index on main" / "untracked files on main"
+// diamond above the real history: five rows of the panel's budget spent telling
+// a beginner that their uncommitted work was already committed.
 func GetUnifiedGraph(limit int) string {
 	out, err := exec.Command("git", "log", "--graph",
-		"--format=%s%x1f%d", "--all",
+		"--format=%s%x1f%d", "--exclude=refs/stash", "--all",
 		fmt.Sprintf("-%d", limit)).Output()
 	if err != nil {
 		return ""
@@ -1556,15 +1608,24 @@ func MergeBranch(name string) (upToDate bool, err error) {
 // branch from origin — no artificial merge commits when catching up).
 //
 // upToDate carries the same meaning as in MergeBranch.
+//
+// LOCAL, despite the name: origin/<branch> is a remote-TRACKING ref that the
+// background fetch has already written, and merging it touches nothing but this
+// repository. It used to run under runNetwork's 60s deadline, which made a big
+// but perfectly healthy merge (large tree, LFS smudge filters, slow disk) die by
+// SIGKILL at one minute, mid-write, reported as "network operation timed out —
+// check your connection" for an operation that never opened a socket. That is
+// the case the file's own rule at the top covers: a local command gets no
+// timeout, because killing it half way through is worse than waiting.
 func MergeFromOrigin(branch string, noFF bool) (upToDate bool, err error) {
 	args := []string{"merge"}
 	if noFF {
 		args = append(args, "--no-ff")
 	}
 	args = append(args, "origin/"+branch)
-	out, err := runNetwork("git", args...)
+	out, err := exec.Command("git", args...).CombinedOutput()
 	if err != nil {
-		return false, netFail("", out, err)
+		return false, fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
 	return mergeWasNoOp(out), nil
 }

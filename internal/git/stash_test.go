@@ -3,6 +3,7 @@ package git
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -345,6 +346,104 @@ func TestApplyOntoADirtyTreeIsRefusedWithoutTouchingAnything(t *testing.T) {
 	}
 	if n := StashCount(); n != 1 {
 		t.Errorf("the stash count changed after a refusal (%d)", n)
+	}
+}
+
+// The third failure, and the one that used to be reported as the first: git
+// refuses to restore a stash while the index holds unmerged entries, and it
+// refuses BEFORE touching anything. Classifying that after the fact read the
+// merge's own unmerged files back out of the index and blamed them on the
+// stash — "conflict markers are now in s.txt, and the stash itself was kept" —
+// with an advised recovery (`git reset HEAD` then `git checkout -- .`) that
+// would have destroyed the half-resolved merge.
+//
+// Two keypresses from the conflict resolver: esc leaves the merge open by
+// design, and the resolver has just told the user their work is parked in a
+// stash.
+func TestRestoreDuringAMergeBlamesTheMergeNotTheStash(t *testing.T) {
+	for _, tc := range []struct {
+		verb    string
+		restore func(string) error
+	}{
+		{"apply", StashApplyRef},
+		{"pop", StashPopRef},
+	} {
+		t.Run(tc.verb, func(t *testing.T) {
+			scratchRepo(t)
+			write(t, "s.txt", "base\n")
+			commitAll(t, "seed")
+			runGit(t, "checkout", "-q", "-b", "feat")
+			write(t, "s.txt", "theirs\n")
+			commitAll(t, "feat edit")
+			runGit(t, "checkout", "-q", "main")
+			write(t, "s.txt", "ours\n")
+			commitAll(t, "main edit")
+
+			// An unrelated stash, so nothing about the failure is about the
+			// stash's own content.
+			write(t, "other.txt", "work in progress\n")
+			runGit(t, "stash", "push", "-q", "--include-untracked")
+
+			// The merge conflicts and is LEFT open — the app's own behaviour.
+			if err := exec.Command("git", "merge", "--no-ff", "feat").Run(); err == nil {
+				t.Fatal("the fixture merge did not conflict")
+			}
+			if !MergeInProgress() {
+				t.Fatal("no merge in progress — the fixture proves nothing")
+			}
+
+			err := tc.restore("stash@{0}")
+			if !errors.Is(err, ErrStashDuringMerge) {
+				t.Fatalf("%s during a merge returned %v, want ErrStashDuringMerge", tc.verb, err)
+			}
+			if errors.Is(err, ErrStashConflict) {
+				t.Error("reported as a stash conflict — the stash never ran")
+			}
+			if !strings.Contains(err.Error(), "abort the merge") {
+				t.Errorf("error = %q, want it to name the merge as the blocker", err)
+			}
+			// Nothing was touched: the entry is still there and the merge's own
+			// state is intact.
+			if n := StashCount(); n != 1 {
+				t.Errorf("stash count = %d, want the entry untouched", n)
+			}
+			if !MergeInProgress() {
+				t.Error("the merge state was disturbed by a refused stash restore")
+			}
+		})
+	}
+}
+
+// The same refusal without MERGE_HEAD: a conflicted stash pop leaves unmerged
+// entries and no merge at all, and "finish or abort the merge" would then name
+// something that does not exist.
+func TestRestoreOntoAnUnmergedIndexWithoutAMerge(t *testing.T) {
+	scratchRepo(t)
+	write(t, "a.txt", "l1\nl2\nl3\n")
+	commitAll(t, "seed")
+	write(t, "a.txt", "l1\nSTASHED\nl3\n")
+	runGit(t, "stash", "push", "-q")
+	write(t, "a.txt", "l1\nCOMMITTED\nl3\n")
+	commitAll(t, "conflicting change")
+
+	// First apply conflicts for real — markers written, index unmerged.
+	if err := StashApplyRef("stash@{0}"); !errors.Is(err, ErrStashConflict) {
+		t.Fatalf("first apply returned %v, want ErrStashConflict", err)
+	}
+	if MergeInProgress() {
+		t.Fatal("a conflicted stash apply set MERGE_HEAD — the fixture is wrong")
+	}
+
+	// The second one is refused because of what the first left behind.
+	err := StashApplyRef("stash@{0}")
+	if !errors.Is(err, ErrStashDuringMerge) {
+		t.Fatalf("apply onto an unmerged index returned %v, want ErrStashDuringMerge", err)
+	}
+	if strings.Contains(err.Error(), "merge is in progress") {
+		t.Errorf("error = %q, but there is no merge to abort", err)
+	}
+	if !strings.Contains(err.Error(), "a.txt") {
+		t.Errorf("error = %q, want the unmerged path named", err)
 	}
 }
 

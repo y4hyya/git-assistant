@@ -356,21 +356,26 @@ type Model struct {
 	// committed or aborted. mergeInProgress mirrors git.MergeInProgress() and is
 	// what the dashboard gates on; it is refreshed with the snapshot so a merge
 	// started in another terminal is picked up too.
-	conflictRows      []conflictRow
-	conflictCursor    int
-	conflictScroll    int
-	conflictOrigin    conflictOrigin
-	conflictSource    string
-	conflictTarget    string
-	conflictStashed   bool
-	conflictStashRef  string
-	conflictEditPath  string
-	conflictMarkWarn  bool
-	conflictMarkPath  string
-	conflictResolving bool
-	conflictFinishing bool
-	conflictAborting  bool
-	mergeInProgress   bool
+	conflictRows     []conflictRow
+	conflictCursor   int
+	conflictScroll   int
+	conflictOrigin   conflictOrigin
+	conflictSource   string
+	conflictTarget   string
+	conflictStashed  bool
+	conflictStashRef string
+	conflictEditPath string
+	conflictMarkWarn bool
+	conflictMarkPath string
+	// conflictConfirmAbort is the y/N gate in front of `git merge --abort`. `a`
+	// used to abort on the first press — the only destructive key in the app
+	// that did not ask, on a screen whose neighbours (file selector, stash
+	// manager) both use `a` for something harmless.
+	conflictConfirmAbort bool
+	conflictResolving    bool
+	conflictFinishing    bool
+	conflictAborting     bool
+	mergeInProgress      bool
 
 	// Config editor
 	configCursor     int
@@ -413,6 +418,13 @@ type Model struct {
 	confirmDiscard bool
 	discarding     bool
 	discardEntry   types.FileEntry
+
+	// confirmConflictedCommit is the gate in front of committing a file that
+	// still holds conflict markers (types.StatusConflicted). The wizard stages
+	// with reset → add → commit, which removes git's own "you have unmerged
+	// files" refusal, so this is the only thing between a stash-pop conflict and
+	// a commit full of <<<<<<< fences.
+	confirmConflictedCommit bool
 
 	// Step 4 — push
 	hasRemote  bool
@@ -457,12 +469,21 @@ type Model struct {
 	// operation runs, promoted here on success.
 	rewriteBaseSHA    string
 	rewritePendingSHA string
+	// rewriteBaseByBranch is the same base, per branch, and it is the record
+	// rewriteBaseSHA/historyRewritten are DERIVED from (see rememberRewrite /
+	// adoptRewriteFor). A rewrite belongs to the branch it happened on: without
+	// this, visiting another branch and coming back cleared historyRewritten for
+	// good, and the still-diverged branch was then offered the plain pull that
+	// merges the pre-rewrite commit straight back in — with no later amend able
+	// to re-arm the flag, since the rewritten commit is on no remote any more.
+	rewriteBaseByBranch map[string]string
 	// historyRewritten records that this session amended or undid a commit that
-	// was already on origin. The next push is then rejected as non-fast-forward,
-	// and the stock "run git pull first" hint is the one piece of advice that
-	// undoes the rewrite — it merges the pre-rewrite commit straight back in.
-	// Deliberately NOT cleared by resetWizard: the rewrite happens in one wizard
-	// run and the rejected push usually happens in the next.
+	// was already on origin, on the branch we are standing on. The next push is
+	// then rejected as non-fast-forward, and the stock "run git pull first" hint
+	// is the one piece of advice that undoes the rewrite — it merges the
+	// pre-rewrite commit straight back in. Deliberately NOT cleared by
+	// resetWizard: the rewrite happens in one wizard run and the rejected push
+	// usually happens in the next.
 	historyRewritten bool
 
 	// Gitignore — paths that need git rm --cached during commit
@@ -518,8 +539,11 @@ type Model struct {
 	// Update and isNavKey.
 	statusNote string
 
-	// Main menu
+	// Main menu. menuScroll is the list's window offset — the dashboard grew to
+	// nine entries in v1.3 and a short terminal used to lose the bottom of it,
+	// cursor included (see menuWindow).
 	menuCursor int
+	menuScroll int
 
 	// Commit graph
 	localGraph   string
@@ -576,6 +600,13 @@ type Model struct {
 	// so the dialog has to say so before offering it.
 	syncAhead    int
 	syncDiverged bool
+	// syncRewriteHold: origin's tip is EXACTLY the commit this session rewrote,
+	// so "behind" means "origin still has the commit you removed" and a pull
+	// puts it back. The offer is withheld and the dialog says why, routing to
+	// the force-with-lease on the push screen. Undoing a pushed commit without
+	// re-committing is the case that needs it most: nothing is ahead, so the
+	// divergence warning above cannot fire at all.
+	syncRewriteHold bool
 
 	// showHelp puts the `?` overlay over the current screen. Not a step: it has
 	// no state of its own, it lists whatever keys the screen underneath
@@ -854,6 +885,12 @@ func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.hasAnyCommit = s.hasAnyCommit
 	m.historyTotal = s.totalCommits
 	m.detached = s.detached
+	// The rewrite pin belongs to a branch, and this is the reading that says
+	// which branch we are on: a switch made anywhere — the branch manager, a
+	// `git checkout` in another terminal — lands here, so the force machinery
+	// is re-derived from the per-branch record rather than left describing the
+	// branch it was armed on.
+	m.adoptRewriteFor(s.branch)
 	// Not while the resolver is on screen, and not while one of its operations
 	// is in flight: the snapshot is read off a goroutine that may have started
 	// before the merge commit landed, and letting a stale reading put the flag
@@ -1127,6 +1164,67 @@ func (m Model) opInFlight() bool {
 		m.initWorking
 }
 
+// ── The rewrite record ──────────────────────────────────
+//
+// One rewrite pin per branch, and historyRewritten/rewriteBaseSHA are the
+// current branch's entry in it. Three rules, each of which was a shipped bug:
+//
+//   - A SECOND rewrite while one is still pending keeps the ORIGINAL base. The
+//     pin names the commit ORIGIN is holding, not the last thing we replaced
+//     locally; overwriting it with the new local HEAD made the force gate
+//     compare two commits that were never meant to match and answer "someone
+//     pushed on top of the commit you rewrote" about a branch nobody else had
+//     touched — while the only advice left on screen (pull) restores what the
+//     user just deleted.
+//   - A branch switch does not destroy the record, it just stops being the
+//     current one. Coming back re-adopts it.
+//   - A push or a pull ENDS the rewrite: origin and the branch agree again
+//     (whichever way round), so the pin is dropped rather than left to arm a
+//     force against a commit nobody is holding.
+
+// rememberRewrite pins the commit origin is expected to still hold after a
+// rewrite that just landed on the current branch.
+//
+// Membership of the map is what historyRewritten means, not the value: an
+// unknown base (a reading git would not give us) still records the rewrite, and
+// originHoldsTheRewrittenCommit falls back to the older behaviour for it rather
+// than refusing a legitimate force.
+func (m *Model) rememberRewrite(base string) {
+	if m.rewriteBaseByBranch == nil {
+		m.rewriteBaseByBranch = make(map[string]string)
+	}
+	// A live pin with a base keeps it: the pin names what ORIGIN holds, and
+	// origin has not moved just because we rewrote a second time locally.
+	if existing, live := m.rewriteBaseByBranch[m.branch]; live && existing != "" {
+		m.rewriteBaseSHA = existing
+		m.historyRewritten = true
+		return
+	}
+	m.rewriteBaseByBranch[m.branch] = base
+	m.rewriteBaseSHA = base
+	m.historyRewritten = true
+}
+
+// forgetRewrite drops the pin for a branch whose local history and origin agree
+// again. Called after a successful push (origin has our version now) and after
+// a successful pull (we have origin's version back).
+func (m *Model) forgetRewrite(branch string) {
+	delete(m.rewriteBaseByBranch, branch)
+	if branch == m.branch {
+		m.rewriteBaseSHA = ""
+		m.historyRewritten = false
+	}
+}
+
+// adoptRewriteFor makes branch's record the current one. Every path that
+// changes which branch we are on runs it — a switch, and the dashboard snapshot
+// that confirms one — so the flag can never describe the branch we left.
+func (m *Model) adoptRewriteFor(branch string) {
+	base, live := m.rewriteBaseByBranch[branch]
+	m.rewriteBaseSHA = base
+	m.historyRewritten = live
+}
+
 // noteOrphanedStash records that an auto-stash was pushed and could not be
 // popped: the stack now holds exactly one more entry than the last dashboard
 // snapshot counted. Arithmetic, not a guess — this app pushed that entry and
@@ -1246,8 +1344,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// it so the rejected push that follows gets force-with-lease guidance
 		// instead of the "run git pull first" advice that would restore it.
 		if wasPushed {
-			m.historyRewritten = true
-			m.rewriteBaseSHA = m.rewritePendingSHA
+			m.rememberRewrite(m.rewritePendingSHA)
 		}
 		// The commit the wizard was pointed at no longer exists. Staying
 		// latched in amendMode would make the next confirm rewrite the
@@ -1469,8 +1566,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Amending a commit that is already on origin rewrites shared history.
 		// See historyRewritten: the push it makes fail needs different advice.
 		if m.amendMode && m.amendPushed {
-			m.historyRewritten = true
-			m.rewriteBaseSHA = m.rewritePendingSHA
+			m.rememberRewrite(m.rewritePendingSHA)
 		}
 		refresh := m.requestDashboardRefresh()
 		// Amends route straight to Done — auto-routing to push after an
@@ -1514,9 +1610,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushFailed = false
 		m.pushErr = nil
 		published := !m.pushHasUpstream
-		// Whatever the local history looked like, origin has it now. This is
-		// also what clears the dashboard's "force required" Push entry.
-		m.historyRewritten = false
+		// Whatever the local history looked like, origin has it now: the pin
+		// goes with the flag, or the next visit re-derives a rewrite that has
+		// already been published. This is also what clears the dashboard's
+		// "force required" Push entry.
+		m.forgetRewrite(m.branch)
 		m.pushForce = false
 		// The branch tracks origin from here on, whichever push did it.
 		m.pushHasUpstream = true
@@ -1565,8 +1663,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Whatever HEAD was before, it is a branch now — switching away is the
 		// cure for a detached HEAD, and the menu unlocks again on this line.
 		m.detached = false
-		// The rewrite belonged to the branch we just left.
-		m.historyRewritten = false
+		// The rewrite belonged to the branch we just left — and it still does.
+		// It used to be cleared outright and never re-derived, so a round trip
+		// disarmed the force machinery on a branch that was still diverged.
+		m.adoptRewriteFor(msg.newBranch)
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
@@ -1617,6 +1717,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branch = msg.newBranch
 		// `git checkout -b` leaves HEAD on the new branch, detached or not.
 		m.detached = false
+		// A brand-new branch has no rewrite of its own; the one we may have been
+		// carrying belongs to the branch it was forked from.
+		m.adoptRewriteFor(msg.newBranch)
 		m.branchEntries = git.GetAllBranches()
 		m.branchCursor = 0
 		m.branchScroll = 0
@@ -1759,8 +1862,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendNoteClause("your uncommitted changes were stashed and restored")
 		}
 		// A completed pull re-joins the branch to its upstream, so whatever
-		// rewrite made them diverge is no longer what a rejected push means.
-		m.historyRewritten = false
+		// rewrite made them diverge is no longer what a rejected push means —
+		// the pre-rewrite commit is back in the branch. Drop the pin with the
+		// flag, or the dashboard would re-derive the rewrite from it.
+		m.forgetRewrite(m.branch)
 		// exitSyncDialog only refreshes when it lands back on the menu; the
 		// pre-push check returns to the push step, where the graph is just as
 		// stale.
@@ -1877,6 +1982,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc", "enter":
 				m.err = nil
 				return m, nil
+			case "S":
+				// Every one of these banners ends in "press S to open the stash
+				// manager", and they land wherever the operation finished — the
+				// push step and the file selector included, where S was a dead
+				// key. The banner names the screen it wants; the key answers
+				// from any of them. See stashRecoveryOffered, which is what puts
+				// S in the footer for the same set of frames.
+				if m.stashRecoveryOffered() {
+					m.enterStash()
+					return m, nil
+				}
 			}
 		} else {
 			m.err = nil

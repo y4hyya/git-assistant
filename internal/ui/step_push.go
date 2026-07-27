@@ -77,6 +77,17 @@ func (m Model) forcePushRequired() bool {
 	if m.pushAhead > 0 && m.pushBehind > 0 {
 		return true
 	}
+	// Pure deletion: the user undid a pushed commit and did NOT re-commit — the
+	// leaked-secret case, and the one this screen used to have no answer for.
+	// Nothing to send, one (or more) commits on origin to remove, and origin's
+	// tip is exactly the commit that was removed, which is what makes the lease
+	// safe. Without this the menu offered "force required", the screen said
+	// "origin already has everything", and the only live key opened a pull that
+	// restored the commit.
+	if m.pushAhead == 0 && m.pushBehind > 0 && m.rewriteBaseSHA != "" &&
+		m.pushLeaseSHA == m.rewriteBaseSHA {
+		return true
+	}
 	// The amend flow knows what it just did without consulting the counts: it
 	// rewrote a commit IsLastCommitPushed() reported as already on a remote.
 	return m.amendPushed && m.pushHasUpstream
@@ -314,15 +325,30 @@ func (m Model) pushVerb() string {
 // this state was a Done screen printing a command to run somewhere else.
 func (m Model) renderForceExplainer() string {
 	var b strings.Builder
-	b.WriteString("  " + modifiedStyle.Render(symWarn+" Force push required — your history was rewritten") + "\n\n")
-	b.WriteString("  " + dimStyle.Render("You amended or undid a commit that origin already has, so the two") + "\n")
-	b.WriteString("  " + dimStyle.Render("copies have diverged and a normal push will be rejected.") + "\n\n")
+	// Undoing a pushed commit without re-committing is a DELETION, and calling
+	// that "replacing origin's copy" hides the only thing about it that matters.
+	deletion := m.pushAhead == 0 && m.pushBehind > 0
+	if deletion {
+		b.WriteString("  " + modifiedStyle.Render(symWarn+" Force push required — you removed a commit origin has") + "\n\n")
+		b.WriteString("  " + dimStyle.Render("You undid a pushed commit and have not made a new one, so this push") + "\n")
+		b.WriteString("  " + dimStyle.Render("DELETES it from origin. A normal push cannot: git only ever adds.") + "\n\n")
+	} else {
+		b.WriteString("  " + modifiedStyle.Render(symWarn+" Force push required — your history was rewritten") + "\n\n")
+		b.WriteString("  " + dimStyle.Render("You amended or undid a commit that origin already has, so the two") + "\n")
+		b.WriteString("  " + dimStyle.Render("copies have diverged and a normal push will be rejected.") + "\n\n")
+	}
 	b.WriteString("  " + dimStyle.Render("Force-with-lease replaces origin's copy ONLY if nobody else pushed") + "\n")
 	b.WriteString("  " + dimStyle.Render("meanwhile — it is the safe force. If someone did, git refuses and") + "\n")
 	b.WriteString("  " + dimStyle.Render("nothing is lost.") + "\n\n")
-	b.WriteString(fmt.Sprintf("  %s  %s\n",
-		modifiedStyle.Render(fmt.Sprintf("%s%d to send", symArrowUp, m.pushAhead)),
-		dimStyle.Render(fmt.Sprintf("%s%d on origin will be replaced", symArrowDown, m.pushBehind))))
+	if deletion {
+		b.WriteString(fmt.Sprintf("  %s\n",
+			modifiedStyle.Render(fmt.Sprintf("%s%d on origin will be removed, nothing is sent in its place",
+				symArrowDown, m.pushBehind))))
+	} else {
+		b.WriteString(fmt.Sprintf("  %s  %s\n",
+			modifiedStyle.Render(fmt.Sprintf("%s%d to send", symArrowUp, m.pushAhead)),
+			dimStyle.Render(fmt.Sprintf("%s%d on origin will be replaced", symArrowDown, m.pushBehind))))
+	}
 	b.WriteString("\n")
 	return b.String()
 }

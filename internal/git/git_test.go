@@ -215,6 +215,35 @@ func TestParseStatusZ(t *testing.T) {
 				{Path: "Rename.txt", Status: types.StatusUntracked},
 			},
 		},
+		{
+			// All seven unmerged codes, and every one of them used to be
+			// swallowed by an arm below: UU read as modified, AA/AU as added,
+			// DD/DU/UD as deleted. A file full of conflict markers then reached
+			// the commit wizard as an ordinary "M".
+			name: "the seven unmerged codes are their own status",
+			data: "UU both.txt\x00AA added.txt\x00DD gone.txt\x00AU we-added.txt\x00" +
+				"UA they-added.txt\x00DU we-deleted.txt\x00UD they-deleted.txt\x00",
+			want: []types.FileEntry{
+				{Path: "both.txt", Status: types.StatusConflicted},
+				{Path: "added.txt", Status: types.StatusConflicted},
+				{Path: "gone.txt", Status: types.StatusConflicted},
+				{Path: "we-added.txt", Status: types.StatusConflicted},
+				{Path: "they-added.txt", Status: types.StatusConflicted},
+				{Path: "we-deleted.txt", Status: types.StatusConflicted},
+				{Path: "they-deleted.txt", Status: types.StatusConflicted},
+			},
+		},
+		{
+			// Ordinary staged/unstaged combinations keep their old meaning —
+			// "U" is what makes a code unmerged, not the presence of A or D.
+			name: "two-sided ordinary codes are unaffected",
+			data: "AM added.txt\x00MD deleted.txt\x00MM modified.txt\x00",
+			want: []types.FileEntry{
+				{Path: "added.txt", Status: types.StatusAdded},
+				{Path: "deleted.txt", Status: types.StatusDeleted},
+				{Path: "modified.txt", Status: types.StatusModified},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -229,6 +258,45 @@ func TestParseStatusZ(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The state no screen could see: a conflicted stash pop leaves "UU" entries and
+// NO MERGE_HEAD, so nothing keyed on a merge being in progress knows anything is
+// wrong. GetStatus is the only thing that ever looks at those files, and while
+// it called them "M" the wizard committed the raw markers under an innocent
+// subject — plain `git commit` refuses ("you have unmerged files"), but the
+// wizard's reset → add → commit sequence steps around git's own guard.
+func TestGetStatusReportsAStashPopConflictAsConflicted(t *testing.T) {
+	scratchRepo(t)
+	write(t, "conflict.txt", "l1\nl2\nl3\n")
+	commitAll(t, "seed")
+	write(t, "conflict.txt", "l1\nSTASHED\nl3\n")
+	runGit(t, "stash", "push", "-q")
+	write(t, "conflict.txt", "l1\nCOMMITTED\nl3\n")
+	commitAll(t, "conflicting change")
+
+	if err := StashPopRef("stash@{0}"); err == nil {
+		t.Fatal("the fixture pop did not conflict")
+	}
+	if MergeInProgress() {
+		t.Fatal("MERGE_HEAD exists — this is not the unguarded state being tested")
+	}
+
+	entry, ok := statusByPath(t)["conflict.txt"]
+	if !ok {
+		t.Fatal("GetStatus did not report the conflicted file at all")
+	}
+	if entry.Status != types.StatusConflicted {
+		t.Errorf("status = %v (symbol %q), want StatusConflicted — the wizard would list it as an ordinary edit",
+			entry.Status, entry.Status.Symbol())
+	}
+	if entry.Status.Symbol() != "U" {
+		t.Errorf("symbol = %q, want %q", entry.Status.Symbol(), "U")
+	}
+	// And the file really is the hazard the status now advertises.
+	if got := readFile(t, "conflict.txt"); !strings.Contains(got, "<<<<<<<") {
+		t.Fatalf("no conflict markers in the fixture file:\n%s", got)
 	}
 }
 
@@ -745,6 +813,93 @@ func TestRunNetworkTimeoutKillsAndReportsFriendly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "check your connection") {
 		t.Errorf("timeout error = %q, want actionable text", err)
+	}
+}
+
+// The deadline has to fire even when the command's own CHILDREN outlive it.
+//
+// git never talks to a remote itself: an https fetch runs git-remote-https, an
+// ssh one runs ssh, and both inherit the stdout/stderr pipes CombinedOutput is
+// reading. Killing git alone leaves the transport holding the write end, and
+// the read blocks until IT exits — for the hung-ssh case this timeout exists
+// for, that is never. `sh -c 'sleep 30 & exec sleep 30'` is the same shape in
+// one line: the backgrounded sleep keeps the pipe open after the foreground
+// process is killed.
+func TestRunNetworkTimeoutKillsChildrenHoldingThePipes(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	start := time.Now()
+	out, err := runNetworkTimeout(200*time.Millisecond, "sh", "-c", "sleep 30 & exec sleep 30")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrNetworkTimeout) {
+		t.Fatalf("err = %v (output %q), want ErrNetworkTimeout", err, out)
+	}
+	// Well under the grandchild's 30s: the point is that the wait is bounded by
+	// the deadline, not by whatever the transport decides to do next.
+	if elapsed > 10*time.Second {
+		t.Errorf("took %s — the read waited for the child that held the pipes", elapsed)
+	}
+}
+
+// The same deadline against the transport git really uses: GIT_SSH_COMMAND
+// points at something that hangs, and git spawns it for an ssh:// remote.
+//
+// Traced in a scratch repo: killing git alone DID return here — git does not
+// hand its ssh child the pipe CombinedOutput reads — but the ssh process
+// SURVIVED, orphaned, still holding the repository a fetch writes packs and
+// refs into, seconds after the user was told the operation had timed out. The
+// group kill is what collects it, and that is what this pins.
+func TestNetworkTimeoutKillsAHungSSHTransport(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	scratchRepo(t)
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "ssh-survived")
+	hang := filepath.Join(tmp, "hang-ssh")
+	script := "#!/bin/sh\n{ sleep 1; : > '" + marker + "'; } &\nexec sleep 30\n"
+	if err := os.WriteFile(hang, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ssh: %v", err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", hang)
+	runGit(t, "remote", "add", "origin", "ssh://git@example.invalid/repo.git")
+
+	start := time.Now()
+	out, err := runNetworkTimeout(500*time.Millisecond, "git", "fetch", "--quiet", "origin")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrNetworkTimeout) {
+		t.Fatalf("err = %v (output %q), want ErrNetworkTimeout", err, out)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %s — the deadline did not bound the wait", elapsed)
+	}
+	// Past the transport's own sleep: with the group kill it never got there.
+	time.Sleep(1500 * time.Millisecond)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("the ssh transport outlived the timeout — it is still writing to the repository")
+	}
+}
+
+// …and the transport child must actually DIE, not merely be waited on: an
+// orphaned git-remote-https goes on writing to the repository the user was just
+// told the operation had timed out on. The grandchild here leaves a marker file
+// behind if it survives its parent's kill.
+func TestRunNetworkTimeoutKillsTheWholeProcessGroup(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	marker := filepath.Join(t.TempDir(), "grandchild-survived")
+	script := "{ sleep 1; : > '" + marker + "'; } & exec sleep 30"
+
+	if _, err := runNetworkTimeout(200*time.Millisecond, "sh", "-c", script); !errors.Is(err, ErrNetworkTimeout) {
+		t.Fatalf("err = %v, want ErrNetworkTimeout", err)
+	}
+	// Past the grandchild's own sleep: if the group kill worked it never got
+	// there. (A slow machine can only make this test pass, never fail wrongly.)
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the transport child outlived the deadline — the kill did not reach the process group")
 	}
 }
 

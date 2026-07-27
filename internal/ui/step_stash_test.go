@@ -785,3 +785,58 @@ func TestACleanAutoStashRoundTripDoesNotBumpTheCount(t *testing.T) {
 		t.Fatalf("err = %v on a clean switch", out.err)
 	}
 }
+
+// ── The mid-merge lock ─────────────────────────────────
+//
+// The conflict resolver parks the auto-stash a conflicting merge took and pops
+// it itself when the merge ends. Mutating the stack from here while that is
+// pending is what let the resolver's pop restore an unrelated entry, or destroy
+// work this screen had just brought back. Browsing stays open.
+
+func TestStashManagerIsReadOnlyMidMerge(t *testing.T) {
+	stashRepo(t, 2)
+	m := wizardModel(t, stepStash)
+	m.enterStash()
+	m.mergeInProgress = true
+
+	for _, k := range []string{"a", "p", "x"} {
+		after, cmd := key(t, m, k)
+		if cmd != nil {
+			t.Errorf("%q dispatched an operation while a merge was open", k)
+		}
+		if after.stashApplying || after.stashDropping || after.stashConfirmDrop {
+			t.Errorf("%q started to act while a merge was open", k)
+		}
+		if after.err == nil {
+			t.Fatalf("%q refused in silence", k)
+		}
+		if msg := after.err.Error(); !strings.Contains(msg, "finish or abort the merge first") {
+			t.Errorf("%q said %q, want the resolver named", k, msg)
+		}
+	}
+
+	// Looking is still allowed — the preview reads and writes nothing.
+	if after, _ := key(t, m, "d"); !after.stashShowDiff {
+		t.Error("the preview is locked too")
+	}
+	if out := m.viewStash(); !strings.Contains(out, "read-only until it is done") {
+		t.Errorf("the screen does not say why the keys refuse:\n%s", out)
+	}
+	if footer := renderHelpRows(m.helpRows()); !strings.Contains(footer, "locked") {
+		t.Errorf("footer = %q, want the locked keys shown as locked", footer)
+	}
+}
+
+func TestStashManagerMutatesFreelyWithNoMerge(t *testing.T) {
+	stashRepo(t, 1)
+	m := wizardModel(t, stepStash)
+	m.enterStash()
+
+	after, cmd := key(t, m, "p")
+	if cmd == nil || !after.stashApplying {
+		t.Error("pop refused with no merge in progress")
+	}
+	if after.err != nil {
+		t.Errorf("err = %v", after.err)
+	}
+}

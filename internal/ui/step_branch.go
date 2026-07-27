@@ -385,7 +385,16 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.branchRenameInput.CursorEnd()
 		m.branchRenameInput.Focus()
 		return m, nil
-	case "d":
+	// Delete is `x`, not `d`.
+	//
+	// `x` is what destroys things everywhere else in this app — discard in the
+	// file selector, delete in the stash manager — while `d` is what LOOKS at
+	// the row under the cursor on the two list screens v1.3 added (the stash
+	// preview and the history detail). On a screen that renders an identical
+	// cursor list, the habit those teach put a beginner one reflexive `y` away
+	// from deleting a branch. `d` is deliberately unhandled here rather than
+	// re-pointed: the muscle memory it belongs to must land on nothing.
+	case "x":
 		if len(m.branchEntries) == 0 {
 			return m, nil
 		}

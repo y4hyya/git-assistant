@@ -10,6 +10,7 @@ import (
 
 	"git-assist/internal/git"
 	"git-assist/internal/types"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -1113,10 +1114,15 @@ func TestMergeConflictOnADirtyTreeParksTheStashUntilTheMergeEnds(t *testing.T) {
 		t.Error("notes.txt is in the working tree during the merge — it belongs in the stash")
 	}
 
-	// `a` is the old behavior, one keypress away: abort, then restore.
-	m2, cmd := key(t, got, "a")
+	// `a` is the old behavior, two keypresses away: it asks first (throwing a
+	// merge away is destructive), then aborts and restores.
+	confirming, cmd := key(t, got, "a")
+	if cmd != nil || !confirming.conflictConfirmAbort {
+		t.Fatal("a aborted without confirming")
+	}
+	m2, cmd := key(t, confirming, "y")
 	if cmd == nil {
-		t.Fatal("a dispatched nothing")
+		t.Fatal("y dispatched nothing")
 	}
 	batch, ok := cmd().(tea.BatchMsg)
 	if !ok {
@@ -3408,9 +3414,22 @@ func TestUndoPromptOffersRevertOnlyForPushedCommits(t *testing.T) {
 	if mu, cmd := key(t, m, "u"); cmd == nil || !mu.undoing {
 		t.Errorf("u did not start the undo (undoing=%v, cmd=%v)", mu.undoing, cmd != nil)
 	}
-	// y still confirms the undo, as it always did.
-	if my, cmd := key(t, m, "y"); cmd == nil || !my.undoing {
-		t.Error("y no longer confirms the undo")
+	// y is NOT a third exit here. The footer says "any cancel", and the whole
+	// point of this prompt is that a pushed commit has two different answers —
+	// the app-wide "y confirms" reflex used to pick the history-rewriting one
+	// without the user ever engaging with the choice.
+	my, cmd := key(t, m, "y")
+	if cmd != nil || my.undoing || my.reverting {
+		t.Error("y ran the undo on a pushed commit instead of cancelling")
+	}
+	if my.confirmUndo {
+		t.Error("y left the prompt up — it must cancel like any other key")
+	}
+	// On an UNPUSHED commit it is still the confirmation it always was.
+	plain := wizardModel(t, stepFiles, file("a.txt"))
+	plain.confirmUndo = true
+	if mp, cmd := key(t, plain, "y"); cmd == nil || !mp.undoing {
+		t.Error("y no longer confirms the undo of an unpushed commit")
 	}
 }
 
@@ -3670,6 +3689,11 @@ func helpScreens(t *testing.T) []struct {
 			m.confirmDiscard = true
 			m.discardEntry = entry("a.txt", types.StatusModified)
 		})},
+		{"files conflicted commit gate", mk(stepFiles, func(m *Model) {
+			m.files = []types.FileEntry{entry("marked.txt", types.StatusConflicted)}
+			m.files[0].Selected = true
+			m.confirmConflictedCommit = true
+		})},
 		{"diff", mk(stepFiles, func(m *Model) {
 			m.showDiff, m.diffContent, m.diffFile = true, "@@ -1 +1 @@\n-a\n+b\n", "a.txt"
 		})},
@@ -3738,6 +3762,20 @@ func helpScreens(t *testing.T) []struct {
 		{"sync", mk(stepSync, func(m *Model) {
 			m.syncPullCurrent, m.syncSyncMain, m.syncMainBranchName = true, true, "main"
 		})},
+		// The pull is withheld here, so the footer has to lose its p.
+		{"sync rewrite hold", mk(stepSync, func(m *Model) {
+			m.syncRewriteHold, m.syncMainBranchName = true, "main"
+			m.syncCurrTotal = 1
+		})},
+		// A recovery banner puts S on whatever screen it lands on.
+		{"push with a recovery banner", mk(stepPush, func(m *Model) {
+			m.pushReturnToMenu, m.stashCount = true, 1
+			m.err = recoveryError{fmt.Errorf("pull failed. %s", stashRecoveryHint("abc1234"))}
+		})},
+		{"files with a recovery banner", mk(stepFiles, func(m *Model) {
+			m.stashCount = 1
+			m.err = recoveryError{fmt.Errorf("switch failed. %s", stashRecoveryHint("abc1234"))}
+		})},
 		{"init", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickOption })},
 		{"init template", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickTemplate })},
 		{"init visibility", mk(stepInit, func(m *Model) { m.initPhase = initPhasePickVisibility })},
@@ -3751,6 +3789,11 @@ func helpScreens(t *testing.T) []struct {
 		{"stash delete", mk(stepStash, func(m *Model) {
 			*m = stashModel(t, 1)
 			m.stashConfirmDrop = true
+		})},
+		// Mid-merge the mutating keys are locked and the footer says so.
+		{"stash mid-merge", mk(stepStash, func(m *Model) {
+			*m = stashModel(t, 2)
+			m.mergeInProgress = true
 		})},
 		// The history browser's four states. Its reads are async, so "still
 		// loading" is a screen the user sees and has to be able to leave.
@@ -3792,6 +3835,17 @@ func helpScreens(t *testing.T) []struct {
 		{"conflicts marker warning", mk(stepConflicts, func(m *Model) {
 			c := conflictScreenModel(t, false)
 			c.conflictMarkWarn, c.conflictMarkPath = true, "shared.txt"
+			*m = c
+		})},
+		{"conflicts abort confirmation", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.conflictConfirmAbort = true
+			*m = c
+		})},
+		{"conflicts abort confirmation with a parked stash", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, true)
+			c.conflictConfirmAbort = true
+			c.conflictStashed, c.conflictStashRef = true, "abc1234"
 			*m = c
 		})},
 		{"conflicts editor", mk(stepConflicts, func(m *Model) {
@@ -4058,5 +4112,622 @@ func TestDashboardSnapshotCarriesDetachedState(t *testing.T) {
 	m.applyDashboard(snap)
 	if !m.detached {
 		t.Error("applyDashboard did not carry the flag onto the model")
+	}
+}
+
+// ── Undoing a pushed commit and NOT re-committing ──────
+//
+// The delete-a-pushed-commit case (a leaked secret is the canonical one). It
+// leaves the branch 0 ahead / N behind, which every gate here used to read as
+// "you are merely behind": the menu said "force required", the push screen said
+// "origin already has everything", `f` was inert, and the only live path — the
+// offered pull — fast-forwarded the undone commit straight back.
+
+// runAll executes a dispatched command (batches included) and feeds every
+// message it produced back through Update, the way the Bubble Tea loop does.
+func runAll(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	for _, msg := range drain(t, cmd) {
+		if _, tick := msg.(spinner.TickMsg); tick {
+			continue
+		}
+		next, _ := m.Update(msg)
+		m = next.(Model)
+	}
+	return m
+}
+
+// undidAPushedCommit builds a repo whose origin holds a commit the local branch
+// has just undone, through the app's own undo prompt. Returns the model and
+// origin's path.
+func undidAPushedCommit(t *testing.T) (Model, string) {
+	t.Helper()
+	origin := tempRepoWithOrigin(t, "chore: seed")
+	writeFile(t, "secret.txt", "AKIA-oops\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "feat: leak a secret")
+	gitRun(t, "push", "-q", "origin", "main")
+
+	m := wizardModel(t, stepFiles, file("secret.txt"))
+	m.hasRemote = true
+	m.hasAnyCommit = true
+	m, _ = key(t, m, "u")
+	if !m.undoPushed {
+		t.Fatal("the prompt did not notice the commit is on origin")
+	}
+	m2, cmd := key(t, m, "u") // "undo anyway"
+	if cmd == nil {
+		t.Fatal("u did not start the undo")
+	}
+	out := runAll(t, m2, cmd)
+	if out.err != nil {
+		t.Fatalf("the undo failed: %v", out.err)
+	}
+	if !out.historyRewritten {
+		t.Fatal("undoing a pushed commit was not recorded as a rewrite")
+	}
+	return out, origin
+}
+
+func originTip(t *testing.T, origin, branch string) string {
+	t.Helper()
+	out, err := exec.Command("git", "--git-dir="+origin, "rev-parse", branch).Output()
+	if err != nil {
+		t.Fatalf("origin rev-parse %s: %v", branch, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestUndoOfAPushedCommitOffersTheForceThatRemovesIt(t *testing.T) {
+	m, origin := undidAPushedCommit(t)
+	removed := originTip(t, origin, "main")
+
+	m.enterPush(true)
+	if m.pushAhead != 0 || m.pushBehind == 0 {
+		t.Fatalf("ahead = %d, behind = %d, want the pure-deletion shape", m.pushAhead, m.pushBehind)
+	}
+	if !m.forcePushRequired() || !m.pushForce {
+		t.Fatal("no force offered for a pushed commit that was undone and not replaced")
+	}
+
+	out := m.viewPush()
+	for _, want := range []string{"Force push required", "DELETES it from origin", "will be removed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the screen never says %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "already has everything") {
+		t.Errorf("the screen still claims origin is up to date:\n%s", out)
+	}
+	if footer := renderHelpRows(m.helpRows()); !strings.Contains(footer, "force-push") {
+		t.Errorf("footer = %q, want f offered", footer)
+	}
+
+	// And `f` actually removes it, under the lease that names the commit the
+	// user was shown.
+	pushed, cmd := key(t, m, "f")
+	if cmd == nil {
+		t.Fatal("f is still inert on the screen whose hint says to press it")
+	}
+	after := runAll(t, pushed, cmd)
+	if after.err != nil {
+		t.Fatalf("the force push failed: %v", after.err)
+	}
+	local := strings.TrimSpace(string(gitOut(t, "rev-parse", "HEAD")))
+	if got := originTip(t, origin, "main"); got != local {
+		t.Errorf("origin/main = %s, want the local tip %s", got, local)
+	}
+	if originTip(t, origin, "main") == removed {
+		t.Error("the undone commit is still origin's tip")
+	}
+	if after.historyRewritten || after.rewriteBaseSHA != "" {
+		t.Error("the rewrite pin survived the push that published it")
+	}
+}
+
+// The sync dialog is the other half: pulling here restores exactly what the
+// user removed, and with ahead == 0 there is no divergence for the existing
+// warning to fire on.
+func TestTheSyncDialogWillNotOfferAPullThatRestoresAnUndoneCommit(t *testing.T) {
+	m, _ := undidAPushedCommit(t)
+	m.step = stepMenu
+	m.hasRemote = true
+
+	if !m.populateSyncDialog() {
+		t.Fatal("the dialog had nothing to say about a branch that is behind")
+	}
+	if m.syncPullCurrent {
+		t.Fatal("the pull that resurrects the undone commit is still on offer")
+	}
+	if !m.syncRewriteHold {
+		t.Fatal("the hold was not recorded")
+	}
+
+	m.step = stepSync
+	out := m.viewSync()
+	for _, want := range []string{
+		"still has the commit you rewrote",
+		"pulling would bring back",
+		"force-with-lease",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the dialog never says %q:\n%s", want, out)
+		}
+	}
+	footer := renderHelpRows(m.helpRows())
+	if strings.Contains(footer, "pull") {
+		t.Errorf("footer = %q, want no pull key", footer)
+	}
+	if !strings.Contains(footer, "quit") {
+		t.Errorf("footer = %q, want q listed — it exits the app from here", footer)
+	}
+	// p is dead on the dialog too, not merely unlisted.
+	if after, cmd := key(t, m, "p"); cmd != nil || after.pulling {
+		t.Error("p pulled anyway")
+	}
+	// The dashboard's own p opens this dialog rather than doing nothing.
+	menu := m
+	menu.step = stepMenu
+	menu.behindOrigin = 1
+	opened, _ := key(t, menu, "p")
+	if opened.step != stepSync {
+		t.Errorf("p on the dashboard went to %v, want the dialog that explains the hold", opened.step)
+	}
+}
+
+// ── The rewrite pin ────────────────────────────────────
+
+// A second rewrite while one is still pending must keep the ORIGINAL base: the
+// pin names what ORIGIN holds, and origin did not move because we amended
+// again. Overwriting it made the force gate compare two commits that were never
+// meant to match, and refuse with "someone pushed on top of the commit you
+// rewrote" on a branch nobody else had touched.
+func TestASecondRewriteKeepsTheOriginalBase(t *testing.T) {
+	m := wizardModel(t, stepConfirm, file("a.txt"))
+	m.branch = "main"
+
+	m.rewritePendingSHA = "aaaaaaa" // origin's tip, before the undo
+	m.rememberRewrite(m.rewritePendingSHA)
+
+	m.rewritePendingSHA = "bbbbbbb" // the commit BELOW it, amended next
+	m.rememberRewrite(m.rewritePendingSHA)
+
+	if m.rewriteBaseSHA != "aaaaaaa" {
+		t.Fatalf("rewriteBaseSHA = %q, want the commit origin is holding", m.rewriteBaseSHA)
+	}
+	if !m.historyRewritten {
+		t.Error("the rewrite stopped being recorded")
+	}
+	// And the force gate still recognises origin's tip.
+	m.pushLeaseSHA = "aaaaaaa"
+	m.pushAhead, m.pushBehind = 1, 2
+	if !m.forcePushRequired() {
+		t.Error("the force was withheld from a branch only this session rewrote")
+	}
+}
+
+// The same rule through the handlers that promote it: undo, then an amend of
+// the commit underneath (which IS reported as pushed, because it is an ancestor
+// of origin's tip).
+func TestTheAmendAfterAnUndoDoesNotMoveThePin(t *testing.T) {
+	m := wizardModel(t, stepFiles, file("a.txt"))
+	m.branch = "main"
+	m.undoPushed = true
+	m.undoing = true
+	m.rewritePendingSHA = "origin-tip"
+	next, _ := m.Update(undoResultMsg{})
+	m = next.(Model)
+
+	m.amendMode, m.amendPushed, m.committing = true, true, true
+	m.rewritePendingSHA = "the-commit-below"
+	next, _ = m.Update(commitResultMsg{hash: "cccdddd"})
+	m = next.(Model)
+
+	if m.rewriteBaseSHA != "origin-tip" {
+		t.Errorf("rewriteBaseSHA = %q, want origin-tip", m.rewriteBaseSHA)
+	}
+}
+
+// The pin belongs to a branch. It used to be cleared on every switch and never
+// re-derived, so a round trip disarmed the force machinery on a branch that was
+// still diverged — and no later amend could re-arm it, because the rewritten
+// commit is on no remote any more.
+func TestTheRewritePinSurvivesABranchRoundTrip(t *testing.T) {
+	m := wizardModel(t, stepBranch)
+	m.branch = "feat"
+	m.rememberRewrite("origin-tip-of-feat")
+
+	next, _ := m.Update(branchSwitchResultMsg{newBranch: "main"})
+	m = next.(Model)
+	if m.historyRewritten || m.rewriteBaseSHA != "" {
+		t.Fatalf("the rewrite followed us onto main (rewritten=%v base=%q)",
+			m.historyRewritten, m.rewriteBaseSHA)
+	}
+
+	next, _ = m.Update(branchSwitchResultMsg{newBranch: "feat"})
+	m = next.(Model)
+	if !m.historyRewritten || m.rewriteBaseSHA != "origin-tip-of-feat" {
+		t.Fatalf("coming back left rewritten=%v base=%q", m.historyRewritten, m.rewriteBaseSHA)
+	}
+
+	// A dashboard snapshot is the other way the current branch changes.
+	m.applyDashboard(dashboardSnapshot{branch: "main"})
+	if m.historyRewritten {
+		t.Error("a snapshot for another branch kept the flag set")
+	}
+	m.applyDashboard(dashboardSnapshot{branch: "feat"})
+	if !m.historyRewritten || m.rewriteBaseSHA != "origin-tip-of-feat" {
+		t.Error("the snapshot for the rewritten branch did not re-derive the pin")
+	}
+}
+
+// A pull ENDS the rewrite: the pre-rewrite commit is back in the branch, so the
+// pin must not survive to arm a force against it.
+func TestAPullDropsTheRewritePin(t *testing.T) {
+	m := wizardModel(t, stepSync)
+	m.branch = "main"
+	m.rememberRewrite("origin-tip")
+	m.pulling = true
+
+	next, _ := m.Update(pullResultMsg{kind: pullKindCurrent})
+	m = next.(Model)
+	if m.historyRewritten || m.rewriteBaseSHA != "" {
+		t.Errorf("rewritten = %v, base = %q after a pull", m.historyRewritten, m.rewriteBaseSHA)
+	}
+	m.applyDashboard(dashboardSnapshot{branch: "main"})
+	if m.historyRewritten {
+		t.Error("the next dashboard snapshot re-derived a rewrite the pull undid")
+	}
+}
+
+// gitRunIn / writeFileIn are gitRun and writeFile against another working
+// directory — the "someone else pushed" half of a remote test needs a second
+// clone, and the app's own helpers are all cwd-relative.
+func gitRunIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+func writeFileIn(t *testing.T, dir, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(dir+"/"+path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ── S from wherever the banner lands ───────────────────
+//
+// Every recovery banner this app raises ends in "press S to open the stash
+// manager", and those banners land wherever the failed operation finished — the
+// push step and the file selector included, where S was handled by nobody. The
+// key is global for exactly the frames the banner is up.
+func TestSOpensTheStashManagerFromAnyRecoveryBanner(t *testing.T) {
+	for _, s := range []step{stepPush, stepFiles, stepMenu, stepBranch, stepDone} {
+		t.Run(fmt.Sprint(s), func(t *testing.T) {
+			stashRepo(t, 1)
+			m := wizardModel(t, s, file("a.txt"))
+			m.stashCount = 1
+			m.err = recoveryError{fmt.Errorf(
+				"pulled, but restoring your uncommitted changes conflicted — the working tree was reset clean and nothing was lost. %s",
+				stashRecoveryHint("abc1234"))}
+
+			if footer := renderHelpRows(m.helpRows()); !strings.Contains(footer, "S") {
+				t.Errorf("footer = %q, want S listed while the banner says to press it", footer)
+			}
+			after, _ := key(t, m, "S")
+			if after.step != stepStash {
+				t.Fatalf("S went to %v, want the stash manager the banner names", after.step)
+			}
+			if after.err != nil {
+				t.Errorf("the banner followed the user onto the screen it pointed at: %v", after.err)
+			}
+			if len(after.stashEntries) != 1 {
+				t.Errorf("%d entries loaded", len(after.stashEntries))
+			}
+		})
+	}
+}
+
+// It is the banner that makes S global, not the screen: with no recovery error
+// up, S stays what it always was (a dashboard/branch key) and is not advertised
+// anywhere else.
+func TestSIsNotAGlobalKeyWithoutTheBanner(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepPush)
+	m.stashCount = 1
+
+	if footer := renderHelpRows(m.helpRows()); strings.Contains(footer, "stash") {
+		t.Errorf("footer = %q offers the stash manager on an ordinary push screen", footer)
+	}
+	after, _ := key(t, m, "S")
+	if after.step != stepPush {
+		t.Errorf("S left the push screen with no banner up (%v)", after.step)
+	}
+}
+
+// A banner with an empty stack must not advertise a key that would open an
+// empty list — same gate as everywhere else S appears.
+func TestSIsNotOfferedWithNothingStashed(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepPush)
+	m.err = recoveryError{fmt.Errorf("something failed. %s", stashRecoveryHint("abc1234"))}
+	m.stashCount = 0
+
+	if footer := renderHelpRows(m.helpRows()); strings.Contains(footer, "stash") {
+		t.Errorf("footer = %q, want no S with an empty stack", footer)
+	}
+	if after, _ := key(t, m, "S"); after.step != stepPush {
+		t.Error("S opened an empty stash manager")
+	}
+}
+
+// ── The dashboard's scroll window ──────────────────────
+
+// v1.3 grew the menu to nine entries and it was the only list in the app with
+// no window: styledBox cut the overflow, `down` walked the cursor onto rows
+// nobody could see, and enter opened them blind. The error banner sat below the
+// list, so it was the first thing to go — on the exact screen where it was the
+// only feedback.
+func fullMenuModel(t *testing.T, height int) Model {
+	t.Helper()
+	m := wizardModel(t, stepMenu, file("a.txt"))
+	m.width = 100
+	m.height = height
+	m.hasRemote = true
+	m.hasAnyCommit = true
+	m.hasUpstream = true
+	m.aheadOrigin = 2
+	m.stashCount = 3
+	m.historyTotal = 12
+	m.mergeInProgress = true // the "Resolve conflicts" entry, first in the list
+	m.branchCount = 4
+	return m
+}
+
+func TestMenuWindowsItsListOnAShortTerminal(t *testing.T) {
+	for _, h := range []int{10, 12, 14, 18, 24} {
+		m := fullMenuModel(t, h)
+		items := m.menuItems()
+		if len(items) < 8 {
+			t.Fatalf("fixture: %d entries, want the full list", len(items))
+		}
+		for cursor := range items {
+			m.menuCursor = cursor
+			m.followMenuCursor(len(items))
+			view := m.viewMenu()
+			if !strings.Contains(view, items[cursor].name) {
+				t.Errorf("height %d: the cursor is on %q and its row is not drawn:\n%s",
+					h, items[cursor].name, view)
+			}
+			if !strings.Contains(view, symCursor) {
+				t.Errorf("height %d: no cursor is visible at all:\n%s", h, view)
+			}
+			if lines := strings.Split(view, "\n"); len(lines) > h {
+				t.Errorf("height %d: the box is %d rows tall", h, len(lines))
+			}
+		}
+	}
+}
+
+func TestMenuSaysHowManyEntriesAreOffScreen(t *testing.T) {
+	m := fullMenuModel(t, 12)
+	items := m.menuItems()
+	m.menuCursor = len(items) - 1
+	m.followMenuCursor(len(items))
+
+	view := m.viewMenu()
+	if !strings.Contains(view, "more") {
+		t.Errorf("a clipped menu does not say how much is above it:\n%s", view)
+	}
+	if !strings.Contains(view, symArrowUp) {
+		t.Errorf("no scroll-up marker on a windowed list:\n%s", view)
+	}
+
+	m.menuCursor = 0
+	m.followMenuCursor(len(items))
+	if view := m.viewMenu(); !strings.Contains(view, symArrowDown) {
+		t.Errorf("no scroll-down marker with entries below:\n%s", view)
+	}
+}
+
+// Feedback is reserved before the list is sized: an error on a short terminal
+// used to be the first thing dropped.
+func TestMenuKeepsItsErrorBannerOnAShortTerminal(t *testing.T) {
+	for _, h := range []int{10, 12, 14} {
+		m := fullMenuModel(t, h)
+		m.err = fmt.Errorf("nothing to commit — working tree clean")
+		if view := m.viewMenu(); !strings.Contains(view, "nothing to commit") {
+			t.Errorf("height %d: the error banner was clipped away:\n%s", h, view)
+		}
+	}
+}
+
+// A tall terminal is unchanged: the whole list, no markers, and the graph still
+// gets what is left.
+func TestMenuDoesNotWindowWhenEverythingFits(t *testing.T) {
+	m := fullMenuModel(t, 40)
+	view := m.viewMenu()
+	for _, item := range m.menuItems() {
+		if !strings.Contains(view, item.name) {
+			t.Errorf("%q is missing from a 40-row terminal:\n%s", item.name, view)
+		}
+	}
+	if strings.Contains(view, "more") {
+		t.Errorf("a list that fits was windowed anyway:\n%s", view)
+	}
+}
+
+// ── Branch delete moved to x ───────────────────────────
+//
+// v1.3's two new list screens teach enter/d = LOOK (stash preview, commit
+// details). The branch manager renders an identical cursor list, and `d` there
+// opened a delete confirmation — one habitual `y` from destroying a branch.
+// `x` is what destroys things everywhere else in this app.
+func TestBranchDeleteIsOnXAndDIsInert(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepBranch)
+	m.branchEntries = []types.BranchEntry{
+		{Name: "main", IsCurrent: true},
+		{Name: "feature"},
+	}
+	m.branchCursor = 1
+
+	after, cmd := key(t, m, "d")
+	if cmd != nil || after.branchDeleteMode {
+		t.Error("d still opens the delete confirmation")
+	}
+	if after.err != nil {
+		t.Errorf("d raised an error banner instead of doing nothing: %v", after.err)
+	}
+
+	deleting, _ := key(t, m, "x")
+	if !deleting.branchDeleteMode {
+		t.Fatal("x did not open the delete confirmation")
+	}
+	// Still confirmed, and still y.
+	confirmed, cmd := key(t, deleting, "y")
+	if cmd == nil || !confirmed.branchDeleting {
+		t.Error("y did not go through with the delete")
+	}
+
+	footer := renderHelpRows(m.helpRows())
+	if !strings.Contains(footer, "x") || !strings.Contains(footer, "delete") {
+		t.Errorf("footer = %q, want x labelled delete", footer)
+	}
+	if strings.Contains(footer, "d delete") {
+		t.Errorf("footer = %q still advertises d", footer)
+	}
+	if !strings.Contains(footer, "quit") {
+		t.Errorf("footer = %q, want q listed — it exits the app from here", footer)
+	}
+}
+
+// The protections that lived on d have to live on x now.
+func TestBranchDeleteRefusalsFollowedTheKey(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	cases := []struct {
+		name  string
+		entry types.BranchEntry
+		want  string
+	}{
+		{"current", types.BranchEntry{Name: "feature", IsCurrent: true}, "current branch"},
+		{"remote", types.BranchEntry{Name: "feature", IsRemote: true}, "remote branch"},
+		{"main", types.BranchEntry{Name: "main"}, "protected"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := wizardModel(t, stepBranch)
+			m.branchEntries = []types.BranchEntry{tc.entry}
+			after, _ := key(t, m, "x")
+			if after.branchDeleteMode {
+				t.Fatal("the confirmation opened on a branch that cannot be deleted")
+			}
+			if after.err == nil || !strings.Contains(after.err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to mention %q", after.err, tc.want)
+			}
+		})
+	}
+}
+
+// ── Files that still hold conflict markers ─────────────
+//
+// A stash pop that conflicts leaves unmerged entries with NO merge in progress,
+// so nothing gated on MERGE_HEAD can see them — and the wizard stages with
+// reset → add → commit, which removes git's own "you have unmerged files"
+// refusal. Without this the markers went into a commit under an innocent
+// subject.
+func conflictedFilesModel(t *testing.T) Model {
+	t.Helper()
+	m := wizardModel(t, stepFiles,
+		entry("clean.txt", types.StatusModified),
+		entry("marked.txt", types.StatusConflicted),
+	)
+	return m
+}
+
+func TestConflictedFilesAreMarkedInTheSelector(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := conflictedFilesModel(t)
+	out := m.viewFiles()
+	if !strings.Contains(out, conflictedMark) {
+		t.Errorf("the conflicted entry is not marked:\n%s", out)
+	}
+	if !strings.Contains(out, "marked.txt") {
+		t.Errorf("the conflicted file is not listed:\n%s", out)
+	}
+}
+
+func TestSelectAllSkipsConflictedFiles(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := conflictedFilesModel(t)
+	m, _ = key(t, m, "a")
+
+	if !m.files[0].Selected {
+		t.Error("select-all skipped an ordinary file")
+	}
+	if m.files[1].Selected {
+		t.Error("select-all swept a file full of conflict markers into the commit")
+	}
+	// A second press still toggles the rest off, and still leaves it alone.
+	m, _ = key(t, m, "a")
+	if m.files[0].Selected || m.files[1].Selected {
+		t.Error("the second press did not deselect")
+	}
+}
+
+func TestCommittingAConflictedFileNeedsAConfirmation(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := conflictedFilesModel(t)
+	m.cursor = 1
+	m, _ = key(t, m, " ") // deliberately select the conflicted one
+	if !m.files[1].Selected {
+		t.Fatal("space did not select the conflicted file")
+	}
+
+	gated, _ := key(t, m, "enter")
+	if gated.step != stepFiles {
+		t.Fatalf("enter walked past the gate to %v", gated.step)
+	}
+	if !gated.confirmConflictedCommit {
+		t.Fatal("no confirmation was raised")
+	}
+	out := gated.viewFiles()
+	for _, want := range []string{"conflict markers", "marked.txt", "Resolve before"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the gate never says %q:\n%s", want, out)
+		}
+	}
+	if footer := renderHelpRows(gated.helpRows()); !strings.Contains(footer, "commit anyway") {
+		t.Errorf("footer = %q", footer)
+	}
+
+	// Any other key goes back to the list, with the selection intact.
+	cancelled, _ := key(t, gated, "j")
+	if cancelled.step != stepFiles || cancelled.confirmConflictedCommit {
+		t.Error("a stray key did not cancel the gate")
+	}
+
+	// y is the deliberate way through.
+	through, _ := key(t, gated, "y")
+	if through.step != stepType {
+		t.Errorf("y landed on %v, want the wizard to continue", through.step)
+	}
+}
+
+func TestACleanSelectionSkipsTheConflictGate(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := conflictedFilesModel(t)
+	m.cursor = 0
+	m, _ = key(t, m, " ")
+	after, _ := key(t, m, "enter")
+	if after.confirmConflictedCommit {
+		t.Error("the gate fired on a selection with no conflicted files")
+	}
+	if after.step != stepType {
+		t.Errorf("step = %v, want the ordinary wizard flow", after.step)
 	}
 }

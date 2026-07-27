@@ -509,7 +509,14 @@ func runInitFlow(choice initChoice, tpl git.GitignoreTemplate, url, repoName str
 		// and say so now, while the user can still pick a different remote.
 		// The remote stays configured either way; they may know better.
 		warning := ""
-		if fetchErr := git.Fetch(); fetchErr == nil {
+		fetchErr := git.Fetch()
+		if fetchErr != nil {
+			// The unrelated-histories check below needs the remote's refs. If
+			// the fetch failed we cannot run it — say so instead of silently
+			// skipping the one moment this warning is useful.
+			warning = "could not reach the remote to check it — if it already has commits, pushes and pulls from here will be refused. Verify the URL and your connection."
+		}
+		if fetchErr == nil {
 			// Wording note: no "rejected" / "non-fast-forward" in this text.
 			// formatError pattern-matches those and appends "Remote has newer
 			// changes. Run git pull first." — the exact doomed advice this

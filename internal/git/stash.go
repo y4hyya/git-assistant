@@ -68,6 +68,44 @@ func (e *StashConflictError) Is(target error) bool { return target == ErrStashCo
 // Nothing was applied and nothing was modified.
 var ErrStashDirtyTree = errors.New("uncommitted changes would be overwritten")
 
+// ErrStashDuringMerge marks an apply/pop git refused because the INDEX already
+// held unmerged entries when it was asked ("could not write index / <path>:
+// needs merge"). Nothing was applied; the blocker is the unresolved merge, not
+// the stash.
+//
+// It is its own failure because the honest sentence differs at every clause
+// from a stash conflict's. The stash manager is two keypresses from the
+// conflict resolver — esc leaves the merge open by design, and the resolver has
+// just told the user their uncommitted work is parked in a stash — so this is a
+// path a beginner walks, not a corner case.
+var ErrStashDuringMerge = errors.New("cannot restore a stash while files are unmerged")
+
+// StashDuringMergeError is ErrStashDuringMerge with the paths that were already
+// unmerged, plus the one fact that decides the advice: whether git is sitting in
+// a merge (MERGE_HEAD) or the unmerged entries were left behind by something
+// else — an earlier conflicted stash pop leaves exactly that, markers and all,
+// with no merge in progress.
+type StashDuringMergeError struct {
+	Files []string
+	Merge bool
+}
+
+func (e *StashDuringMergeError) Error() string {
+	msg := ErrStashDuringMerge.Error()
+	if e.Merge {
+		msg = "cannot restore a stash while a merge is in progress — finish or abort the merge first"
+	} else {
+		msg += " — resolve them first"
+	}
+	if len(e.Files) > 0 {
+		msg += " (unmerged: " + strings.Join(e.Files, ", ") + ")"
+	}
+	return msg
+}
+
+// Is makes errors.Is(err, ErrStashDuringMerge) work on the typed form.
+func (e *StashDuringMergeError) Is(target error) bool { return target == ErrStashDuringMerge }
+
 // ErrNoSuchStash marks a SHA that is no longer in the stack — normally because
 // another operation dropped or popped it since the list was read.
 var ErrNoSuchStash = errors.New("stash entry is gone")
@@ -271,11 +309,26 @@ func runStashRestore(verb, ref string) error {
 	if !isStashRef(ref) {
 		return fmt.Errorf("not a stash ref: %q", ref)
 	}
+	// Snapshot the unmerged set BEFORE running the verb. The classification
+	// below reads the index, and an unresolved merge has already filled it: read
+	// after the fact, the MERGE's files came back as the stash's own casualties.
+	unmergedBefore := GetConflictFiles()
+
 	out, err := exec.Command("git", "stash", verb, ref).CombinedOutput()
 	if err == nil {
 		return nil
 	}
 	msg := strings.TrimSpace(string(out))
+
+	// Already unmerged going in: git refuses ("could not write index / <path>:
+	// needs merge") before touching the tree or the stash. Calling that a stash
+	// conflict was wrong in every clause — the apply never ran, the markers in
+	// those files belong to the merge, and the recovery it advises
+	// (`git reset HEAD` then `git checkout -- .`) would destroy a half-resolved
+	// merge. The blocker is the merge, so the error names the merge.
+	if len(unmergedBefore) > 0 {
+		return &StashDuringMergeError{Files: unmergedBefore, Merge: MergeInProgress()}
+	}
 	// Classify by what the repository looks like now, not by matching English:
 	// an unmerged index is the difference between "your files hold conflict
 	// markers" and "nothing happened at all", and only the first needs the user

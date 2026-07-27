@@ -65,7 +65,7 @@ Push always pushes the **current** branch to `origin/<branch>`. There is no bran
 
 Reachable from the menu, from the file selector (`b`), or directly via `git-assist branch`.
 
-- Switch, create, rename (`r`), and delete branches. `main` / `master` and the current branch are protected from deletion.
+- Switch, create, rename (`r`), and delete (`x`, the same destructive key the file selector and the stash manager use) branches. `main` / `master` and the current branch are protected from deletion.
 - New branch names are validated with `git check-ref-format` and rejected with a readable message, rather than by git's `fatal: … is not a valid pathspec`.
 - Deleting a branch with unmerged commits opens a second confirmation and then force-deletes (`-D`) — no trip to a terminal to repeat the command.
 - Renaming discloses that `git branch -m` is local only: if the branch has an upstream, both the prompt and the result say origin still has the old name.
@@ -83,9 +83,9 @@ A conflicting merge, pull or sync used to be aborted on the spot with "resolve i
 - `o` keeps **your** version, `t` takes the incoming branch's. On a file the other side deleted, the key that "keeps that side" **deletes the file**, and both the footer and the line above it say so rather than pretending it is a content choice.
 - `e` opens the conflicted file in the built-in editor with the markers visible, above a legend: `<<<<<<< yours … ======= … >>>>>>> theirs — delete the markers, keep what you want, save`. Saving does **not** mark it resolved (half-finished saves are normal); `m` does, and warns once if the markers are still in there.
 - Resolved files get a ✓, move to their own section, and the header counts down (`2 of 3 resolved`).
-- `c` finishes the merge (`git commit --no-edit`, so no editor is ever launched on top of the TUI); `a` aborts the whole thing and says "nothing changed".
-- Uncommitted work auto-stashed before the merge stays parked until the merge is committed or aborted — git refuses to restore a stash into an unmerged index — and the screen says so instead of leaving you to wonder where your edits went.
-- Quit halfway and the merge is still there: the next launch opens straight on the resolver with an "unfinished merge from earlier" banner. A `git merge` you started in a terminal is picked up the same way, with the branch names read from git's own merge message.
+- `c` finishes the merge (`git commit --no-edit`, so no editor is ever launched on top of the TUI); `a` aborts the whole thing — after a `y/N` that says how many resolutions go back to conflicted, since `a` means select-all one screen over.
+- Uncommitted work auto-stashed before the merge stays parked until the merge is committed or aborted — git refuses to restore a stash into an unmerged index — and the screen says so instead of leaving you to wonder where your edits went. The parked entry is addressed by its SHA, and the stash manager's apply / pop / delete are locked while the merge is open, so nothing can move it out from under the resolver.
+- Quit halfway and the merge is still there: the next launch opens straight on the resolver with an "unfinished merge from earlier" banner, and it picks the parked stash back up — the association is recorded in `.git`, next to git's own merge state. A `git merge` you started in a terminal is picked up the same way, with the branch names read from git's own merge message.
 - While a merge is open the dashboard carries a permanent `⚠ Resolve conflicts` entry, and commit / amend / push / branch switching answer "finish or abort the merge first".
 
 ### Stash manager
@@ -117,7 +117,7 @@ Appears on the menu as `History  N commits` once the repo has any. Answers the t
 - `s` to merge `origin/main` into the current branch (`--no-ff` for an explicit integration commit).
 - "Behind main" is measured against `origin/<main>` when it exists, so a stale local `main` can no longer wedge the badge or the shortcut.
 - Background fetch on startup and on return-to-menu, debounced to 30 seconds. A failed fetch does not reset the debounce, and the header says so quietly: `(offline — sync info may be stale)`.
-- Network operations (fetch, pushes, remote merges, `gh repo create`) time out after 60 seconds and cancel on force-quit; local operations are untouched.
+- Network operations (fetch, pushes, `gh repo create`) time out after 60 seconds and cancel on force-quit; local operations — including merges of already-fetched refs — are untouched.
 - A pull or sync that conflicts opens the conflict resolver, named after the operation you asked for; neither offer appears while a merge is still open, since both would start a second one.
 
 ### First-run init flow
@@ -215,6 +215,7 @@ Every list below is what the app's own `?` overlay shows, because both come from
 | `?` | Show this screen's keys (any screen without a focused text field) |
 | `ctrl+c` | Force quit (warns first if an operation is running) |
 | `esc` | Back / cancel (context-dependent) |
+| `S` | Open the stash manager — from **any** screen showing a stash-recovery banner (the banner ends in "press S", and it lands wherever the failed operation finished) |
 
 ### Menu
 | Key | Action |
@@ -293,7 +294,7 @@ Confirmations on this screen (discard, undo) answer `y` to confirm and any other
 | `enter` | Switch to selected branch |
 | `c` | Create branch |
 | `r` | Rename branch (local branches only) |
-| `d` | Delete branch (unmerged branches get a second, force-delete confirmation) |
+| `x` | Delete branch — asks first; unmerged branches get a second, force-delete confirmation |
 | `m` | Merge (opens target picker) |
 | `S` | Open the stash manager (visible when something is stashed) |
 | `esc` | Back to menu (`q` quits when launched as `git-assist branch`) |
@@ -325,7 +326,7 @@ Confirmations on this screen (discard, undo) answer `y` to confirm and any other
 | `e` | Edit the file with the conflict markers visible (`ctrl+s` saves) |
 | `m` | Mark the file resolved (asks first if markers are still present) |
 | `c` | Finish the merge — offered once every file is decided |
-| `a` | Abort: undo the whole merge, restore any auto-stash |
+| `a` | Abort: undo the whole merge, restore any auto-stash — asks first (`y`), stating how many resolutions it discards |
 | `esc` | Back to the menu (the merge stays open, and the menu says so) |
 
 ### Config editor

@@ -22,7 +22,51 @@ import (
 // helpRows returns the current screen's keys, grouped into the rows its footer
 // draws. Empty means "this screen has no footer" (the in-flight frames), and
 // that is also what suppresses the overlay there.
+//
+// One key is not a screen's own: `S` answers from ANY screen showing a
+// stash-recovery banner, because that banner ends in "press S to open the stash
+// manager" and lands wherever the failed operation finished. It is spliced in
+// here rather than added to a dozen per-screen lists, so the footer, the
+// overlay and the handler in Update can never disagree about when it is live.
 func (m Model) helpRows() [][]helpEntry {
+	rows := m.screenHelpRows()
+	if len(rows) == 0 || !m.stashRecoveryOffered() {
+		return rows
+	}
+	return withStashRecoveryKey(rows)
+}
+
+// stashRecoveryOffered reports whether `S` opens the stash manager right now.
+// The banner is the trigger, the stack is the gate (same stashAvailable every
+// other mention of S uses), and a focused text field or an operation in flight
+// takes it back out — `S` is a character in the first and a jump away from a
+// running git command in the second.
+func (m Model) stashRecoveryOffered() bool {
+	return isRecoveryError(m.err) && m.stashAvailable() &&
+		!m.typingActive() && !m.opInFlight()
+}
+
+// withStashRecoveryKey appends S to the last footer row, unless the screen
+// already lists it (the dashboard and the branch manager do, whenever there is
+// a stack to open).
+func withStashRecoveryKey(rows [][]helpEntry) [][]helpEntry {
+	for _, row := range rows {
+		for _, e := range row {
+			if e.key == "S" {
+				return rows
+			}
+		}
+	}
+	out := make([][]helpEntry, len(rows))
+	copy(out, rows)
+	last := len(out) - 1
+	row := make([]helpEntry, len(out[last]), len(out[last])+1)
+	copy(row, out[last])
+	out[last] = append(row, helpEntry{"S", "stash"})
+	return out
+}
+
+func (m Model) screenHelpRows() [][]helpEntry {
 	switch m.step {
 	case stepMenu:
 		return m.menuHelp()
@@ -183,6 +227,9 @@ func (m Model) filesHelp() [][]helpEntry {
 		}
 		return oneRow(helpEntry{"y", "confirm"}, helpEntry{"any", "cancel"})
 
+	case m.confirmConflictedCommit:
+		return oneRow(helpEntry{"y", "commit anyway"}, helpEntry{"any", "go back"})
+
 	case m.confirmDiscard:
 		return oneRow(helpEntry{"y", "confirm"}, helpEntry{"any", "cancel"})
 
@@ -249,9 +296,13 @@ func (m Model) branchHelp() [][]helpEntry {
 
 	// The list. Two rows since rename joined: seven entries do not fit an
 	// 80-column line.
-	exit := helpEntry{"esc", "back"}
+	//
+	// `q` is listed on both variants. The standalone one used to be the only
+	// place it appeared, while `q` quit the whole app from the menu-launched
+	// list too — an app-terminating key that no footer mentioned.
+	exit := []helpEntry{{"esc", "back"}, {"q", "quit"}}
 	if m.branchStandalone {
-		exit = helpEntry{"q", "quit"}
+		exit = []helpEntry{{"q", "quit"}}
 	}
 	first := []helpEntry{
 		{symArrows, "navigate"},
@@ -264,14 +315,17 @@ func (m Model) branchHelp() [][]helpEntry {
 	if m.stashAvailable() {
 		first = append(first, helpEntry{"S", "stash"})
 	}
+	// Delete is `x`, the app's destructive key everywhere else (discard in the
+	// file selector, delete in the stash manager). It sat on `d`, which the two
+	// list screens v1.3 added use to LOOK at the row under the cursor — so the
+	// habit those teach landed a beginner one `y` away from deleting a branch.
 	return [][]helpEntry{
 		first,
-		{
+		append([]helpEntry{
 			{"r", "rename"},
-			{"d", "delete"},
+			{"x", "delete"},
 			{"m", "merge"},
-			exit,
-		},
+		}, exit...),
 	}
 }
 
@@ -294,13 +348,24 @@ func (m Model) stashHelp() [][]helpEntry {
 	// Two rows, grouped by what they do — move and look, then act on the entry
 	// under the cursor. Five keys with their honest labels do not fit one
 	// 80-column line, and a wrapped bar costs the list a whole row.
+	first := []helpEntry{
+		{symArrows, "navigate"},
+		{"enter/d", "preview"},
+		{"esc", "menu"},
+		{"q", "quit"},
+	}
+	// Mid-merge the three mutating keys refuse (see updateStash): the conflict
+	// resolver is holding one of these entries and will pop it itself. Listed as
+	// locked rather than dropped, because the answer to "why did a do nothing"
+	// has to be on the screen that did nothing.
+	if m.mergeInProgress {
+		return [][]helpEntry{
+			first,
+			{{"a/p/x", "locked until the merge is finished"}},
+		}
+	}
 	return [][]helpEntry{
-		{
-			{symArrows, "navigate"},
-			{"enter/d", "preview"},
-			{"esc", "menu"},
-			{"q", "quit"},
-		},
+		first,
 		{
 			{"a", "apply (keep)"},
 			{"p", "pop (apply + delete)"},
@@ -372,6 +437,8 @@ func (m Model) conflictsHelp() [][]helpEntry {
 			return nil // the saving frame draws no footer
 		}
 		return oneRow(helpEntry{"ctrl+s", "save"}, helpEntry{"esc", "back"})
+	case m.conflictConfirmAbort:
+		return oneRow(helpEntry{"y", "undo the merge"}, helpEntry{"any", "cancel"})
 	case m.conflictMarkWarn:
 		return oneRow(helpEntry{"y", "mark resolved anyway"}, helpEntry{"any", "cancel"})
 	}
@@ -540,7 +607,10 @@ func (m Model) syncHelp() [][]helpEntry {
 	if m.syncSyncMain {
 		entries = append(entries, helpEntry{"s", "sync with " + m.syncMainBranchName})
 	}
-	entries = append(entries, helpEntry{"enter", "skip"})
+	// esc and q were both live and unlisted, and one of them exits the app. The
+	// dialog looks modal, so "q dismisses this" is the obvious wrong guess to
+	// make about it.
+	entries = append(entries, helpEntry{"enter/esc", "skip"}, helpEntry{"q", "quit"})
 	return oneRow(entries...)
 }
 
@@ -633,6 +703,8 @@ func (m Model) screenName() string {
 			return "File filter"
 		case m.confirmUndo:
 			return "Undo last commit"
+		case m.confirmConflictedCommit:
+			return "Commit conflicted files"
 		case m.confirmDiscard:
 			return "Discard changes"
 		case m.gitignoreMode:
@@ -679,6 +751,8 @@ func (m Model) screenName() string {
 		switch {
 		case m.editMode:
 			return "Conflict editor"
+		case m.conflictConfirmAbort:
+			return "Undo the merge"
 		case m.conflictMarkWarn:
 			return "Mark resolved"
 		}

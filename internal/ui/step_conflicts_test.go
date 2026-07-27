@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -104,6 +105,21 @@ func press(t *testing.T, m Model, k string) Model {
 		}
 	}
 	return m
+}
+
+// pressAbort takes the two keys `a` costs now: the key itself, then the y of
+// the confirmation it raises. Asserting the prompt appeared is half the point —
+// every call site here would silently pass again if the confirm went away.
+func pressAbort(t *testing.T, m Model) Model {
+	t.Helper()
+	m = press(t, m, "a")
+	if !m.conflictConfirmAbort {
+		t.Fatal("a did not raise the abort confirmation")
+	}
+	if m.conflictAborting {
+		t.Fatal("a started the abort without asking")
+	}
+	return press(t, m, "y")
 }
 
 func conflictPaths(m Model) []string {
@@ -368,7 +384,7 @@ func TestAbortUndoesTheWholeMerge(t *testing.T) {
 	m.conflictCursor = indexOfConflict(t, m, "shared.txt")
 	m = press(t, m, "o") // a decision that must be thrown away with the rest
 
-	m = press(t, m, "a")
+	m = pressAbort(t, m)
 	if m.err != nil {
 		t.Fatalf("abort failed: %v", m.err)
 	}
@@ -378,7 +394,7 @@ func TestAbortUndoesTheWholeMerge(t *testing.T) {
 	if m.step != stepMenu || m.mergeInProgress {
 		t.Errorf("step = %v, mergeInProgress = %v after aborting", m.step, m.mergeInProgress)
 	}
-	if m.statusNote != "Merge aborted — nothing changed" {
+	if m.statusNote != "Merge aborted — the repository is back to before the merge" {
 		t.Errorf("note = %q", m.statusNote)
 	}
 	if got := strings.TrimSpace(string(gitOut(t, "rev-parse", "HEAD"))); got != before {
@@ -459,7 +475,7 @@ func TestAutoStashComesBackAfterAbort(t *testing.T) {
 	}
 	m := wizardModel(t, stepBranch)
 	next, _ := m.Update(msg)
-	got := press(t, next.(Model), "a")
+	got := pressAbort(t, next.(Model))
 
 	if got.err != nil {
 		t.Fatalf("abort failed: %v", got.err)
@@ -870,4 +886,340 @@ func indexOfConflict(t *testing.T, m Model, path string) int {
 func conflictRowFor(t *testing.T, m Model, path string) conflictRow {
 	t.Helper()
 	return m.conflictRows[indexOfConflict(t, m, path)]
+}
+
+// ── The parked stash, when the stack moves underneath ──
+//
+// The resolver deliberately lets the user leave (esc), and a merge can also be
+// resolved across two sessions, so the stash stack is NOT frozen for the
+// duration of a resolution — the app locks its own manager (see
+// TestStashManagerIsReadOnlyMidMerge), but another terminal is still a thing.
+// Both of these were reproduced end to end against real git before the fix:
+// the pop was positional (`git stash pop` = stash@{0}, whatever that is now).
+
+// dirtyMergeResolver runs the fixture merge on a dirty tree and lands on the
+// resolver with the auto-stash parked, the way beginConflicts does.
+func dirtyMergeResolver(t *testing.T) Model {
+	t.Helper()
+	msg := doMergeBranch("feat")().(branchMergeResultMsg)
+	if msg.err == nil || !msg.stashed || msg.stashRef == "" {
+		t.Fatalf("fixture: want a conflicting merge on a stashed tree (err=%v stashed=%v)", msg.err, msg.stashed)
+	}
+	m := wizardModel(t, stepBranch)
+	next, _ := m.Update(msg)
+	got := next.(Model)
+	if got.step != stepConflicts || !got.conflictStashed {
+		t.Fatalf("step = %v, stashed = %v", got.step, got.conflictStashed)
+	}
+	return got
+}
+
+// resolveEverything decides both conflicting files through the screen's keys.
+func resolveEverything(t *testing.T, m Model) Model {
+	t.Helper()
+	m.conflictCursor = indexOfConflict(t, m, "shared.txt")
+	m = press(t, m, "o")
+	m.conflictCursor = indexOfConflict(t, m, "gone.txt")
+	m = press(t, m, "o")
+	if !m.conflictDone() {
+		t.Fatalf("files left unresolved: %v", conflictPaths(m))
+	}
+	return m
+}
+
+// Variant A: the parked entry is gone and an UNRELATED one has taken its place
+// at the top of the stack. The positional pop restored a stranger's work into
+// the merged tree and reported it as "your uncommitted changes were restored".
+func TestFinishNeverPopsAnUnrelatedStash(t *testing.T) {
+	conflictFixture(t)
+	// Someone's older stash, sitting in the stack from last week.
+	writeFile(t, "seed.txt", "an unrelated stashed change\n")
+	gitRun(t, "stash", "push", "-q", "-m", "unrelated")
+
+	writeFile(t, "notes.txt", "in progress\n")
+	m := dirtyMergeResolver(t)
+	parked := m.conflictStashRef
+
+	// The user (or another terminal) deletes the parked entry mid-merge. git
+	// allows this, verified: stash@{0} is now the unrelated one.
+	gitRun(t, "stash", "drop", "stash@{0}")
+	if n := stashDepth(t); n != 1 {
+		t.Fatalf("fixture: %d entries left, want the unrelated one", n)
+	}
+
+	m = resolveEverything(t, m)
+	counted := m.stashCount
+	m = press(t, m, "c")
+
+	if m.err != nil {
+		t.Fatalf("finishing failed: %v", m.err)
+	}
+	if mergeInProgressOnDisk(t) {
+		t.Fatal("the merge was not committed")
+	}
+	if n := stashDepth(t); n != 1 {
+		t.Errorf("%d stash entries left — the unrelated entry was popped into the merge", n)
+	}
+	if got := readFile(t, "seed.txt"); got != "seed\n" {
+		t.Errorf("seed.txt = %q — somebody else's stashed work landed in the merged tree", got)
+	}
+	if _, err := os.Stat("notes.txt"); err == nil {
+		t.Error("notes.txt is back, from an entry that was deleted")
+	}
+	if !strings.Contains(m.statusNote, "already applied or deleted") {
+		t.Errorf("note = %q, want the missing stash disclosed", m.statusNote)
+	}
+	if strings.Contains(m.statusNote, "stashed and restored") {
+		t.Errorf("note = %q claims a restore that did not happen", m.statusNote)
+	}
+	if m.stashCount != counted {
+		t.Errorf("stashCount went %d → %d — a phantom orphan was counted", counted, m.stashCount)
+	}
+	_ = parked
+}
+
+// Variant B, the destructive one: the user resolves everything, walks out to
+// the stash manager (or another terminal) and pops the parked entry themselves.
+// The positional pop then failed with "No stash entries found" and
+// CleanupFailedStashPop's `git checkout -- .` permanently destroyed the
+// tracked-file edit that had JUST been restored — under a banner saying nothing
+// was lost, naming a stash that no longer existed.
+func TestFinishNeverDestroysWorkTheUserAlreadyRestored(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "committed content\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "add notes")
+	writeFile(t, "notes.txt", "IMPORTANT UNCOMMITTED EDIT\n")
+
+	m := resolveEverything(t, dirtyMergeResolver(t))
+
+	// The pop the user performs themselves: it succeeds once the index has no
+	// unmerged entries, and it drops the entry.
+	gitRun(t, "stash", "pop")
+	if got := readFile(t, "notes.txt"); got != "IMPORTANT UNCOMMITTED EDIT\n" {
+		t.Fatalf("fixture: the manual pop did not restore the edit (%q)", got)
+	}
+
+	counted := m.stashCount
+	m = press(t, m, "c")
+
+	if got := readFile(t, "notes.txt"); got != "IMPORTANT UNCOMMITTED EDIT\n" {
+		t.Fatalf("the finish destroyed the restored edit: notes.txt = %q", got)
+	}
+	if m.err != nil {
+		t.Errorf("a stash that was already restored was reported as a failure: %v", m.err)
+	}
+	if isRecoveryError(m.err) {
+		t.Error("the banner points at a stash that no longer exists")
+	}
+	if n := stashDepth(t); n != 0 {
+		t.Errorf("%d stash entries left behind", n)
+	}
+	if m.stashCount != counted {
+		t.Errorf("stashCount went %d → %d — the phantom orphan is back", counted, m.stashCount)
+	}
+	if !strings.Contains(m.statusNote, "already applied or deleted") {
+		t.Errorf("note = %q, want the already-restored stash disclosed", m.statusNote)
+	}
+}
+
+// The same rule on the other exit.
+func TestAbortNeverDestroysWorkTheUserAlreadyRestored(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "committed content\n")
+	gitRun(t, "add", "-A")
+	gitRun(t, "commit", "-q", "-m", "add notes")
+	writeFile(t, "notes.txt", "IMPORTANT UNCOMMITTED EDIT\n")
+
+	m := resolveEverything(t, dirtyMergeResolver(t))
+	gitRun(t, "stash", "pop")
+
+	m = pressAbort(t, m)
+
+	if got := readFile(t, "notes.txt"); got != "IMPORTANT UNCOMMITTED EDIT\n" {
+		t.Fatalf("the abort destroyed the restored edit: notes.txt = %q", got)
+	}
+	if m.err != nil {
+		t.Errorf("err = %v", m.err)
+	}
+	if !strings.Contains(m.statusNote, "already applied or deleted") {
+		t.Errorf("note = %q", m.statusNote)
+	}
+}
+
+// The ordinary path still restores, still says so, and still deletes nothing.
+func TestFinishRestoresTheParkedEntryByItsSHA(t *testing.T) {
+	conflictFixture(t)
+	// A second, older entry to make the parked one NOT stash@{0}-by-luck once
+	// the positional guess is gone.
+	writeFile(t, "seed.txt", "unrelated\n")
+	gitRun(t, "stash", "push", "-q", "-m", "unrelated")
+	writeFile(t, "notes.txt", "in progress\n")
+
+	m := dirtyMergeResolver(t)
+	parked := m.conflictStashRef
+	m = press(t, resolveEverything(t, m), "c")
+
+	if m.err != nil {
+		t.Fatalf("finishing failed: %v", m.err)
+	}
+	if got := readFile(t, "notes.txt"); got != "in progress\n" {
+		t.Errorf("notes.txt = %q, want the parked work back", got)
+	}
+	if n := stashDepth(t); n != 1 {
+		t.Errorf("%d entries left, want the unrelated one untouched", n)
+	}
+	if got := readFile(t, "seed.txt"); got != "seed\n" {
+		t.Errorf("seed.txt = %q — the unrelated entry was applied too", got)
+	}
+	if !strings.Contains(m.statusNote, "stashed and restored") {
+		t.Errorf("note = %q", m.statusNote)
+	}
+	if parked == "" {
+		t.Error("the resolver never recorded which entry it parked")
+	}
+}
+
+// ── Surviving a quit ───────────────────────────────────
+
+// Quitting mid-resolution used to lose the association entirely: the recovered
+// merge finished without restoring the parked changes and without mentioning
+// them, so the previous session's on-screen promise was broken in silence.
+func TestARecoveredMergePicksUpTheParkedStash(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "in progress\n")
+	first := dirtyMergeResolver(t)
+	parked := first.conflictStashRef
+
+	// Quit. Everything the model knew is gone; the merge and the stash are not.
+	relaunched := NewModel(nil, "main")
+	relaunched.width, relaunched.height = 120, 40
+
+	if relaunched.step != stepConflicts {
+		t.Fatalf("the relaunch landed on %v, want the resolver", relaunched.step)
+	}
+	if !relaunched.conflictStashed || relaunched.conflictStashRef != parked {
+		t.Fatalf("stashed = %v, ref = %q, want the parked %q",
+			relaunched.conflictStashed, relaunched.conflictStashRef, parked)
+	}
+	if out := relaunched.View(); !strings.Contains(out, "parked in a stash") {
+		t.Errorf("the recovered screen does not disclose the parked stash:\n%s", out)
+	}
+	if relaunched.conflictSource != "feat" {
+		t.Errorf("source = %q, want the label the parking session recorded", relaunched.conflictSource)
+	}
+
+	done := press(t, resolveEverything(t, relaunched), "c")
+	if done.err != nil {
+		t.Fatalf("finishing the recovered merge failed: %v", done.err)
+	}
+	if got := readFile(t, "notes.txt"); got != "in progress\n" {
+		t.Errorf("notes.txt = %q — the recovered merge did not restore the parked work", got)
+	}
+	if !strings.Contains(done.statusNote, "stashed and restored") {
+		t.Errorf("note = %q", done.statusNote)
+	}
+	if n := stashDepth(t); n != 0 {
+		t.Errorf("%d stash entries left after the recovered merge", n)
+	}
+}
+
+// The record is repo-scoped state, so it has to be cleaned up like git's own.
+func TestTheParkedStashRecordIsRemovedWhenTheMergeEnds(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "in progress\n")
+	m := dirtyMergeResolver(t)
+
+	path, err := conflictStatePath()
+	if err != nil {
+		t.Fatalf("conflictStatePath: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("no record was written while the stash was parked: %v", err)
+	}
+	if !strings.HasSuffix(filepath.Dir(path), ".git") {
+		t.Errorf("the record lives at %s, want it inside the git directory", path)
+	}
+
+	m = press(t, resolveEverything(t, m), "c")
+	if m.err != nil {
+		t.Fatalf("finishing failed: %v", m.err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("the record outlived the merge it belonged to")
+	}
+}
+
+// A record whose entry has since been applied or deleted must not put "your
+// changes are parked in a stash" back on the screen.
+func TestAStaleParkedStashRecordIsIgnored(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "in progress\n")
+	dirtyMergeResolver(t)
+	gitRun(t, "stash", "drop", "stash@{0}")
+
+	relaunched := NewModel(nil, "main")
+	relaunched.width, relaunched.height = 120, 40
+	if relaunched.conflictStashed {
+		t.Error("a stash that is no longer in the stack was adopted")
+	}
+	if out := relaunched.View(); strings.Contains(out, "parked in a stash") {
+		t.Errorf("the screen promises a stash that is gone:\n%s", out)
+	}
+}
+
+// ── The abort confirmation ─────────────────────────────
+
+// `a` is select-all in the file selector and apply in the stash manager — the
+// two screens that look exactly like this one. It used to throw the whole merge
+// away on the first press, resolutions and all, with no confirmation anywhere.
+func TestAbortAsksFirstAndSaysWhatItCosts(t *testing.T) {
+	conflictFixture(t)
+	m := conflictedModel(t)
+	m.conflictCursor = indexOfConflict(t, m, "shared.txt")
+	m = press(t, m, "o")
+
+	confirming, cmd := key(t, m, "a")
+	if cmd != nil {
+		t.Fatal("a dispatched the abort instead of asking")
+	}
+	if !confirming.conflictConfirmAbort {
+		t.Fatal("a did not raise a confirmation")
+	}
+	if !mergeInProgressOnDisk(t) {
+		t.Fatal("the merge was aborted by the question")
+	}
+
+	out := confirming.View()
+	for _, want := range []string{"Undo the whole merge?", "1 file", "no undo"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the confirmation never says %q:\n%s", want, out)
+		}
+	}
+	if footer := renderHelpRows(confirming.helpRows()); !strings.Contains(footer, "cancel") {
+		t.Errorf("footer = %q, want the cancel spelled out", footer)
+	}
+
+	// Any other key cancels, and the merge (and the resolution) survive.
+	cancelled, cmd := key(t, confirming, "j")
+	if cmd != nil || cancelled.conflictConfirmAbort || cancelled.conflictAborting {
+		t.Error("a stray key went through with the abort")
+	}
+	if !mergeInProgressOnDisk(t) {
+		t.Fatal("the merge was aborted by a cancel")
+	}
+	if cancelled.conflictResolvedCount() != 1 {
+		t.Errorf("%d resolutions survived the cancel, want 1", cancelled.conflictResolvedCount())
+	}
+}
+
+// The parked stash is part of what the question has to disclose.
+func TestAbortConfirmationDisclosesTheParkedStash(t *testing.T) {
+	conflictFixture(t)
+	writeFile(t, "notes.txt", "in progress\n")
+	m := dirtyMergeResolver(t)
+	m, _ = key(t, m, "a")
+	if out := m.View(); !strings.Contains(out, "parked uncommitted changes are restored") {
+		t.Errorf("the confirmation does not mention the parked stash:\n%s", out)
+	}
 }
