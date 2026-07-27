@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 
+	"git-assist/internal/git"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -51,6 +52,8 @@ func (m Model) helpRows() [][]helpEntry {
 		return m.stashHelp()
 	case stepHistory:
 		return m.historyHelp()
+	case stepConflicts:
+		return m.conflictsHelp()
 	}
 	return nil
 }
@@ -110,7 +113,7 @@ func (m Model) menuHelp() [][]helpEntry {
 		{symArrows, "navigate"},
 		{"enter", "select"},
 	}
-	if m.hasRemote && m.behindOrigin > 0 && !m.detached {
+	if m.canPull() {
 		entries = append(entries, helpEntry{"p", "pull"})
 	}
 	if m.canSyncMain() {
@@ -351,6 +354,55 @@ func (m Model) historyHelp() [][]helpEntry {
 	)
 }
 
+// conflictsHelp mirrors viewConflicts' dispatch: the editor short-circuits
+// everything, then the marker confirmation, then the list.
+//
+// The per-file keys follow the row under the cursor and change LABEL with its
+// status — on a file the incoming branch deleted, `t` does not "take theirs",
+// it deletes the file, and the footer has to say the same thing the screen
+// above it says (see conflictSideLabel). On a resolved row they are gone
+// entirely: `git checkout --ours` fails once a version has been staged.
+func (m Model) conflictsHelp() [][]helpEntry {
+	switch {
+	case m.editMode:
+		switch {
+		case m.confirmExit:
+			return oneRow(helpEntry{"y", "discard"}, helpEntry{"any", "cancel"})
+		case m.saving:
+			return nil // the saving frame draws no footer
+		}
+		return oneRow(helpEntry{"ctrl+s", "save"}, helpEntry{"esc", "back"})
+	case m.conflictMarkWarn:
+		return oneRow(helpEntry{"y", "mark resolved anyway"}, helpEntry{"any", "cancel"})
+	}
+
+	var first []helpEntry
+	if len(m.conflictRows) > 1 {
+		first = append(first, helpEntry{symArrows, "navigate"})
+	}
+	if row, ok := m.conflictSelected(); ok && !row.resolved {
+		first = append(first,
+			helpEntry{"o", conflictKeyLabel(row.file, git.SideOurs)},
+			helpEntry{"t", conflictKeyLabel(row.file, git.SideTheirs)},
+			helpEntry{"e", "edit"},
+			helpEntry{"m", "mark resolved"},
+		)
+	}
+	second := []helpEntry{}
+	if m.conflictDone() {
+		second = append(second, helpEntry{"c", "finish the merge"})
+	}
+	second = append(second,
+		helpEntry{"a", "abort — undo the whole merge"},
+		helpEntry{"esc", "menu"},
+		helpEntry{"q", "quit"},
+	)
+	if len(first) == 0 {
+		return oneRow(second...)
+	}
+	return [][]helpEntry{first, second}
+}
+
 func (m Model) configHelp() [][]helpEntry {
 	switch {
 	case m.configRemoveRemote:
@@ -547,6 +599,9 @@ func (m Model) typingActive() bool {
 		return m.configEditMode
 	case stepInit:
 		return m.initPhase == initPhaseInputURL || m.initPhase == initPhaseInputRepoName
+	case stepConflicts:
+		// The resolver borrows the file selector's textarea for the markers.
+		return m.editMode
 	}
 	return false
 }
@@ -620,6 +675,14 @@ func (m Model) screenName() string {
 			return "Commit details"
 		}
 		return "History"
+	case stepConflicts:
+		switch {
+		case m.editMode:
+			return "Conflict editor"
+		case m.conflictMarkWarn:
+			return "Mark resolved"
+		}
+		return "Resolve conflicts"
 	}
 	return "git-assist"
 }

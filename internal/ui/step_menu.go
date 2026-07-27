@@ -16,6 +16,30 @@ type menuItem struct {
 	desc string
 }
 
+// conflictMenuItem is the entry an unfinished merge puts at the top of the
+// dashboard, in both the ordinary and the detached-HEAD list. It is permanent
+// while MERGE_HEAD exists — the repository cannot be committed to, switched
+// away from or pushed sensibly until it is dealt with, and the resolver is the
+// only screen that can deal with it.
+func (m Model) conflictMenuItem() []menuItem {
+	if !m.mergeInProgress {
+		return nil
+	}
+	return []menuItem{{"Resolve conflicts", symWarn + " merge in progress — finish it or undo it"}}
+}
+
+// mergeBlocked reports whether an entry that writes commits or moves HEAD has
+// to refuse right now. Everything it gates would either corrupt the merge (the
+// commit wizard's `git reset` unstages every resolution) or bury it (a checkout
+// carrying MERGE_HEAD onto another branch).
+func (m Model) mergeBlocked() bool { return m.mergeInProgress }
+
+// mergeBlockedErr is the one sentence those entries refuse with. Advisory, not
+// an error — nothing failed, the user simply has an earlier job to finish.
+func mergeBlockedErr(what string) error {
+	return fmt.Errorf("%s finish or abort the merge first — %s is not safe until then. Open \"Resolve conflicts\"", symWarn, what)
+}
+
 func (m Model) menuItems() []menuItem {
 	// Detached HEAD: every other entry needs a branch. Commit and Amend would
 	// write commits nothing points at, Push would try to create a remote branch
@@ -23,9 +47,8 @@ func (m Model) menuItems() []menuItem {
 	// against. One way out is offered instead — the branch manager, where
 	// switching to a branch is the cure.
 	if m.detached {
-		items := []menuItem{
-			{"Branch", "switch to a branch to continue"},
-		}
+		items := m.conflictMenuItem()
+		items = append(items, menuItem{"Branch", "switch to a branch to continue"})
 		// Stash is the exception to "every entry needs a branch": a stash
 		// belongs to no branch, and a detached HEAD is precisely the state
 		// where uncommitted work most needs a way back out.
@@ -48,9 +71,8 @@ func (m Model) menuItems() []menuItem {
 		commitDesc = fmt.Sprintf("%d changes", changeCount)
 	}
 
-	items := []menuItem{
-		{"Commit", commitDesc},
-	}
+	items := m.conflictMenuItem()
+	items = append(items, menuItem{"Commit", commitDesc})
 	// Amend shows up only when there's a last commit to amend.
 	if m.hasAnyCommit {
 		items = append(items, menuItem{"Amend", "edit last commit"})
@@ -175,8 +197,16 @@ func clampMenuCursor(cursor, n int) int {
 // on one condition, so the dashboard can never offer a sync it cannot perform
 // (or hide one it should). mainRef is empty in a repository with no main
 // branch at all, where there is nothing to sync with.
+// A merge already in progress rules it out too: `s` starts a second merge,
+// which git refuses outright, and the badge would be inviting the user to do it.
 func (m Model) canSyncMain() bool {
-	return m.behindMain > 0 && m.mainRef != "" && !m.detached
+	return m.behindMain > 0 && m.mainRef != "" && !m.detached && !m.mergeInProgress
+}
+
+// canPull gates the dashboard's `p` shortcut and its help entry on one
+// condition, so the key and the row advertising it cannot disagree.
+func (m Model) canPull() bool {
+	return m.hasRemote && m.behindOrigin > 0 && !m.detached && !m.mergeInProgress
 }
 
 // mainLabel names the main branch for display. Falls back to "main" before the
@@ -353,7 +383,22 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// shifts when conditional entries (Amend, Connect to GitHub)
 		// are present, so name-based dispatch is harder to break.
 		switch items[m.menuCursor].name {
+		case "Resolve conflicts":
+			if !m.openConflicts() {
+				// The merge finished under us — a snapshot taken before it
+				// landed can outlive it by a frame. Say so rather than
+				// opening an empty resolver.
+				m.setStatusNote("The merge is already finished — nothing left to resolve")
+			}
+			return m, nil
 		case "Commit":
+			if m.mergeBlocked() {
+				// The wizard's first act is `git reset`, which throws away
+				// every conflict resolution staged so far. Finishing the
+				// merge IS the commit here, and it belongs to the resolver.
+				m.err = mergeBlockedErr("committing")
+				return m, nil
+			}
 			// Re-read the tree first: the dashboard stays open for hours and
 			// the snapshot behind this gate goes stale the moment the user
 			// edits a file in their editor or another terminal.
@@ -367,14 +412,31 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resetWizard()
 			m.step = stepFiles
 		case "Amend":
+			if m.mergeBlocked() {
+				// `git commit --amend` mid-merge rewrites the commit BELOW the
+				// merge and drags MERGE_HEAD along with it.
+				m.err = mergeBlockedErr("amending")
+				return m, nil
+			}
 			m.refreshFiles()
 			return m.startAmend(), nil
 		case "Push":
+			if m.mergeBlocked() {
+				m.err = mergeBlockedErr("pushing")
+				return m, nil
+			}
 			// Same step the wizard uses; enterPush reads what this particular
 			// push would send and decides whether it has to be a force.
 			m.enterPush(true)
 			return m, nil
 		case "Branch":
+			if m.mergeBlocked() {
+				// A checkout carries the half-finished merge onto whatever
+				// branch it lands on, and git refuses a second merge on top of
+				// this one with a message about MERGE_HEAD.
+				m.err = mergeBlockedErr("switching or merging branches")
+				return m, nil
+			}
 			m.branchEntries = git.GetAllBranches()
 			m.branchCursor = 0
 			m.branchScroll = 0
@@ -436,7 +498,11 @@ func (m Model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Manual pull fallback. Opens the sync dialog if there's anything
 		// to pull — user may have skipped the startup dialog, or new
 		// upstream commits appeared mid-session.
-		if m.detached {
+		//
+		// Never mid-merge: a pull IS a merge, and git refuses to start one
+		// while MERGE_HEAD exists. populateSyncDialog gates on the same flag,
+		// so the startup auto-show cannot slip past this either.
+		if m.detached || m.mergeInProgress {
 			return m, nil
 		}
 		if m.populateSyncDialog() && m.syncPullCurrent {
@@ -525,10 +591,16 @@ func (m Model) viewMenu() string {
 			name = highlightStyle.Render(item.name)
 		}
 
-		// Dim "Commit" when no changes
-		if i == 0 && len(m.files) == 0 {
+		// Dim "Commit" when no changes. By NAME, not by index: an unfinished
+		// merge puts its own entry at the top, and dimming that one would fade
+		// out the only thing on the screen that has to be acted on.
+		if item.name == "Commit" && len(m.files) == 0 {
 			name = dimStyle.Render(item.name)
 			desc = dimStyle.Render(item.desc)
+		}
+		// The merge entry is the loud one for as long as it exists.
+		if item.name == "Resolve conflicts" {
+			desc = modifiedStyle.Render(item.desc)
 		}
 
 		rows = append(rows, fmt.Sprintf("%s%-12s %s", cursor, name, desc))

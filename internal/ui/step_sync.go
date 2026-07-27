@@ -154,14 +154,7 @@ func (m Model) updateSync(msg tea.Msg) (tea.Model, tea.Cmd) {
 // The zero value of syncReturnStep is stepMenu, which is the correct default
 // when the dialog was fired without an explicit return context.
 func (m Model) exitSyncDialog() (Model, tea.Cmd) {
-	m.syncPullCurrent = false
-	m.syncSyncMain = false
-	m.syncIncomingCurr = nil
-	m.syncIncomingMain = nil
-	m.syncCurrTotal = 0
-	m.syncMainTotal = 0
-	m.syncAhead = 0
-	m.syncDiverged = false
+	m.clearSyncDialog()
 	if m.syncReturnStep == stepMenu {
 		// Back to the dashboard through the one shared door: a pull moves
 		// HEAD and can restore a stash, so status and graphs must be re-read.
@@ -172,6 +165,23 @@ func (m Model) exitSyncDialog() (Model, tea.Cmd) {
 	}
 	m.step = m.syncReturnStep
 	return m, nil
+}
+
+// clearSyncDialog drops the dialog's contents without deciding where to go
+// next. Split out of exitSyncDialog for the one caller that has its own
+// destination: a conflicting pull routes to the resolver, and it must not pick
+// up exitSyncDialog's return-to-menu command — dropping that command would
+// leave refreshing latched with no refresh in flight, and every later dashboard
+// read would coalesce into a request that never runs.
+func (m *Model) clearSyncDialog() {
+	m.syncPullCurrent = false
+	m.syncSyncMain = false
+	m.syncIncomingCurr = nil
+	m.syncIncomingMain = nil
+	m.syncCurrTotal = 0
+	m.syncMainTotal = 0
+	m.syncAhead = 0
+	m.syncDiverged = false
 }
 
 // ── View ───────────────────────────────────────────────
@@ -245,8 +255,12 @@ func (m Model) viewSync() string {
 // Does NOT change m.step — caller decides whether to transition.
 func (m *Model) populateSyncDialog() bool {
 	// A detached HEAD tracks nothing and merges into nothing: every question
-	// below would be asked about the branch we are NOT on.
-	if !m.hasRemote || m.detached {
+	// below would be asked about the branch we are NOT on. A merge already in
+	// progress rules it out for a sharper reason — both offers here START a
+	// merge, git refuses to run one while MERGE_HEAD exists, and this is the
+	// function the startup auto-show calls, so the dialog would otherwise open
+	// itself on top of an unresolved conflict.
+	if !m.hasRemote || m.detached || m.mergeInProgress {
 		return false
 	}
 	main := git.ResolveMainBranch()

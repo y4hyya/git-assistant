@@ -23,20 +23,21 @@ const fetchDebounce = 30 * time.Second
 type step int
 
 const (
-	stepMenu    step = iota // main menu hub
-	stepFiles               // file selection
-	stepBranch              // branch manager
-	stepConfig              // config editor
-	stepType                // commit type picker
-	stepCustom              // custom type input
-	stepMessage             // commit message input (includes inline scope)
-	stepConfirm             // commit confirmation
-	stepPush                // branch picker + push
-	stepDone                // success screen
-	stepSync                // sync dialog (pull current / merge origin/main)
-	stepInit                // first-run setup when cwd is not a git repo
-	stepStash               // stash manager: list, preview, apply, pop, delete
-	stepHistory             // commit history browser: list, detail, patch (read-only)
+	stepMenu      step = iota // main menu hub
+	stepFiles                 // file selection
+	stepBranch                // branch manager
+	stepConfig                // config editor
+	stepType                  // commit type picker
+	stepCustom                // custom type input
+	stepMessage               // commit message input (includes inline scope)
+	stepConfirm               // commit confirmation
+	stepPush                  // branch picker + push
+	stepDone                  // success screen
+	stepSync                  // sync dialog (pull current / merge origin/main)
+	stepInit                  // first-run setup when cwd is not a git repo
+	stepStash                 // stash manager: list, preview, apply, pop, delete
+	stepHistory               // commit history browser: list, detail, patch (read-only)
+	stepConflicts             // merge conflict resolver: keep ours/theirs, edit, continue, abort
 )
 
 // Async result messages
@@ -345,6 +346,31 @@ type Model struct {
 	historyPatchLoaded  bool
 	historyPatchLoading bool
 	historyPatchScroll  int
+
+	// Merge conflict resolver (see step_conflicts.go). conflictRows is re-read
+	// from git after every resolution — a list carried across a mutation
+	// describes an index that no longer exists. conflictStashed/conflictStashRef
+	// are the auto-stash the merge took before it started: it stays in the stack
+	// UNTOUCHED for the whole resolution, because `git stash pop` refuses while
+	// the index has unmerged entries, and is restored only after the merge is
+	// committed or aborted. mergeInProgress mirrors git.MergeInProgress() and is
+	// what the dashboard gates on; it is refreshed with the snapshot so a merge
+	// started in another terminal is picked up too.
+	conflictRows      []conflictRow
+	conflictCursor    int
+	conflictScroll    int
+	conflictOrigin    conflictOrigin
+	conflictSource    string
+	conflictTarget    string
+	conflictStashed   bool
+	conflictStashRef  string
+	conflictEditPath  string
+	conflictMarkWarn  bool
+	conflictMarkPath  string
+	conflictResolving bool
+	conflictFinishing bool
+	conflictAborting  bool
+	mergeInProgress   bool
 
 	// Config editor
 	configCursor     int
@@ -673,6 +699,11 @@ func NewModel(files []types.FileEntry, branch string) Model {
 	// initNameInput is a zero-value textinput and .Focus() nil-derefs.
 	m.setupInitModel()
 	m.RefreshGraphs()
+	// A merge left in progress — by a quit mid-resolution, or by a `git merge`
+	// run in a terminal — is the one repository state that has to be dealt with
+	// before anything else on the dashboard is safe to offer. Open on it, with
+	// the labels read from MERGE_MSG since nothing in this process started it.
+	m.openConflicts()
 	// Show the spinner on first render if we're going to fetch immediately.
 	if m.hasRemote {
 		m.fetching = true
@@ -723,9 +754,17 @@ func NewInitModel() Model {
 // branch list is extra here.
 func NewBranchModel(branch string) Model {
 	m := NewModel(nil, branch)
-	m.step = stepBranch
 	m.branchStandalone = true
 	m.branchEntries = git.GetAllBranches()
+	// An unfinished merge outranks the subcommand: switching or merging on top
+	// of one is exactly what the branch manager must not let happen, and the
+	// resolver is the way out. It returns to the dashboard afterwards, which is
+	// where a repository in this state belongs.
+	if m.mergeInProgress {
+		m.branchStandalone = false
+		return m
+	}
+	m.step = stepBranch
 	return m
 }
 
@@ -755,6 +794,11 @@ type dashboardSnapshot struct {
 	// detached: HEAD is on no branch. Read here with everything else so the
 	// dashboard's gating never depends on a git call made inside Update.
 	detached bool
+	// mergeInProgress: MERGE_HEAD exists, so a merge is waiting to be finished
+	// or aborted. Read here for the same reason, and because a merge started in
+	// another terminal has to reach the dashboard's gating without the user
+	// doing anything.
+	mergeInProgress bool
 
 	files   []types.FileEntry
 	filesOK bool // false when withStatus was off, or git status failed
@@ -780,6 +824,7 @@ func readDashboard(branch string, withStatus bool) dashboardSnapshot {
 	snap.stashCount = git.StashCount()
 	snap.totalCommits = git.TotalCommits()
 	snap.detached = git.IsDetachedHead()
+	snap.mergeInProgress = git.MergeInProgress()
 	if withStatus {
 		if files, err := git.GetStatus(); err == nil {
 			snap.files = files
@@ -809,6 +854,13 @@ func (m *Model) applyDashboard(s dashboardSnapshot) {
 	m.hasAnyCommit = s.hasAnyCommit
 	m.historyTotal = s.totalCommits
 	m.detached = s.detached
+	// Not while the resolver is on screen, and not while one of its operations
+	// is in flight: the snapshot is read off a goroutine that may have started
+	// before the merge commit landed, and letting a stale reading put the flag
+	// back would re-raise "merge in progress" over a repository that has none.
+	if m.step != stepConflicts && !m.conflictFinishing && !m.conflictAborting {
+		m.mergeInProgress = s.mergeInProgress
+	}
 	// Not while the manager is on screen: it holds the authoritative list (it
 	// re-reads on entry and after every mutation), and a snapshot taken before
 	// a pop would put the entry back in the count.
@@ -984,9 +1036,11 @@ func (m *Model) appendNoteClause(clause string) {
 // for the user to walk back to the dashboard before saying anything at all.
 // The stash manager is on the list for the same reason: an apply, a pop and a
 // delete all finish there, and the user stays to work on the rest of the stack.
+// The conflict resolver is on it for the same reason again: every o/t/m
+// happens there and the user stays for the rest of the files.
 func (m Model) rendersStatusNote() bool {
 	return m.step == stepMenu || m.step == stepBranch ||
-		m.step == stepFiles || m.step == stepStash
+		m.step == stepFiles || m.step == stepStash || m.step == stepConflicts
 }
 
 // isNavKey reports whether a keypress only moves a cursor. Status notes
@@ -1067,6 +1121,9 @@ func (m Model) opInFlight() bool {
 		m.pulling ||
 		m.stashApplying ||
 		m.stashDropping ||
+		m.conflictResolving ||
+		m.conflictFinishing ||
+		m.conflictAborting ||
 		m.initWorking
 }
 
@@ -1240,6 +1297,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stashDropResultMsg:
 		return m.handleStashDropResult(msg)
+
+	// The conflict resolver's four operations. Their handlers live next to the
+	// commands that produce them, in step_conflicts.go, because the stash
+	// ordering they implement is the subtlest thing in the feature.
+	case conflictResolveResultMsg:
+		return m.handleConflictResolve(msg)
+
+	case conflictSaveResultMsg:
+		return m.handleConflictSave(msg)
+
+	case conflictFinishResultMsg:
+		return m.handleConflictFinish(msg)
+
+	case conflictAbortResultMsg:
+		return m.handleConflictAbort(msg)
 
 	// The history browser's three reads. None of them calls startResult: they
 	// are reads the user asked to LOOK at something, not operations, and
@@ -1627,24 +1699,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.noteOrphanedStash()
 		}
 		if msg.err != nil {
-			verb := "pull"
-			if msg.kind == pullKindMain {
-				verb = "sync with " + m.syncMainBranchName
-			}
 			if len(msg.conflictFiles) > 0 {
-				// Abort first: that puts the tree back on the stash's base
-				// commit, which is exactly where the stash applies cleanly.
-				// State the file count the way the branch-manager merge does —
-				// it is the only measure of how much work a manual retry is.
-				git.MergeAbort()
-				m.err = fmt.Errorf("%s conflict — %s, so the merge was aborted and nothing changed",
-					verb, plural(len(msg.conflictFiles), "conflicting file", "conflicting files"))
-			} else {
-				m.err = msg.err
+				// NOT aborted any more. The merge stays in progress and the
+				// resolver takes over — including the auto-stash, which it must
+				// leave alone until the merge is committed or aborted (git
+				// refuses to pop into an unmerged index; see step_conflicts.go).
+				origin, source := conflictFromPull, "origin/"+m.branch
+				if msg.kind == pullKindMain {
+					origin, source = conflictFromSync, "origin/"+m.syncMainBranchName
+				}
+				m.clearSyncDialog()
+				m.beginConflicts(origin, source, m.branch, msg.stashed, msg.stashRef)
+				return m, nil
 			}
-			// The pull auto-stashed a dirty tree before merging. Whatever
-			// went wrong above, those changes must come back — or the user
-			// must be told exactly where they are.
+			m.err = msg.err
+			// No conflicts, so the merge never started and HEAD is still the
+			// commit the auto-stash was taken from: the changes apply straight
+			// back. (The conflicting case returned above — the resolver owns the
+			// stash from there.)
 			if msg.stashed {
 				if popErr := git.StashPop(); popErr != nil {
 					git.CleanupFailedStashPop()
@@ -1704,22 +1776,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.noteOrphanedStash()
 		}
 		if msg.err != nil && !msg.merged {
-			conflicts := msg.conflictFiles
-			if len(conflicts) > 0 {
-				// Always auto-abort merge conflicts — there's no in-TUI
-				// resolution path, and leaving the repo in a half-merged
-				// state surprises users on the next operation. The error
-				// tells them how many files conflicted so they know how
-				// much work awaits in their terminal.
-				git.MergeAbort()
-				m.err = fmt.Errorf("merge aborted — %d conflicting file(s). Resolve in your terminal (git status, edit, git add, git merge --continue) and retry", len(conflicts))
-			} else {
-				m.err = msg.err
+			if len(msg.conflictFiles) > 0 {
+				// Conflicts are no longer auto-aborted. This used to run
+				// `git merge --abort` on the spot and tell the user to finish
+				// the job in a terminal — the app could start a merge it could
+				// not complete. The merge stays in progress and stepConflicts
+				// takes over; `a` there is the same abort, one keypress away.
+				//
+				// The auto-stash goes WITH it, unrestored: `git stash pop`
+				// fails against an unmerged index, so the resolver holds the
+				// ref and pops only after the merge is committed or aborted.
+				m.beginConflicts(conflictFromMerge, msg.source, m.branch, msg.stashed, msg.stashRef)
+				return m, nil
 			}
-			// The merge auto-stashed a dirty tree before starting. Whatever
-			// failed above, those changes have to come back — the abort put
-			// the tree back on the stash's base commit, which is exactly
-			// where it applies cleanly.
+			m.err = msg.err
+			// A failure with no conflicts is a merge that never started (a bad
+			// ref, a tree git refused to overwrite), so HEAD is still the commit
+			// the auto-stash was taken from and the changes apply straight back.
+			// The conflicting case returned above — there the stash stays put
+			// until the resolver is done with it.
 			if msg.stashed {
 				if popErr := git.StashPop(); popErr != nil {
 					git.CleanupFailedStashPop()
@@ -1851,6 +1926,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateStash(msg)
 	case stepHistory:
 		return m.updateHistory(msg)
+	case stepConflicts:
+		return m.updateConflicts(msg)
 	}
 
 	return m, nil
@@ -1898,6 +1975,8 @@ func (m Model) View() string {
 		content = m.viewStash()
 	case stepHistory:
 		content = m.viewHistory()
+	case stepConflicts:
+		content = m.viewConflicts()
 	}
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)

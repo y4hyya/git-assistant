@@ -39,7 +39,20 @@ Reachable from the menu, from the file selector (`b`), or directly via `git-assi
 - Auto-stash and restore around branch switches and pulls — **includes untracked files**. If a stash-pop conflicts, the short SHA of your stash is surfaced and `S` opens the stash manager right there — no trip to another terminal.
 - Merge with `--no-ff` so the fork/merge diamond is always visible in the graph.
 - Merge target picker — choose which branch to merge **into** with a direction arrow; auto-switches to the target first if needed.
-- Conflicting merges auto-abort with a clear file count, never leaving the repo half-merged.
+- Conflicting merges open the conflict resolver (below) instead of being abandoned.
+
+### Conflict resolver
+A conflicting merge, pull or sync used to be aborted on the spot with "resolve it in your terminal" — git-assist could start a merge it could not finish. Now it stops here, and the abort is one keypress away instead of the only outcome.
+
+- Explains what happened in plain words: *"Merging feat into main stopped — 2 files have conflicting changes. git needs you to pick which version to keep in each."*
+- Every conflicting file is listed with what actually happened to it: **both changed it**, **you changed it, feat deleted it**, **you deleted it, feat changed it**, **you and feat each added a file with this name** — parsed from git's unmerged index entries (`UU / AA / UD / DU / DD / AU / UA`), not guessed.
+- `o` keeps **your** version, `t` takes the incoming branch's. On a file the other side deleted, the key that "keeps that side" **deletes the file**, and both the footer and the line above it say so rather than pretending it is a content choice.
+- `e` opens the conflicted file in the built-in editor with the markers visible, above a legend: `<<<<<<< yours … ======= … >>>>>>> theirs — delete the markers, keep what you want, save`. Saving does **not** mark it resolved (half-finished saves are normal); `m` does, and warns once if the markers are still in there.
+- Resolved files get a ✓, move to their own section, and the header counts down (`2 of 3 resolved`).
+- `c` finishes the merge (`git commit --no-edit`, so no editor is ever launched on top of the TUI); `a` aborts the whole thing and says "nothing changed".
+- Uncommitted work auto-stashed before the merge stays parked until the merge is committed or aborted — git refuses to restore a stash into an unmerged index — and the screen says so instead of leaving you to wonder where your edits went.
+- Quit halfway and the merge is still there: the next launch opens straight on the resolver with an "unfinished merge from earlier" banner. A `git merge` you started in a terminal is picked up the same way, with the branch names read from git's own merge message.
+- While a merge is open the dashboard carries a permanent `⚠ Resolve conflicts` entry, and commit / amend / push / branch switching answer "finish or abort the merge first".
 
 ### Stash manager
 Appears on the menu (and answers `S`) only once there is something stashed — from the menu or from the branch manager, including on top of the "your changes are safe in stash …" banner an auto-stash failure raises.
@@ -64,6 +77,7 @@ Appears on the menu as `History  N commits` once the repo has any. Answers the t
 - `p` to pull the current branch (fast-forward when possible).
 - `s` to merge `origin/main` into the current branch (`--no-ff` for an explicit integration commit).
 - Background fetch on startup and on return-to-menu, debounced to 30 seconds.
+- A pull or sync that conflicts opens the conflict resolver, named after the operation you asked for; neither offer appears while a merge is still open, since both would start a second one.
 
 ### First-run init flow
 When launched in a non-git directory, git-assist offers four paths instead of erroring:
@@ -208,6 +222,18 @@ Running `git-assist` outside of a git repository launches the first-run init flo
 | `p` | Toggle the full patch (in the detail pane) |
 | `esc` | Patch → detail → list → menu |
 
+### Conflict resolver
+| Key | Action |
+|-----|--------|
+| `↑↓` or `j/k` | Navigate the conflicting files |
+| `o` | Keep **your** version (deletes the file when your side deleted it) |
+| `t` | Take the incoming branch's version (deletes the file when that side deleted it) |
+| `e` | Edit the file with the conflict markers visible (`ctrl+s` saves) |
+| `m` | Mark the file resolved (asks first if markers are still present) |
+| `c` | Finish the merge — offered once every file is decided |
+| `a` | Abort: undo the whole merge, restore any auto-stash |
+| `esc` | Back to the menu (the merge stays open, and the menu says so) |
+
 ### Config editor
 | Key | Action |
 |-----|--------|
@@ -239,7 +265,7 @@ Builds embed the current `git describe --tags --always --dirty` output as the ve
 main.go                    Entry, flag and subcommand parsing
 internal/
   git/                     Pure git operations — no TUI dependencies
-                           (git.go, stash.go, history.go, gitignore_templates.go)
+                           (git.go, stash.go, history.go, conflict.go, gitignore_templates.go)
   types/                   Shared types (FileEntry, BranchEntry, …)
   ui/
     model.go               Bubble Tea Model, step enum, async msg handlers
@@ -250,6 +276,7 @@ internal/
     step_branch.go         Branch manager (switch, create, rename, delete, merge)
     step_stash.go          Stash manager (list, preview, apply, pop, delete)
     step_history.go        History browser (paged commit list, detail, patch)
+    step_conflicts.go      Conflict resolver (ours/theirs, marker editor, continue, abort)
     step_config.go         Config editor
     step_init.go           First-run init flow
     step_sync.go           Pull / sync-with-main dialog

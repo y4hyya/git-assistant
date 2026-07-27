@@ -1051,7 +1051,14 @@ func TestMergeStashNoteReachesTheMenuToo(t *testing.T) {
 	}
 }
 
-func TestMergeConflictOnADirtyTreeRestoresTheStash(t *testing.T) {
+// Updated with the conflict resolver: this used to assert that a conflicting
+// merge auto-aborted and popped the stash on the spot. It does neither now —
+// the merge stays in progress, the stash stays parked (git refuses to pop into
+// an unmerged index), and BOTH are undone by `a` on the resolver, which is the
+// same abort the handler used to run. The round trip is still the assertion;
+// what changed is who triggers it. See TestAutoStashComesBackAfterAbort for the
+// same flow driven all the way through the resolver's keys.
+func TestMergeConflictOnADirtyTreeParksTheStashUntilTheMergeEnds(t *testing.T) {
 	tempRepo(t, "chore: seed", "")
 	writeFile(t, "shared.txt", "base\n")
 	gitRun(t, "add", "-A")
@@ -1081,17 +1088,51 @@ func TestMergeConflictOnADirtyTreeRestoresTheStash(t *testing.T) {
 	m := wizardModel(t, stepBranch)
 	next, _ := m.Update(msg)
 	got := next.(Model)
-	if got.err == nil {
-		t.Fatal("the failure was swallowed")
+
+	// The merge is NOT aborted, and neither is it reported as a failure: it is
+	// a screen now.
+	if got.step != stepConflicts {
+		t.Fatalf("step = %v, want stepConflicts", got.step)
 	}
-	if !strings.Contains(got.err.Error(), "restored") {
-		t.Errorf("error = %q, want it to state what happened to the stash", got.err)
+	if got.err != nil {
+		t.Errorf("the conflict was reported as an error banner: %v", got.err)
+	}
+	if !got.conflictStashed || got.conflictStashRef == "" {
+		t.Error("the pending auto-stash was not handed to the resolver")
+	}
+	if n := stashDepth(t); n != 1 {
+		t.Fatalf("%d stash entries mid-merge, want the auto-stash parked until the merge ends", n)
+	}
+	if _, err := os.Stat("notes.txt"); err == nil {
+		t.Error("notes.txt is in the working tree during the merge — it belongs in the stash")
+	}
+
+	// `a` is the old behavior, one keypress away: abort, then restore.
+	m2, cmd := key(t, got, "a")
+	if cmd == nil {
+		t.Fatal("a dispatched nothing")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected a batch, got %T", cmd())
+	}
+	for _, c := range batch {
+		if res, ok := c().(conflictAbortResultMsg); ok {
+			out, _ := m2.Update(res)
+			m2 = out.(Model)
+		}
+	}
+	if m2.err != nil {
+		t.Fatalf("the abort failed: %v", m2.err)
 	}
 	if content := readFile(t, "notes.txt"); content != "in progress\n" {
 		t.Errorf("uncommitted work not restored: notes.txt = %q", content)
 	}
 	if n := stashDepth(t); n != 0 {
 		t.Errorf("%d stash entr(ies) left behind after recovery", n)
+	}
+	if !strings.Contains(m2.statusNote, "restored") {
+		t.Errorf("note = %q, want the stash round trip stated", m2.statusNote)
 	}
 }
 
@@ -3710,6 +3751,39 @@ func helpScreens(t *testing.T) []struct {
 			m.historyDetailSHA = "abc1234"
 			m.historyPatchLoaded, m.historyShowPatch = true, true
 			m.historyPatch = git.CommitPatchInfo{Patch: "@@ -1 +1 @@\n-a\n+b\n"}
+		})},
+		// The conflict resolver. Its per-file keys change LABEL with the row
+		// under the cursor (a modify/delete conflict's `t` deletes the file)
+		// and disappear on a resolved one, so every one of those states is a
+		// separate screen as far as the footer is concerned.
+		{"conflicts", mk(stepConflicts, func(m *Model) { *m = conflictScreenModel(t, false) })},
+		{"conflicts deleted variant", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.conflictCursor = 1 // the modify/delete row
+			*m = c
+		})},
+		{"conflicts all resolved", mk(stepConflicts, func(m *Model) { *m = conflictScreenModel(t, true) })},
+		{"conflicts marker warning", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.conflictMarkWarn, c.conflictMarkPath = true, "shared.txt"
+			*m = c
+		})},
+		{"conflicts editor", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.editMode, c.conflictEditPath = true, "shared.txt"
+			c.editArea.SetValue("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feat\n")
+			*m = c
+		})},
+		{"conflicts editor unsaved", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.editMode, c.conflictEditPath = true, "shared.txt"
+			c.editDirty, c.confirmExit = true, true
+			*m = c
+		})},
+		{"conflicts recovered at startup", mk(stepConflicts, func(m *Model) {
+			c := conflictScreenModel(t, false)
+			c.conflictOrigin, c.conflictSource = conflictFromRecovered, ""
+			*m = c
 		})},
 		// Both panes drop their scroll keys when there is nothing to scroll,
 		// so both states need covering.

@@ -90,7 +90,7 @@ Lower-impact polish. Roughly: each is a one-function fix, none individually move
 These would substantially improve the tool but are not bugs.
 
 - **`--amend`** flow for fixing the last commit without losing the message
-- **Conflict resolution UI** — currently a conflict kicks the user to terminal; an in-TUI conflict-file picker + "mark resolved" + "abort" would close the loop
+- ~~**Conflict resolution UI** — currently a conflict kicks the user to terminal; an in-TUI conflict-file picker + "mark resolved" + "abort" would close the loop~~ **Built** — `stepConflicts`: per-file keep-ours/keep-theirs (routed by unmerged kind, `git rm` where the kept side is a deletion), the marker editor with `m` to mark resolved, `c` to finish (`git commit --no-edit`) and `a` to abort. Conflicts are no longer auto-aborted, the pending auto-stash is held until the merge ends, and a merge left in progress — by a quit or by a terminal — is picked up at startup
 - ~~**Branch rename** — common operation, not exposed~~ **Built** — `r` in the branch manager, with the "origin still has the old name" disclosure
 - ~~**`--force-with-lease` push** — for rebased branches, with safety~~ **Built** — see M30; the Done screen and the dashboard route into it instead of printing the command
 - ~~**Discard a file's changes**~~ **Built** — `x` in the file selector, routed per status with a confirmation that names what is lost
