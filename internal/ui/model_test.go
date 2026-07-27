@@ -4361,6 +4361,45 @@ func TestTheRewritePinSurvivesABranchRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTheRewritePinFollowsABranchRename(t *testing.T) {
+	m := wizardModel(t, stepBranch)
+	m.branch = "feat"
+	m.rememberRewrite("origin-tip-of-feat")
+
+	next, _ := m.Update(branchRenameResultMsg{from: "feat", to: "feat2", wasCurrent: true})
+	m = next.(Model)
+	if !m.historyRewritten || m.rewriteBaseSHA != "origin-tip-of-feat" {
+		t.Fatalf("rename disarmed the rewrite (rewritten=%v base=%q)",
+			m.historyRewritten, m.rewriteBaseSHA)
+	}
+	if _, stale := m.rewriteBaseByBranch["feat"]; stale {
+		t.Error("the old branch name kept a stale pin entry")
+	}
+	if m.rewriteBaseByBranch["feat2"] != "origin-tip-of-feat" {
+		t.Errorf("the pin did not migrate to the new name: %q", m.rewriteBaseByBranch["feat2"])
+	}
+
+	// The dashboard refresh a rename schedules must not disarm it either.
+	m.applyDashboard(dashboardSnapshot{branch: "feat2"})
+	if !m.historyRewritten || m.rewriteBaseSHA != "origin-tip-of-feat" {
+		t.Error("the post-rename snapshot dropped the migrated pin")
+	}
+
+	// Renaming a NON-current branch that holds a pin migrates the map entry
+	// without touching the live flag for the branch we are standing on.
+	m2 := wizardModel(t, stepBranch)
+	m2.branch = "main"
+	m2.rewriteBaseByBranch = map[string]string{"feat": "shaX"}
+	next, _ = m2.Update(branchRenameResultMsg{from: "feat", to: "renamed", wasCurrent: false})
+	m2 = next.(Model)
+	if m2.historyRewritten {
+		t.Error("renaming another branch armed the current branch's flag")
+	}
+	if m2.rewriteBaseByBranch["renamed"] != "shaX" {
+		t.Error("the non-current branch's pin did not migrate")
+	}
+}
+
 // A pull ENDS the rewrite: the pre-rewrite commit is back in the branch, so the
 // pin must not survive to arm a force against it.
 func TestAPullDropsTheRewritePin(t *testing.T) {

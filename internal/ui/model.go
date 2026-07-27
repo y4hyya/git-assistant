@@ -1461,6 +1461,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.wasCurrent {
 			m.branch = msg.to
 		}
+		// The rewrite pin is keyed by branch name; a rename must carry it over
+		// or the dashboard refresh disarms the force machinery and the sync
+		// dialog goes back to offering the pull that resurrects the rewritten
+		// commit — the exact hole the per-branch map exists to close.
+		if base, ok := m.rewriteBaseByBranch[msg.from]; ok {
+			m.rewriteBaseByBranch[msg.to] = base
+			delete(m.rewriteBaseByBranch, msg.from)
+			if msg.wasCurrent {
+				m.adoptRewriteFor(msg.to)
+			}
+		}
 		m.branchEntries = git.GetAllBranches()
 		if m.branchCursor >= len(m.branchEntries) {
 			m.branchCursor = max(0, len(m.branchEntries)-1)

@@ -21,6 +21,7 @@ What follows is what is *not* closed.
 ### Behaviour
 
 - **M21** — the `init.defaultBranch` picker offers existing local branches only. Git accepts any name; a brand-new one can't be typed here.
+- The history-rewrite pin (`rewriteBaseByBranch`) is memory-only. Quit and relaunch after undoing a pushed commit and the new session doesn't know the branch diverged deliberately — its sync dialog offers the plain pull that restores the undone commit. The conflict-stash association survives a relaunch via `.git/git-assist-conflict-stash`; the rewrite pin deserves the same treatment.
 - **M22** — `core.editor` isn't checked against `PATH`. Setting `nonexistent-editor` succeeds, and the break surfaces the next time git wants an editor.
 - **M23** — the GPG signing toggle doesn't check that a signing key is configured. Enabling it without one makes every subsequent commit fail.
 - **M31** — the help bar still wraps below roughly 80 columns. `footerHeight()` now *counts* the wrapped rows, so nothing else is pushed off the screen, but a two-line bar on a narrow terminal is still worse than a shorter list would be.
