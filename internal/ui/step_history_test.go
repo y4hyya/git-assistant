@@ -783,3 +783,43 @@ func TestHistoryQuits(t *testing.T) {
 		}
 	}
 }
+
+// The spinner on this screen means one thing — something is being read — so
+// it has to tick for exactly as long as that is true. Forwarding ticks
+// unconditionally would leave the browser re-rendering ten times a second
+// forever; not forwarding them during a read freezes the only indication that
+// anything is happening.
+func TestHistorySpinnerTicksOnlyWhileSomethingIsBeingRead(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+
+	idle := historyModel(t, 3)
+	if idle.historyBusy() {
+		t.Fatal("an idle browser reports itself busy")
+	}
+	if _, cmd := idle.Update(idle.spinner.Tick()); cmd != nil {
+		t.Fatal("the spinner keeps ticking with nothing in flight")
+	}
+
+	// Each of the four reads this screen can have outstanding counts.
+	reads := []struct {
+		name string
+		set  func(*Model)
+	}{
+		{"first page", func(m *Model) { m.historyLoading = true }},
+		{"next page", func(m *Model) { m.historyPaging = true }},
+		{"commit detail", func(m *Model) { m.historyDetailLoading = true }},
+		{"patch", func(m *Model) { m.historyPatchLoading = true }},
+	}
+	for _, r := range reads {
+		t.Run(r.name, func(t *testing.T) {
+			m := historyModel(t, 3)
+			r.set(&m)
+			if !m.historyBusy() {
+				t.Fatal("a read is in flight but the screen reports itself idle")
+			}
+			if _, cmd := m.Update(m.spinner.Tick()); cmd == nil {
+				t.Fatal("the spinner stopped while a read was in flight")
+			}
+		})
+	}
+}

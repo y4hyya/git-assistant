@@ -1,0 +1,62 @@
+version: 2
+
+project_name: git-assist
+
+before:
+  hooks:
+    # Not `go mod tidy` — a release build must not be able to rewrite go.mod
+    # or go.sum out from under the tag it is building.
+    - go mod download
+
+builds:
+  - id: git-assist
+    main: .
+    binary: git-assist
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # main.Version is the same variable the Makefile writes to, so a released
+    # binary answers `git-assist --version` exactly as a local `make build` on
+    # that tag would. .Tag rather than .Version because the Makefile's
+    # `git describe --tags` keeps the leading v.
+    ldflags:
+      - -s -w -X main.Version={{ .Tag }}
+
+archives:
+  - id: git-assist
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  draft: false
+  prerelease: auto

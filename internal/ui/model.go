@@ -31,7 +31,7 @@ const (
 	stepCustom                // custom type input
 	stepMessage               // commit message input (includes inline scope)
 	stepConfirm               // commit confirmation
-	stepPush                  // branch picker + push
+	stepPush                  // outgoing-commit confirm + push
 	stepDone                  // success screen
 	stepSync                  // sync dialog (pull current / merge origin/main)
 	stepInit                  // first-run setup when cwd is not a git repo

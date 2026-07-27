@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a PR makes the previous run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The version comes from go.mod's own directive — one place to bump.
+          go-version-file: go.mod
+          cache: true
+
+      # The suite drives a real git binary, so the runner's git is part of the
+      # toolchain. Nothing in this repo is platform-specific (no build tags, no
+      # runtime.GOOS, no cgo), but two commands the app runs need a git new
+      # enough to have them:
+      #   git restore   — 2.23 (DiscardFile)
+      #   git init -b   — 2.28 (the first-run init flow)
+      # ubuntu-latest ships far newer; this step fails loudly rather than
+      # letting an old image produce a confusing test failure.
+      - name: Check git version
+        run: |
+          git --version
+          have="$(git --version | awk '{print $3}')"
+          need=2.28.0
+          if [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)" != "$need" ]; then
+            echo "::error::git $have is older than the required $need"
+            exit 1
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs to run on these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...

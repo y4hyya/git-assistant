@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"git-assist/internal/types"
@@ -38,19 +39,56 @@ var (
 // too (that is what exec.CommandContext buys us), which matters most for
 // `gh repo create`: on a plain process exit the orphaned child kept running
 // and created the repository the user had just tried to cancel.
-var netCtx, netCancel = context.WithCancel(context.Background())
+//
+// netMu guards both: CancelNetworkOps runs on the Bubble Tea update goroutine
+// while runNetworkTimeout reads netCtx from whichever command goroutine is
+// dispatching, and ResetNetworkOps writes it.
+var (
+	netMu             sync.Mutex
+	netCtx, netCancel = context.WithCancel(context.Background())
+)
 
 // CancelNetworkOps aborts every in-flight remote operation. Wired into the
 // force-quit path — after it runs, further remote calls fail fast with
 // ErrNetworkCancelled, which is correct for a process on its way out.
-func CancelNetworkOps() { netCancel() }
+func CancelNetworkOps() {
+	netMu.Lock()
+	defer netMu.Unlock()
+	netCancel()
+}
+
+// ResetNetworkOps re-arms the latch CancelNetworkOps throws.
+//
+// Nothing in the application calls this, and it must stay that way: the
+// one-way latch is the point. A force-quit has to keep a queued `gh repo
+// create` from starting after the user abandoned it, so "cancelled" is a
+// terminal state for the process that set it.
+//
+// It exists because that state is process-global, and a test binary is the
+// one process that legitimately runs both halves: a single test of the
+// ctrl+c handler would otherwise fail every later fetch, push and
+// `gh repo create` in the binary with ErrNetworkCancelled — in whatever
+// order -shuffle happened to pick. Tests that perform real remote operations
+// call this first.
+func ResetNetworkOps() {
+	netMu.Lock()
+	defer netMu.Unlock()
+	netCtx, netCancel = context.WithCancel(context.Background())
+}
+
+// networkContext reads the current parent context under the lock.
+func networkContext() context.Context {
+	netMu.Lock()
+	defer netMu.Unlock()
+	return netCtx
+}
 
 // runNetworkTimeout runs a remote-touching command under an explicit deadline.
 // Local-only git commands deliberately get no timeout: a large merge or
 // checkout can legitimately take minutes and killing it mid-write is worse
 // than waiting.
 func runNetworkTimeout(timeout time.Duration, name string, args ...string) ([]byte, error) {
-	return runNetworkCtx(netCtx, timeout, name, args...)
+	return runNetworkCtx(networkContext(), timeout, name, args...)
 }
 
 // runNetworkCtx is runNetworkTimeout with the parent context spelled out, so

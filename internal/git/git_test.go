@@ -27,12 +27,12 @@ func runGit(t *testing.T, args ...string) string {
 }
 
 // scratchRepo creates an empty repository in a temp dir and chdirs into it for
-// the duration of the test. The host's global/system git config is disabled so
+// the duration of the test. The host's global/system git config is replaced so
 // results don't depend on the developer's machine (autocrlf, gpgsign, hooks,
-// templates, aliases).
+// templates, aliases) — see isolatedGitConfig for the one setting it keeps.
 func scratchRepo(t *testing.T) string {
 	t.Helper()
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_GLOBAL", isolatedGitConfig(t))
 	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
 	t.Setenv("GIT_TERMINAL_PROMPT", "0")
 

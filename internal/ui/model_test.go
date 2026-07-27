@@ -67,9 +67,15 @@ func tempRepo(t *testing.T, subject, body string) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	// The ctrl+c handler calls git.CancelNetworkOps(), which throws a
+	// PROCESS-GLOBAL one-way latch: every later fetch, push and `gh repo
+	// create` in this binary then fails with ErrNetworkCancelled. One test of
+	// the force-quit path would otherwise break every remote operation that
+	// -shuffle happens to schedule after it. Re-arm it per test.
+	git.ResetNetworkOps()
 	// Identity and config isolation go through the environment so the calls
 	// internal/git makes (plain exec.Command, inherited env) see them too.
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_GLOBAL", isolatedGitConfig(t))
 	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
 	t.Setenv("GIT_AUTHOR_NAME", "t")
 	t.Setenv("GIT_AUTHOR_EMAIL", "t@t.invalid")
@@ -3702,6 +3708,26 @@ func helpScreens(t *testing.T) []struct {
 			m.configRemoveRemote = true
 		})},
 		{"type", mk(stepType, nil)},
+		// The wizard's own text screens. filesHelp branches on editMode and
+		// filterMode exactly as viewFiles does, so both modes are screens in
+		// their own right and the parity check has to reach them.
+		{"message", mk(stepMessage, nil)},
+		{"files edit", mk(stepFiles, func(m *Model) {
+			m.editMode = true
+			m.editArea.SetValue("line one\nline two\n")
+		})},
+		{"files edit dirty", mk(stepFiles, func(m *Model) {
+			m.editMode, m.editDirty = true, true
+			m.editArea.SetValue("edited\n")
+		})},
+		{"files edit exit prompt", mk(stepFiles, func(m *Model) {
+			m.editMode, m.editDirty, m.confirmExit = true, true, true
+		})},
+		{"files filter", mk(stepFiles, func(m *Model) {
+			m.filterMode = true
+			m.filterInput.SetValue("a")
+			m.filterMatches = []int{0}
+		})},
 		{"confirm", mk(stepConfirm, func(m *Model) { m.files[0].Selected = true })},
 		{"push", mk(stepPush, func(m *Model) {
 			m.pushHasUpstream, m.pushOutgoingTotal = true, 2

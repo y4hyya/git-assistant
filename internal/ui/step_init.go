@@ -42,7 +42,7 @@ var initChoiceLabels = []struct {
 }{
 	{"Initialize local repo", "git init, nothing else"},
 	{"Connect to GitHub repo", "git init + add existing remote URL"},
-	{"Create new GitHub repo", "git init + gh repo create + push"},
+	{"Create new GitHub repo", "git init + gh repo create (push via the wizard)"},
 	{"Cancel", "quit without changes"},
 }
 

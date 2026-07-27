@@ -691,3 +691,97 @@ func TestManagerReportsAStashThatVanished(t *testing.T) {
 		t.Errorf("stashCount is %d after the list came back empty", out.stashCount)
 	}
 }
+
+// ── Orphaned auto-stash accounting ─────────────────────
+
+// Every recovery banner about an orphaned auto-stash ends in "press S to open
+// the stash manager", and both that key and the menu entry are gated on
+// stashCount. The count comes from the dashboard snapshot, which is refreshed
+// asynchronously — so each handler bumps it the instant the pop fails.
+// Without that, the only instruction on screen is dead for as long as the
+// refresh takes, on precisely the screen where it is the way forward.
+func TestAFailedAutoStashPopMakesTheStashManagerReachableImmediately(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.Msg
+	}{
+		{"branch-switch-stash-conflict", branchSwitchResultMsg{newBranch: "feat", stashConflict: true, stashRef: "abc1234"}},
+		{"branch-switch-orphaned", branchSwitchResultMsg{newBranch: "feat", stashOrphaned: true, stashRef: "abc1234"}},
+		{"pull-orphaned", pullResultMsg{kind: pullKindCurrent, stashOrphaned: true}},
+		{"merge-orphaned", branchMergeResultMsg{source: "feat", merged: true, stashOrphaned: true}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempRepo(t, "chore: seed", "")
+			m := wizardModel(t, stepMenu)
+			m.stashCount = 0
+			if m.stashAvailable() {
+				t.Fatal("fixture starts with a stash")
+			}
+
+			next, _ := m.Update(tc.msg)
+			out := next.(Model)
+
+			if out.stashCount != 1 {
+				t.Fatalf("stashCount = %d after a failed pop, want 1", out.stashCount)
+			}
+			if !out.stashAvailable() {
+				t.Fatal("the stash manager is still gated shut — 'press S' is dead advice")
+			}
+		})
+	}
+}
+
+// The banner and the key have to agree: the message names the ref and tells
+// the user to press S, and S then opens the manager rather than being ignored.
+func TestTheOrphanedStashBannerAndTheSKeyAgree(t *testing.T) {
+	stashRepo(t, 1)
+	m := wizardModel(t, stepMenu)
+	m.stashCount = 0
+
+	next, _ := m.Update(branchSwitchResultMsg{newBranch: "feat", stashConflict: true, stashRef: "abc1234"})
+	out := next.(Model)
+
+	if out.err == nil {
+		t.Fatal("no banner was raised")
+	}
+	if !isRecoveryError(out.err) {
+		t.Fatal("the banner is not a recovery error — an ordinary keypress would wipe it mid-read")
+	}
+	if !strings.Contains(out.err.Error(), "abc1234") {
+		t.Fatalf("banner = %q, want the stash ref", out.err)
+	}
+	if !strings.Contains(out.err.Error(), "press S") {
+		t.Fatalf("banner = %q, want the S instruction", out.err)
+	}
+
+	out.step = stepMenu
+	after, _ := key(t, out, "S")
+	if after.step != stepStash {
+		t.Fatalf("S did not open the stash manager (step %d)", after.step)
+	}
+	// Acting on the banner clears it — it must not follow the user onto the
+	// screen it pointed at and read as a fresh failure.
+	if after.err != nil {
+		t.Fatalf("the banner followed the user into the manager: %v", after.err)
+	}
+}
+
+// The count is arithmetic on a known event, so it must not be bumped by a
+// result that popped cleanly.
+func TestACleanAutoStashRoundTripDoesNotBumpTheCount(t *testing.T) {
+	tempRepo(t, "chore: seed", "")
+	m := wizardModel(t, stepMenu)
+	m.stashCount = 0
+
+	next, _ := m.Update(branchSwitchResultMsg{newBranch: "feat", stashRef: "abc1234"})
+	out := next.(Model)
+
+	if out.stashCount != 0 {
+		t.Fatalf("stashCount = %d after a successful pop, want 0", out.stashCount)
+	}
+	if out.err != nil {
+		t.Fatalf("err = %v on a clean switch", out.err)
+	}
+}

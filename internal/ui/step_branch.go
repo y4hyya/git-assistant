@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"git-assist/internal/git"
-	"git-assist/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -713,14 +712,4 @@ func (m Model) viewBranch() string {
 	b.WriteString(renderHelpRows(m.helpRows()))
 
 	return m.styledBox(b.String())
-}
-
-// branchSeparatorIndex returns the index where remote branches start.
-func branchSeparatorIndex(entries []types.BranchEntry) int {
-	for i, e := range entries {
-		if e.IsRemote {
-			return i
-		}
-	}
-	return len(entries)
 }
