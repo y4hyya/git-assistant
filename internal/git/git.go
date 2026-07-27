@@ -452,11 +452,31 @@ func stageEntries(files []types.FileEntry) (failed []string, lastErr string) {
 	for _, f := range files {
 		args := append([]string{"add", "--"}, stagePaths(f)...)
 		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			// A deletion that is already staged (rm --cached from any source
+			// — this wizard's gitignore flow or the user's own terminal)
+			// makes `git add` fail: the path is in no index, often not on
+			// disk, and possibly ignored. The index already says exactly
+			// what the picker's D row promised, so that is success.
+			if indexAlreadyDeletes(f.Path) {
+				continue
+			}
 			failed = append(failed, f.Path)
 			lastErr = strings.TrimSpace(string(out))
 		}
 	}
 	return failed, lastErr
+}
+
+// indexAlreadyDeletes reports whether the index stages a deletion for path
+// with nothing further in the worktree to pick up (porcelain "D " — staged
+// delete, clean worktree side).
+func indexAlreadyDeletes(path string) bool {
+	out, err := exec.Command("git", "status", "--porcelain=v1", "-z", "--", path).Output()
+	if err != nil {
+		return false
+	}
+	rec := strings.SplitN(string(out), "\x00", 2)[0]
+	return len(rec) >= 3 && rec[0] == 'D' && rec[1] == ' '
 }
 
 // Commit stages the selected files and creates a commit.
@@ -478,10 +498,27 @@ func Commit(files []types.FileEntry, cachedPaths []string, message string) error
 		return err
 	}
 
+	// The rm --cached above already staged those paths exactly as intended:
+	// removed from the index, kept (or already gone) on disk. Running
+	// `git add` on them again can only fail — the path is now absent from
+	// the index, usually absent from the worktree, and matched by the very
+	// .gitignore rule the user just wrote, so git answers "pathspec did not
+	// match" or "paths are ignored" and the whole commit aborts. Skip them.
+	cached := make(map[string]bool, len(cachedPaths))
+	for _, p := range cachedPaths {
+		cached[p] = true
+	}
+	var toStage []types.FileEntry
+	for _, f := range files {
+		if !cached[f.Path] {
+			toStage = append(toStage, f)
+		}
+	}
+
 	// Stage the selection. If any file fails to stage we commit nothing —
 	// silently committing the survivors while the confirm screen promised
 	// all of them is worse than an error the user can act on.
-	failed, lastErr := stageEntries(files)
+	failed, lastErr := stageEntries(toStage)
 	if len(failed) > 0 {
 		return fmt.Errorf("could not stage %s (nothing committed): %s",
 			strings.Join(failed, ", "), lastErr)

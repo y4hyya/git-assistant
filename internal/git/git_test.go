@@ -1770,3 +1770,65 @@ func TestIsDetachedHead(t *testing.T) {
 		t.Error("DetachedLabel resolves as a branch name")
 	}
 }
+
+// The real-world v1.3.0 report: gitignore a tracked file through the wizard
+// (which queues rm --cached), delete it from disk, select the .gitignore
+// change and the deletion together, commit. The queued rm --cached already
+// stages the removal; the redundant `git add` on that path then failed and
+// aborted the whole commit.
+func TestCommitOfAGitignoredDeletionSucceeds(t *testing.T) {
+	scratchRepo(t)
+	write(t, "docs/THREAT_MODEL.md", "internal\n")
+	write(t, ".gitignore", "*.log\n")
+	commitAll(t, "init")
+
+	write(t, ".gitignore", "*.log\n/docs/THREAT_MODEL.md\n")
+	if err := os.Remove("docs/THREAT_MODEL.md"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Commit([]types.FileEntry{
+		{Path: ".gitignore", Status: types.StatusModified},
+		{Path: "docs/THREAT_MODEL.md", Status: types.StatusDeleted},
+	}, []string{"docs/THREAT_MODEL.md"}, "docs: ignore threat model")
+	if err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	tree := runGit(t, "ls-tree", "-r", "--name-only", "HEAD")
+	if strings.Contains(tree, "THREAT_MODEL.md") {
+		t.Errorf("the deletion did not land; HEAD still tracks it:\n%s", tree)
+	}
+	if !strings.Contains(runGit(t, "show", "HEAD:.gitignore"), "THREAT_MODEL") {
+		t.Error("the .gitignore change did not land in the same commit")
+	}
+	if out := runGit(t, "status", "--porcelain"); strings.TrimSpace(out) != "" {
+		t.Errorf("working tree not clean after the commit:\n%s", out)
+	}
+}
+
+// Same terminal state reached without the wizard's queue: the user ran
+// `git rm --cached` in a terminal themselves, then committed the visible D
+// row through the wizard. The staged deletion must count as staged.
+func TestCommitAcceptsAnAlreadyStagedDeletion(t *testing.T) {
+	scratchRepo(t)
+	write(t, "docs/THREAT_MODEL.md", "internal\n")
+	commitAll(t, "init")
+
+	write(t, ".gitignore", "/docs/THREAT_MODEL.md\n")
+	runGit(t, "rm", "--cached", "docs/THREAT_MODEL.md")
+	if err := os.Remove("docs/THREAT_MODEL.md"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Commit([]types.FileEntry{
+		{Path: ".gitignore", Status: types.StatusUntracked},
+		{Path: "docs/THREAT_MODEL.md", Status: types.StatusDeleted},
+	}, nil, "docs: drop threat model")
+	if err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+	if strings.Contains(runGit(t, "ls-tree", "-r", "--name-only", "HEAD"), "THREAT_MODEL.md") {
+		t.Error("the deletion did not land")
+	}
+}
